@@ -1,0 +1,50 @@
+{
+  "_comment": "P-26 deploy_fit sim-ranked winner, keeper-CONFIRMED 2026-07-18 and REJECTED (hit 0.7083 @ 8.623 vs defaults 0.7327 @ 8.8-8.9). Kept as committed evidence of the sim-vs-keeper divergence; do not deploy.",
+  "epoch": "2026-07-18-deployfit",
+  "freq_w": 120.0,
+  "freq_decay": 0.1,
+  "reuse_w": 4000.0,
+  "reuse_tau": 150.0,
+  "provenance": {
+    "epoch": "2026-07-18-deployfit",
+    "generated_by": "tools/loader_fit/deploy_fit.py",
+    "generated_at": "2026-07-18T21:15:02",
+    "inputs": {
+      "dump": "tests/integration/loader_offline_sim/assets/traj_4gpu_canonical.jsonl.gz",
+      "calib": "tests/assets/gpu_loader_calibration_4gpu_hbm.json",
+      "caps": [
+        203,
+        203,
+        443,
+        443
+      ]
+    },
+    "grid": {
+      "freq_w": [
+        0.0,
+        30.0,
+        45.0,
+        60.0,
+        90.0,
+        120.0
+      ],
+      "reuse_w": [
+        1000.0,
+        2000.0,
+        4000.0
+      ],
+      "reuse_tau": [
+        150.0,
+        300.0,
+        600.0
+      ],
+      "freq_decay": 0.1
+    },
+    "sim_hit": 0.7294,
+    "sim_fetch_per_tok": 162.38,
+    "sim_pred_ms_per_tok": 53.34,
+    "keeper_fingerprint": 0.7083,
+    "keeper_tok_s": 8.623,
+    "verdict": "REJECTED \u2014 keeper regression vs defaults (0.7327 @ 8.8-8.9): the sim freq model over-rewards protection; sim ranks, keeper decides"
+  }
+}

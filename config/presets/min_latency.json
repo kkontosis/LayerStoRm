@@ -1,0 +1,66 @@
+{
+  "orchestrator": {
+    "performance_objective": {
+      "latency_weight": 0.9,
+      "throughput_weight": 0.1
+    },
+    "max_batch_size": 32,
+    "expert_batching": {
+      "max_wait_us": 10,
+      "min_batch_tokens_per_expert": 1
+    }
+  },
+  "speculation": {
+    "enabled": true,
+    "mtp": {
+      "max_depth": 1,
+      "dynamic_depth": false
+    },
+    "self_speculative": {
+      "enabled": true,
+      "draft_expert_count": 2,
+      "residual_correction": {
+        "enabled": true
+      }
+    },
+    "layer_skip_draft": {
+      "enabled": true,
+      "threshold": 0.995
+    },
+    "verification": {
+      "adaptive_topk_threshold": 0.92,
+      "verification_quality_floor": 0.95,
+      "in_flight_transfer_mode": "conservative"
+    },
+    "reasoning_mode": {
+      "enabled": true,
+      "aggressive_speculation_depth_multiplier": 2.0
+    }
+  },
+  "prefetch": {
+    "prescope": {
+      "lookahead_layers": 1
+    },
+    "speculative": {
+      "max_prefetch_depth_layers": 4,
+      "confidence_threshold": 0.3
+    },
+    "probe": {
+      "confidence_threshold": 0.8
+    },
+    "moe_speq": {
+      "enabled": true
+    }
+  },
+  "memory": {
+    "expert_cache": {
+      "stable_zone_fraction": 0.8
+    },
+    "kv_cache": {
+      "speculation_pool_fraction": 0.1
+    }
+  },
+  "serving": {
+    "max_concurrent_requests": 8
+  }
+}

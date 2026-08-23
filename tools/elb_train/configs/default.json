@@ -1,0 +1,59 @@
+{
+  "_comment": "EPM-3 default training config (production-shaped; the real corpus run is EPM-5 after TD-EPM-CORPUS). Every field EPM-4 sweeps is reachable here: model.adapter.r_base / .delta.budget_params (rank schedules), model.taps (fixed map vs fusion), model.normalization, model.arm (router vs direct), model.layer_groups, loss.* (KL/BCE/MSE weights + temperature), wmap.* (directive knobs, uniform control, explicit matrices), data.token_mismatch_weight. Defaults are overridable per config file or --set key.path=json.",
+  "seed": 0,
+  "device": "cuda",
+  "out_dir": "build/epm3-train",
+  "data": {
+    "shards": null,
+    "held_out_fraction": 0.1,
+    "split_seed": 0,
+    "in_sample": false,
+    "batch_blocks": 8,
+    "token_mismatch_weight": 1.0,
+    "unknown_provenance_matched": true
+  },
+  "router": {
+    "checkpoint_dir": "/srv/models/lukealonso/GLM-5.2-NVFP4",
+    "npz": null
+  },
+  "model": {
+    "arm": "router",
+    "normalization": {"kind": "rmsnorm", "learnable": true, "eps": 1e-6},
+    "taps": {"mode": "fixed", "map": "prior"},
+    "layer_groups": "per_layer",
+    "adapter": {
+      "r_base": 64,
+      "residual": true,
+      "activation": "none",
+      "delta": {"enabled": true, "budget_params": 60000000,
+                "min_rank": 0, "max_rank": 96}
+    },
+    "direct_head": {
+      "r_base": 64,
+      "logit_bias": true,
+      "use_router_bias_for_selection": true,
+      "residual": false,
+      "activation": "none",
+      "delta": {"enabled": true, "budget_params": 30000000,
+                "min_rank": 0, "max_rank": 96}
+    }
+  },
+  "wmap": {
+    "kind": "directive",
+    "accept_curve": [0.43, 0.28, 0.27, 0.21, 0.11, 0.07, 0.09],
+    "k0_value": 1.0,
+    "k1_early_layers": 4,
+    "k1_early_value": 0.8,
+    "depth_taper_min": 0.5,
+    "floor": 0.02
+  },
+  "loss": {"kl_weight": 1.0, "kl_temperature": 1.0, "bce_weight": 0.25,
+           "mse_weight": 0.0},
+  "optim": {"lr": 3e-4, "weight_decay": 0.01, "betas": [0.9, 0.999],
+            "schedule": "cosine", "warmup_steps": 100,
+            "min_lr_ratio": 0.0, "grad_accum": 1, "clip_grad_norm": 1.0,
+            "max_steps": 20000},
+  "eval": {"every_steps": 1000, "m_rank": 32},
+  "checkpoint": {"every_steps": 2000, "keep": 3},
+  "log_every": 25
+}

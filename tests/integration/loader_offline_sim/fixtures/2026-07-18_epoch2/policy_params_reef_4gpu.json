@@ -1,0 +1,8 @@
+{
+  "_comment": "P-25 epoch-2 (post-LASTPASSER) validated I8 policy weights — the hand-regrid plateau optimum (DETHRONE_AFFINITY_IDEAS.md UPDATE 9). Frozen fixture: keep available verbatim before any automated deployment-fit (P-26) retrains these. Champion arm: KEEPER52_REEF_ORCH, calib gpu_loader_calibration_4gpu_hbm.json, fingerprint hit 0.7327, walls 8.815-8.935 tok/s.",
+  "epoch": "2026-07-18T2 (strict-improving solver, INV-LOADER-SOLVER-GATE rebased)",
+  "freq_w": 60.0,
+  "freq_decay": 0.1,
+  "reuse_w": 2000.0,
+  "reuse_tau": 300.0
+}

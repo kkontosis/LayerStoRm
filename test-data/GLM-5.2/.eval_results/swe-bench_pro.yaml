@@ -1,0 +1,7 @@
+- dataset:
+    id: ScaleAI/SWE-bench_Pro
+    task_id: SWE_Bench_Pro
+  value: 62.1
+  source:
+    url: https://huggingface.co/zai-org/GLM-5.2
+    name: Model Card

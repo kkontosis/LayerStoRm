@@ -1,0 +1,102 @@
+[
+  {
+    "name": "qa-geography",
+    "text": "Question: What is the capital of France, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of France is",
+    "gen_tokens": 200
+  },
+  {
+    "name": "prose-history",
+    "text": "The industrial revolution transformed European society in ways that no previous economic shift had. Beginning in the textile mills of northern England,",
+    "gen_tokens": 220
+  },
+  {
+    "name": "code-python",
+    "text": "# Python module: a small LRU cache with TTL expiry, implemented from scratch\n# using a doubly linked list and a dict. Fully typed, with docstrings.\n\nfrom __future__ import annotations\n\nimport time\nfrom typing import Generic, Hashable, Optional, TypeVar\n\nK = TypeVar(\"K\", bound=Hashable)\nV = TypeVar(\"V\")\n\n\nclass _Node(Generic[K, V]):\n    __slots__ = (\"key\", \"value\", \"expires_at\", \"prev\", \"next\")\n\n    def __init__(self, key: K, value: V, expires_at: float) -> None:",
+    "gen_tokens": 240
+  },
+  {
+    "name": "math-derivation",
+    "text": "Problem: Prove that the sum of the first n odd positive integers equals n^2.\n\nSolution: We proceed by induction on n. For the base case, when n = 1,",
+    "gen_tokens": 200
+  },
+  {
+    "name": "techdoc-networking",
+    "text": "## TCP congestion control: a practical overview\n\nTCP congestion control governs how quickly a sender may inject packets into the network. The classic algorithm, additive-increase/multiplicative-decrease (AIMD), works as follows:",
+    "gen_tokens": 220
+  },
+  {
+    "name": "story-scifi",
+    "text": "The colony ship Meridian had been silent for three hundred years when the first signal arrived. Chief engineer Okafor was the only one awake to hear it,",
+    "gen_tokens": 220
+  },
+  {
+    "name": "code-c-systems",
+    "text": "/* A minimal single-header arena allocator in C11.\n * Fixed-capacity, pointer-bump allocation, alignment-aware,\n * with a scratch-scope API for temporary allocations. */\n\n#include <stdalign.h>\n#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\ntypedef struct {\n    uint8_t *base;\n    size_t   cap;\n    size_t   used;\n} arena_t;\n\nstatic inline void arena_init(arena_t *a, void *mem, size_t cap) {",
+    "gen_tokens": 220
+  },
+  {
+    "name": "qa-science",
+    "text": "Question: Why is the sky blue during the day but red at sunset? Explain the physics in plain language.\nAnswer:",
+    "gen_tokens": 200
+  },
+  {
+    "name": "howto-cooking",
+    "text": "How to make a classic French omelette, step by step:\n\nStep 1: Crack three fresh eggs into a bowl and",
+    "gen_tokens": 180
+  },
+  {
+    "name": "essay-economics",
+    "text": "The concept of opportunity cost is central to economic reasoning. When a student chooses to spend an evening studying rather than working a paid shift, the true cost of that choice is",
+    "gen_tokens": 200
+  },
+  {
+    "name": "dialogue-interview",
+    "text": "Interviewer: You've spent twenty years studying deep-sea ecosystems. What first drew you to hydrothermal vents?\n\nDr. Chen: It started with a photograph, actually.",
+    "gen_tokens": 200
+  },
+  {
+    "name": "math-wordproblem",
+    "text": "A water tank can be filled by pipe A in 6 hours and by pipe B in 9 hours, while drain C can empty the full tank in 12 hours. If all three are opened at once on an empty tank, how long until the tank is full?\n\nLet the tank's volume be 1 unit. Pipe A fills at a rate of",
+    "gen_tokens": 200
+  },
+  {
+    "name": "legal-explainer",
+    "gen_tokens": 200,
+    "text": "Explain in plain language what the doctrine of adverse possession is in property law, what conditions a claimant typically has to satisfy, and give one concrete illustrative example."
+  },
+  {
+    "name": "medical-explainer",
+    "gen_tokens": 200,
+    "text": "Describe how mRNA vaccines work at the cellular level, step by step, including how the immune system builds lasting protection afterwards."
+  },
+  {
+    "name": "poetry-sonnet",
+    "gen_tokens": 180,
+    "text": "Write a Shakespearean sonnet about a lighthouse keeper watching a winter storm, then briefly explain the volta you chose."
+  },
+  {
+    "name": "code-js-async",
+    "gen_tokens": 240,
+    "text": "Write a JavaScript module that fetches three REST endpoints concurrently with a per-request timeout and one retry with exponential backoff, then merges the results. Use async/await, no external libraries, and add short comments."
+  },
+  {
+    "name": "sql-analytics",
+    "gen_tokens": 220,
+    "text": "Given tables orders(order_id, customer_id, created_at, total_cents) and customers(customer_id, country, signup_at), write SQL to compute monthly revenue by country for the last 12 months, month-over-month growth, and the top 3 countries by growth. Explain each CTE briefly."
+  },
+  {
+    "name": "logic-puzzle",
+    "gen_tokens": 220,
+    "text": "Three friends - Ada, Ben, and Cara - each own a different pet (cat, dog, parrot) and live in different cities (Oslo, Lima, Kyoto). Ada does not own the dog. The parrot owner lives in Lima. Ben lives in Oslo. Cara does not live in Lima. Who owns which pet and lives where? Reason step by step."
+  },
+  {
+    "name": "review-product",
+    "gen_tokens": 180,
+    "text": "Write a balanced 150-word review of a mid-range mechanical keyboard, covering build quality, switch feel, software, and value, ending with a verdict out of 10."
+  },
+  {
+    "name": "translation-style",
+    "gen_tokens": 200,
+    "text": "Translate the sentence 'The quiet harbor kept its secrets long after the last ship had gone' into French and German, then explain the stylistic choices you made in each translation."
+  }
+]

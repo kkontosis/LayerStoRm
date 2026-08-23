@@ -1,0 +1,7 @@
+- dataset:
+    id: datacurve/deep-swe
+    task_id: deep_swe
+  value: 46.2
+  source:
+    url: https://huggingface.co/zai-org/GLM-5.2
+    name: Model Card

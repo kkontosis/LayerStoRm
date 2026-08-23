@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "x-configFile": "orchestrator.json",
+  "description": "Orchestrator event-loop internal parameters (Python OrchestratorConfig knobs not part of the user-facing orchestrator section). Loaded from orchestrator.json if not inlined.",
+  "properties": {
+    "ep_gpu_indices": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 },
+      "uniqueItems": true,
+      "default": [],
+      "description": "EP owner set for the FETCH_AND_RUN_MOE round-robin: GPU positions (index into hardware.gpus[], INV-4.18) allowed to OWN routed experts. Empty (DEFAULT) = derive from topology (drivers' derived value; byte-identical to prior behavior). HAZARD (INV-FAR deadline-burn): MUST exclude GPUs that host no expert cache — e.g. a dspark draft GPU — an expert round-robined onto such a GPU can never become ready, and every MoE layer then burns the full FETCH_AND_RUN fetch deadline. Mirrors Python OrchestratorConfig.ep_gpu_indices (drivers pass this value through when present)."
+    }
+  },
+  "additionalProperties": false
+}

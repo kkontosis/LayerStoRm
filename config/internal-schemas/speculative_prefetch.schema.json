@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "x-configFile": "speculative_prefetch.json",
+  "description": "Speculative prefetch planning internal parameters. Loaded from speculative_prefetch.json if not inlined.",
+  "properties": {
+    "per_layer_us": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 920,
+      "x-changeable": true,
+      "description": "Estimated microseconds per MoE layer during verification (for transfer timing)"
+    },
+    "pcie_bw_bytes_per_us": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 64000.0,
+      "x-changeable": true,
+      "description": "PCIe bandwidth in bytes per microsecond (64000 = ~64 GB/s PCIe gen5 x16)"
+    },
+    "max_transfers_per_plan": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 256,
+      "description": "Maximum expert transfers in a single verification plan"
+    }
+  },
+  "additionalProperties": false
+}

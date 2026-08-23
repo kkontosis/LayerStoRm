@@ -1,0 +1,116 @@
+{
+    "_comment": "EPM-5 production base (full corpus, studies/epm/epm5-corpus). Bakes the EPM-4 grid priors (DECISION.md): BCE-PRIMARY loss (the single biggest lever, +0.044 r@8; ALSO REQUIRED \u2014 the EPM-5 corpus is assembled store_logits=False so kl_weight MUST be 0), learnable rmsnorm input (essential; no-norm collapses below Tier-0), 5-tap fusion (small real gain), W-shaped LOSS (small real W-score edge over uniform), direct low-rank heads (best ECE 0.026). Capacity knobs (r_base, delta budget/max_rank) were data-limited/unmeasurable at 319 blocks \u2014 set generously here and re-swept at scale by the arms grid. split_seed + accept_curve are PLACEHOLDERS: Phase C re-derives the split by the E4 procedure (select_split_seed on the real corpus, NEVER reuse an old seed) and the accept_curve from the corpus accepted_len histogram before training.",
+    "seed": 0,
+    "device": "cuda",
+    "out_dir": "build/epm5-grid/default",
+    "data": {
+        "shards": "/srv/models/epm5-corpus/shards",
+        "held_out_fraction": 0.25,
+        "split_seed": 35,
+        "in_sample": false,
+        "batch_blocks": 16,
+        "token_mismatch_weight": 1.0,
+        "unknown_provenance_matched": true
+    },
+    "router": {
+        "checkpoint_dir": "/srv/models/lukealonso/GLM-5.2-NVFP4",
+        "npz": null
+    },
+    "model": {
+        "arm": "direct",
+        "normalization": {
+            "kind": "rmsnorm",
+            "learnable": true,
+            "eps": 1e-06
+        },
+        "taps": {
+            "mode": "fusion",
+            "map": "prior"
+        },
+        "layer_groups": "per_layer",
+        "direct_head": {
+            "r_base": 64,
+            "logit_bias": true,
+            "use_router_bias_for_selection": true,
+            "residual": false,
+            "activation": "none",
+            "delta": {
+                "enabled": true,
+                "budget_params": 60000000,
+                "min_rank": 0,
+                "max_rank": 96
+            }
+        },
+        "adapter": {
+            "r_base": 64,
+            "residual": true,
+            "activation": "none",
+            "delta": {
+                "enabled": true,
+                "budget_params": 60000000,
+                "min_rank": 0,
+                "max_rank": 96
+            }
+        },
+        "prior": {
+            "enabled": false,
+            "init_beta": 3.0,
+            "per": "layer"
+        }
+    },
+    "_wmap_note": "accept_curve DERIVED from the corpus accepted_len histogram (per-position conditional acceptance), 2026-08-08.",
+    "wmap": {
+        "kind": "directive",
+        "accept_curve": [
+            0.6402,
+            0.6149,
+            0.6099,
+            0.631,
+            0.675,
+            0.7173,
+            0.765,
+            0.8083,
+            0.8338,
+            0.8663,
+            0.8884,
+            0.912,
+            0.9286,
+            0.9479,
+            0.956
+        ],
+        "k0_value": 1.0,
+        "k1_early_layers": 4,
+        "k1_early_value": 0.8,
+        "depth_taper_min": 0.5,
+        "floor": 0.02
+    },
+    "loss": {
+        "kl_weight": 0.0,
+        "kl_temperature": 1.0,
+        "bce_weight": 1.0,
+        "mse_weight": 0.0
+    },
+    "optim": {
+        "lr": 0.0003,
+        "weight_decay": 0.01,
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "schedule": "cosine",
+        "warmup_steps": 200,
+        "min_lr_ratio": 0.0,
+        "grad_accum": 1,
+        "clip_grad_norm": 1.0,
+        "max_steps": 4000
+    },
+    "eval": {
+        "every_steps": 0,
+        "m_rank": 32
+    },
+    "checkpoint": {
+        "every_steps": 0,
+        "keep": 1
+    },
+    "log_every": 100
+}

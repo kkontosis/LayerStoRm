@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "x-configFile": "dspark.json",
+  "description": "DSpark drafter/scheduler internal parameters (Phase 28). Loaded from dspark.json if not inlined.",
+  "properties": {
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for per-position acceptance-rate tracking (DSP-11 metrics; mirrors _internal-mtp_draft.acceptance_ema_alpha)"
+    },
+    "confidence_trace_capacity": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4096,
+      "description": "DSP-7: max recorded (c_k, accepted) rounds kept by the orchestrator planner as the offline STS-fit trace (DsparkDraft.confidence_trace, oldest dropped); only recorded when confidence_enabled"
+    }
+  },
+  "additionalProperties": false
+}

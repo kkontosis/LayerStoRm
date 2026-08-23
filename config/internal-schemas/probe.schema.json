@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "x-configFile": "probe.json",
+  "description": "PROBE multi-layer predictor internal parameters. Loaded from probe.json if not inlined.",
+  "properties": {
+    "hidden_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 7168,
+      "description": "Model hidden dimension for random projection input. Must match model.hidden_size"
+    },
+    "feature_dim": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 256,
+      "description": "Random projection output dimension"
+    },
+    "learning_rate": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 0.001,
+      "x-changeable": true,
+      "description": "SGD learning rate"
+    },
+    "momentum": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.9,
+      "x-changeable": true,
+      "description": "SGD momentum"
+    },
+    "training_batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 32,
+      "x-changeable": true,
+      "description": "Samples per training step"
+    },
+    "training_buffer_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2048,
+      "description": "Per-(probe_point, target_layer) ring buffer capacity"
+    },
+    "min_samples_before_predict": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 64,
+      "x-changeable": true,
+      "description": "Cold-start guard: return empty predictions until this many samples collected"
+    }
+  },
+  "additionalProperties": false
+}

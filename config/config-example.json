@@ -1,0 +1,581 @@
+{
+  "model": {
+    "architecture": "deepseek_v3",
+    "weights_path": "/data/models/deepseek-v3.2-nvfp4/",
+    "weights_format": "safetensors",
+    "use_mmap": true,
+    "num_hidden_layers": 61,
+    "hidden_size": 7168,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 128,
+    "kv_lora_rank": 512,
+    "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
+    "v_head_dim": 128,
+    "q_lora_rank": 1536,
+    "intermediate_size": 18432,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 8,
+    "n_group": 8,
+    "topk_group": 4,
+    "vocab_size": 129280,
+    "max_position_embeddings": 163840,
+    "rope_theta": 10000,
+    "rms_norm_eps": 0.000001,
+    "num_nextn_predict_layers": 1,
+    "index_topk": 2048,
+    "index_n_heads": 64,
+    "index_head_dim": 128,
+    "index_topk_freq": 0,
+    "index_skip_topk_offset": 0,
+    "rope_interleave": false,
+    "indexer_rope_interleave": false,
+    "first_k_dense_replace": 3,
+    "routed_scaling_factor": 2.5,
+    "moe_intermediate_size": 2048,
+    "moe_layer_freq": 1,
+    "norm_topk_prob": true,
+    "gating_score_fn": "sigmoid",
+    "head_dim": 0,
+    "compress_ratios": [],
+    "compress_rope_theta": 0,
+    "sliding_window": 0,
+    "swiglu_limit": 0,
+    "num_hash_layers": 0,
+    "o_groups": 1,
+    "o_lora_rank": 0,
+    "hc_mult": 1,
+    "hc_sinkhorn_iters": 20,
+    "hc_eps": 0.000001,
+    "vision": {
+      "enabled": false,
+      "hidden_size": 1152,
+      "num_layers": 27,
+      "num_heads": 16,
+      "patch_size": 14,
+      "image_size": 384
+    }
+  },
+  "quantization": {
+    "weights": "nvfp4",
+    "gguf_strategy": "int",
+    "attention_compute": "fp8_e4m3",
+    "kv_cache": "fp8_e4m3",
+    "gating_compute": "fp32"
+  },
+  "hardware": {
+    "gpus": [
+      {
+        "id": 0,
+        "type": "rtx5090"
+      },
+      {
+        "id": 1,
+        "type": "rtx5090"
+      },
+      {
+        "id": 2,
+        "type": "rtx5080"
+      },
+      {
+        "id": 3,
+        "type": "rtx5080"
+      }
+    ],
+    "cpu_expert_devices": [],
+    "nvme_paths": [],
+    "dcp_indexer_mode": "replicated",
+    "dcp_kv_mode": "sharded"
+  },
+  "memory": {
+    "pinned_layers": {
+      "attention": "all",
+      "dense_ffn_layers": [
+        0,
+        1,
+        2,
+        59,
+        60
+      ],
+      "embedding": true,
+      "output_head": true,
+      "gating": "all"
+    },
+    "kv_cache": {
+      "max_pages_per_gpu": "auto",
+      "page_size_tokens": 16,
+      "speculation_pool_fraction": 0.15,
+      "indexer_k_page_size_tokens": 8192,
+      "prefill_scratch_preallocated_gb": 0.5,
+      "streaming_spill_fraction": 0.34,
+      "dcp_chunk_size": 16,
+      "page_growth_chunk_tokens": 1024,
+      "_advanced": {
+        "fragmentation_tolerance": 0.15
+      }
+    },
+    "kv_tiering": {
+      "enabled": false,
+      "hot_buffer_slots": 0,
+      "host_to_device_ratio": 8,
+      "replica_cold_dedup": true
+    },
+    "expert_cache": {
+      "eviction_policy": "impact_weighted_lru",
+      "eviction_alpha_recency": 0.4,
+      "eviction_beta_frequency": 0.35,
+      "eviction_gamma_routing_weight": 0.25,
+      "eviction_delta_temporal_autocorr": 0,
+      "eviction_epsilon_coactivation": 0,
+      "eviction_zeta_prefetch_score": 0,
+      "eviction_eta_hysteresis": 0,
+      "hysteresis_enabled": false,
+      "hysteresis_stages": 5,
+      "hysteresis_up_threshold": 5,
+      "hysteresis_down_threshold": 1,
+      "duplication_frequency_threshold_percentile": 95,
+      "temporal_autocorrelation_bonus": 0.8,
+      "stable_zone_fraction": 0.7,
+      "inclusive_cache": true,
+      "_advanced": {
+        "layer_depth_decay_factor": 0.95,
+        "entropy_aware_eviction": false
+      }
+    },
+    "nvme_tier": {
+      "enabled": false,
+      "io_engine": "io_uring",
+      "queue_depth": 64,
+      "prefetch_ahead_layers": 3,
+      "direct_io": true
+    },
+    "numa": {
+      "interleave_strategy": "affinity_based",
+      "fallback": "round_robin"
+    },
+    "vram_safety_margin_gb": 1,
+    "host_packed_cache_mb": 0,
+    "preload_expert_buffers": true,
+    "pin_host_expert_pool": true,
+    "pin_host_expert_pool_sizing": {
+      "mode": "fraction_total",
+      "value": 0.9,
+      "per_node": []
+    },
+    "pin_host_expert_pool_extra_scratch_bytes": 0,
+    "pin_host_expert_pool_preload": true,
+    "cross_node_spill": {
+      "enabled": true,
+      "nodes": [],
+      "sizing_mode": "fraction_total",
+      "sizing_value": 0.9,
+      "per_node": []
+    },
+    "pin_host_expert_pool_direct_o_direct": true,
+    "pin_host_expert_pool_iouring": false,
+    "pin_host_expert_pool_thp": true,
+    "arena_attach": {
+      "enabled": true,
+      "socket_path": "@layerstorm-arena",
+      "holder_binary": "",
+      "auto_spawn": true,
+      "persist": false
+    },
+    "arena_placement": {
+      "freq_table": "",
+      "online": true
+    }
+  },
+  "orchestrator": {
+    "performance_objective": {
+      "latency_weight": 0.6,
+      "throughput_weight": 0.4
+    },
+    "max_batch_size": 64,
+    "expert_batching": {
+      "enabled": true,
+      "max_wait_us": 50,
+      "min_batch_tokens_per_expert": 4
+    },
+    "coactivation_graph": {
+      "enabled": true,
+      "decay_factor": 0.999,
+      "reoptimize_interval_seconds": 300,
+      "workload_shift_decay": 0.1
+    },
+    "workload_detection": {
+      "ewma_alpha": 0.01,
+      "shift_threshold_std_devs": 3,
+      "_advanced": {
+        "token_window_size": 32
+      }
+    },
+    "ipc_transaction": {
+      "writer_yield_interval": 16,
+      "publish_interval_us": 5000,
+      "reader_max_retries": 200000000,
+      "reader_backoff_stage_size": 4096,
+      "reader_stage0_yield_every": 64
+    }
+  },
+  "prefetch": {
+    "prescope": {
+      "enabled": true,
+      "lookahead_layers": 1,
+      "top_k": 8,
+      "score_threshold": 0.01,
+      "predictor_enabled": false
+    },
+    "probe": {
+      "enabled": true,
+      "probe_points": [
+        0.25,
+        0.5,
+        0.75
+      ],
+      "confidence_threshold": 0.6
+    },
+    "moe_speq": {
+      "enabled": true,
+      "predictor_hidden_size": 256,
+      "learning_rate": 0.0001,
+      "training_buffer_size": 10000,
+      "train_interval_steps": 100
+    },
+    "speculative": {
+      "enabled": true,
+      "max_prefetch_depth_layers": 3,
+      "confidence_threshold": 0.4
+    },
+    "fusion_weights": {
+      "prescope_alpha": 0.5,
+      "probe_beta": 0.3,
+      "speq_gamma": 0.2,
+      "sp_moe_delta": 0.15
+    }
+  },
+  "speculation": {
+    "enabled": true,
+    "method": "none",
+    "mtp": {
+      "enabled": true,
+      "max_depth": 3,
+      "dynamic_depth": true,
+      "confidence_threshold": 0.4,
+      "batched_verify": true
+    },
+    "dspark": {
+      "block_size": 8,
+      "speculative_tokens": 7,
+      "aux_hidden_state_layer_ids": [
+        8,
+        23,
+        39,
+        55,
+        70
+      ],
+      "mask_token_id": 154856,
+      "max_anchors": 1024,
+      "draft_vocab_size": 154880,
+      "checkpoint_path": "test-data/GLM-5.2-speculator.dspark",
+      "draft_gpus": [],
+      "draft_weights_quant": "bf16",
+      "markov_rank": 256,
+      "head_type": "markov",
+      "confidence_enabled": false,
+      "scheduler_mode": "off",
+      "confidence_threshold": 0.5,
+      "sts_temperatures": [],
+      "draft_context_capacity_tokens": 8192,
+      "aux_capture_max_rows": 2048,
+      "epm_dump_dir": "",
+      "verify_chunk_prefetch": false
+    },
+    "self_speculative": {
+      "enabled": true,
+      "draft_expert_count": 1,
+      "adaptive_exit_enabled": true,
+      "draft_confidence_threshold": 0.4,
+      "residual_correction": {
+        "enabled": true,
+        "hidden_size": 128,
+        "learning_rate": 0.00005,
+        "training_buffer_size": 50000
+      }
+    },
+    "prompt_lookup": {
+      "enabled": true,
+      "min_ngram_size": 2,
+      "max_ngram_size": 4,
+      "max_continuation_length": 5
+    },
+    "verification": {
+      "moe_spec_max_loaded_experts_fraction": 0.8,
+      "adaptive_topk_threshold": 0.92,
+      "verification_quality_floor": 0.85,
+      "in_flight_transfer_mode": "conservative",
+      "sparse_verification": false,
+      "ranking_strategy": "router_based",
+      "substitution_policy": "substitution",
+      "_advanced": {
+        "max_draft_tree_size": 64
+      }
+    },
+    "layer_skip_draft": {
+      "enabled": false,
+      "method": "cosine_similarity",
+      "threshold": 0.995,
+      "min_acceptance_rate_to_enable": 0.5,
+      "target_skip_fraction": 0.5,
+      "no_skip_first": 3,
+      "no_skip_last": 3,
+      "min_contiguous": 1,
+      "product_window": 1,
+      "product_threshold": 0.985,
+      "_advanced": {
+        "layer_optimization_interval": 128,
+        "decaying_threshold_temperature": 0
+      }
+    },
+    "transfer_cancellation": {
+      "cancel_abort_transfers": true,
+      "cancel_skip_transfers": true,
+      "cancel_stability_window": 2,
+      "transfer_origin_expiry_cycles": 10000
+    },
+    "reasoning_mode": {
+      "enabled": false,
+      "think_token_detection": true,
+      "aggressive_speculation_depth_multiplier": 2,
+      "relaxed_verification_threshold": 0.85
+    },
+    "calibration": {
+      "min_acceptance_rate": 0.3,
+      "target_acceptance_rate": 0.6,
+      "adjustment_interval_tokens": 500,
+      "acceptance_ema_alpha": 0.5,
+      "draft_count_ema_alpha": 0.9,
+      "adjustment_step_size": 0.01,
+      "_advanced": {
+        "cascade_test_iterations": 4,
+        "cascade_set_iterations": 16,
+        "cascade_adaptive_backoff": true
+      }
+    },
+    "utility_scorer": {
+      "enabled": true,
+      "strategy": "cascade",
+      "static_depth": 3,
+      "utility_threshold": 1,
+      "vram_headroom_fraction": 0.1
+    },
+    "draft_combiner": {
+      "enabled": true,
+      "prompt_lookup_priority_boost": 1,
+      "mtp_compute_cost": 0.1,
+      "self_spec_compute_cost": 0.5,
+      "dspark_compute_cost": 0.05
+    }
+  },
+  "parallelism": {
+    "tensor_parallelism": 2,
+    "expert_affinity": {
+      "mode": "soft",
+      "initial_assignment": "round_robin",
+      "rebalance_interval_seconds": 300
+    },
+    "expert_duplication": {
+      "enabled": true,
+      "max_duplicated_fraction": 0.05
+    },
+    "node_routing": {
+      "max_nodes_per_token": 4
+    }
+  },
+  "transfer": {
+    "fine_grained": {
+      "enabled": false,
+      "max_in_flight_per_gpu": 4,
+      "prefetch_distance_layers": 4
+    },
+    "streams_per_gpu": 2,
+    "priority_levels": 3
+  },
+  "compute": {
+    "cuda_graphs": {
+      "enabled": true,
+      "capture_attention": true,
+      "capture_gating": true,
+      "capture_tp_allreduce": true,
+      "capture_expert_ffn": false
+    },
+    "gemm": {
+      "backend": "cutlass",
+      "grouped_gemm": true,
+      "fused_swiglu": true
+    },
+    "attention_backend": "snapmla",
+    "prefill_superchunk_tokens": 0,
+    "prefill_moe_big": true,
+    "moe_big_chunk_tokens": 512,
+    "dsa_sparse_prefill": false,
+    "dsa_indexer_rewind": true,
+    "deterministic_reduce": true,
+    "deterministic_ep_combine": false,
+    "deterministic_ep_combine_precision": "bf16",
+    "ipc_pin": true
+  },
+  "serving": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_concurrent_requests": 32,
+    "max_sequence_length": 32768,
+    "tokenizer_path": "auto",
+    "tool_call_parser": "",
+    "enable_auto_tool_choice": false,
+    "reasoning_parser": "",
+    "reasoning_config": "",
+    "tokenizer_mode": "auto",
+    "prefix_cache": {
+      "enabled": true,
+      "max_cached_tokens": 8192,
+      "max_entries": 8
+    }
+  },
+  "preprocessing": {
+    "prepacked_dir": "",
+    "auto_preprocess": false,
+    "auto_preprocess_target": "",
+    "host_cache_mode": "mmap",
+    "legacy_weights": false
+  },
+  "_internal-prescope": {
+    "hidden_size": 7168,
+    "pca_dim": 256,
+    "hidden_dim": 256,
+    "learning_rate": 0.001,
+    "momentum": 0.9,
+    "training_batch_size": 32,
+    "training_buffer_size": 2048,
+    "focal_loss_gamma": 2,
+    "balance_loss_lambda": 0.5,
+    "input_group_frac": 0.25,
+    "output_group_frac": 0.25,
+    "min_samples_before_predict": 64,
+    "freq_ema_alpha": 0.01
+  },
+  "_internal-residual_correction": {
+    "training_batch_size": 32,
+    "min_samples_before_predict": 64,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8
+  },
+  "_internal-utility_scorer": {
+    "candidate_depths": [
+      0,
+      1,
+      2,
+      3,
+      5,
+      7
+    ],
+    "test_iterations": 4,
+    "set_iterations": 16,
+    "convergence_tolerance": 0.1,
+    "backoff_multiplier": 2,
+    "ema_alpha": 0.3,
+    "ema_up_threshold": 0,
+    "ema_down_threshold": -0.25,
+    "coverage_discount_floor": 0.5
+  },
+  "_internal-mtp_draft": {
+    "confidence_threshold": 0.4,
+    "acceptance_ema_alpha": 0.3
+  },
+  "_internal-prompt_lookup": {
+    "acceptance_ema_alpha": 0.3
+  },
+  "_internal-self_speculative": {
+    "max_depth": 5,
+    "acceptance_ema_alpha": 0.3
+  },
+  "_internal-probe": {
+    "hidden_size": 7168,
+    "feature_dim": 256,
+    "learning_rate": 0.001,
+    "momentum": 0.9,
+    "training_batch_size": 32,
+    "training_buffer_size": 2048,
+    "min_samples_before_predict": 64
+  },
+  "_internal-moe_speq": {
+    "hidden_size": 7168,
+    "feature_dim": 256,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8,
+    "training_batch_size": 32,
+    "min_samples_before_predict": 64
+  },
+  "_internal-speculative_prefetch": {
+    "per_layer_us": 920,
+    "pcie_bw_bytes_per_us": 64000,
+    "max_transfers_per_plan": 256
+  },
+  "_internal-prefetch_fuser": {
+    "prescope_alpha": 0.5,
+    "probe_beta": 0.3,
+    "speq_gamma": 0.2,
+    "sp_moe_delta": 0.15,
+    "time_decay": 0.1,
+    "per_layer_us": 920
+  },
+  "_internal-scheduler": {
+    "urgency_weight": 0.4,
+    "readiness_weight": 0.4,
+    "batching_weight": 0.2,
+    "max_batch_size": 64,
+    "speculation_penalty": 0.1
+  },
+  "_internal-gpu_load_balancer": {
+    "weight_residency": 0.25,
+    "weight_capacity": 0.2,
+    "weight_headroom": 0.1,
+    "weight_affinity": 0.15,
+    "weight_transfer_cost": 0.15,
+    "weight_cache_quality_stable": 0.1,
+    "weight_cache_quality_streaming": 0.05,
+    "priority_bin_thresholds": [
+      0.3,
+      0.7
+    ],
+    "learned_scorer_enabled": false,
+    "learned_scorer_hidden_size": 32,
+    "learned_scorer_learning_rate": 0.0001,
+    "learned_scorer_buffer_size": 10000,
+    "learned_scorer_min_samples": 128
+  },
+  "_internal-draft_combiner": {
+    "acceptance_ema_alpha": 0.3,
+    "latency_per_position_us": 920,
+    "min_utility_threshold": 0,
+    "coverage_discount_floor": 0.5
+  },
+  "_internal-verifier": {
+    "acceptance_ema_alpha": 0.3
+  },
+  "_internal-dspark": {
+    "acceptance_ema_alpha": 0.3,
+    "confidence_trace_capacity": 4096
+  },
+  "_internal-orchestrator": {
+    "ep_gpu_indices": []
+  },
+  "gpu_loader": {
+    "enabled": false,
+    "calibration_mode": "loaded",
+    "calibration_path": ""
+  }
+}

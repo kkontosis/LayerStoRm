@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "x-configFile": "mtp_draft.json",
+  "description": "MTP draft internal parameters. Loaded from mtp_draft.json if not inlined.",
+  "properties": {
+    "confidence_threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.4,
+      "x-changeable": true,
+      "description": "Dynamic depth confidence gate (stop drafting when top1_prob below this)"
+    },
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for acceptance rate tracking"
+    }
+  },
+  "additionalProperties": false
+}

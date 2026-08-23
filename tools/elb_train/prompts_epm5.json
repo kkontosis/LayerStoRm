@@ -1,0 +1,3242 @@
+[
+ {
+  "name": "qa-geography-japan",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Japan, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Japan is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-brazil",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Brazil, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Brazil is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-egypt",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Egypt, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Egypt is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-canada",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Canada, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Canada is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-australia",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Australia, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Australia is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-india",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of India, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of India is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-norway",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Norway, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Norway is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-kenya",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Kenya, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Kenya is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-peru",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Peru, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Peru is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-thailand",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Thailand, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Thailand is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-morocco",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Morocco, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Morocco is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-geography-greece",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Greece, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Greece is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "qa-science-rainbow",
+  "family": "qa-science",
+  "text": "Question: Explain why rainbows form and why the colors always appear in the same order.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-tides",
+  "family": "qa-science",
+  "text": "Question: Explain how the Moon causes ocean tides and why there are two high tides a day.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-rust",
+  "family": "qa-science",
+  "text": "Question: Explain why iron rusts and how galvanization prevents it.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-lightning",
+  "family": "qa-science",
+  "text": "Question: Explain how lightning forms inside a thundercloud and why thunder follows it.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-vaccines",
+  "family": "qa-science",
+  "text": "Question: Explain how vaccines train the immune system to recognize a pathogen.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-blackhole",
+  "family": "qa-science",
+  "text": "Question: Explain what happens to matter that falls into a black hole.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-photosynth",
+  "family": "qa-science",
+  "text": "Question: Explain how photosynthesis converts sunlight into chemical energy.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-earthquake",
+  "family": "qa-science",
+  "text": "Question: Explain what causes earthquakes at tectonic plate boundaries.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-dna",
+  "family": "qa-science",
+  "text": "Question: Explain how DNA replication copies genetic information before cell division.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-antibiotic",
+  "family": "qa-science",
+  "text": "Question: Explain why antibiotics work against bacteria but not viruses.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-aurora",
+  "family": "qa-science",
+  "text": "Question: Explain what causes the aurora borealis at high latitudes.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-science-glacier",
+  "family": "qa-science",
+  "text": "Question: Explain how glaciers form and how they carve valleys over millennia.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-python-lru",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement an LRU cache class with get/put in O(1) using a doubly linked list and a dict.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-csvagg",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a function that reads a CSV file and returns per-column mean, min and max.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-trie",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a trie (prefix tree) with insert, search and startswith methods.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-heap",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a binary min-heap class with push, pop and peek from scratch.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-json2xml",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a recursive converter from nested dicts/lists to indented XML.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-retry",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a retry decorator with exponential backoff and jitter.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-topo",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement topological sort of a dependency graph with cycle detection.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-bloom",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a Bloom filter class with add and probably-contains using two hash functions.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-diff",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a simple line-based diff between two lists of strings (LCS based).\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-pool",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a thread pool with a task queue and graceful shutdown.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-interval",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement an interval tree supporting insertion and overlap queries.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-python-markov",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a character-level Markov chain text generator with configurable order.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-ringbuf",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a lock-free single-producer single-consumer ring buffer.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-mempool",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a fixed-size block memory pool allocator with a free list.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-hashmap",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement an open-addressing hash map with linear probing and tombstones.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-spsc",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a bounded blocking queue using pthread mutex and condition variables.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-arena",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a bump-pointer arena allocator with alignment handling and reset.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-rbtree",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement red-black tree insertion with rebalancing rotations.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-crc32",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a table-driven CRC32 implementation.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-epoll",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement an epoll-based TCP echo server event loop.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-bitset",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a dynamic bitset with set/clear/test and population count.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-slab",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a slab allocator for fixed-size kernel-style objects.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-wal",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a minimal write-ahead log append and replay routine.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-c-systems-mmapio",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement memory-mapped file reading with madvise hints for sequential scans.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "code-js-async-fetchretry",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a fetch wrapper with timeout, abort controller and retries.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-debounce",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement debounce and throttle utilities with leading/trailing options.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-promisepool",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a promise pool that runs at most N tasks concurrently.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-eventemit",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a typed event emitter class with once and off.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-asyncq",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement an async task queue with priorities and cancellation.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-sse",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a server-sent-events client with automatic reconnection and backoff.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-memoize",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement an async memoization helper with TTL-based cache invalidation.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-stream",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a Node stream transform that gzips and hashes a file in one pass.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-router",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a tiny hash-based client-side router with route parameters.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-batcher",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a microtask batcher that coalesces calls within one tick.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-ws",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a WebSocket wrapper with heartbeat ping/pong and resubscribe on reconnect.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "code-js-async-semaphore",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a counting semaphore for limiting concurrent async operations.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 812
+ },
+ {
+  "name": "sql-analytics-retention",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: compute 7-day rolling user retention from an events table.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-funnel",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: a signup-to-purchase conversion funnel with step drop-off percentages.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-dedup",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: remove duplicate rows keeping the latest by updated_at using window functions.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-cohort",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: monthly revenue cohorts pivoted by months-since-signup.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-sessionize",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: sessionize click events with a 30-minute inactivity gap.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-topn",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: top 3 products per category by revenue with ties broken by units.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-churn",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: flag customers with no orders in the trailing 90 days as churned.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-median",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: median order value per region without a MEDIAN built-in.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-gapfill",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: fill missing calendar days with zero sales using a date spine.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-rfm",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: RFM (recency, frequency, monetary) scoring with quintile buckets.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-movavg",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: 28-day moving average of daily active users.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sql-analytics-slowly",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: a type-2 slowly changing dimension merge for customer addresses.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "math-derivation-quadratic",
+  "family": "math-derivation",
+  "text": "Problem: Derive the quadratic formula by completing the square. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-geoseries",
+  "family": "math-derivation",
+  "text": "Problem: Derive the closed form of a finite geometric series sum. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-basel",
+  "family": "math-derivation",
+  "text": "Problem: Derive why the sum of 1/n^2 converges (comparison test), and the value it approaches. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-derivsin",
+  "family": "math-derivation",
+  "text": "Problem: Derive the derivative of sin(x) from the limit definition. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-binomial",
+  "family": "math-derivation",
+  "text": "Problem: Derive the binomial theorem by induction. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-amgm",
+  "family": "math-derivation",
+  "text": "Problem: Derive the AM-GM inequality for two and then n variables. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-integparts",
+  "family": "math-derivation",
+  "text": "Problem: Derive the integration-by-parts formula from the product rule. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-euler",
+  "family": "math-derivation",
+  "text": "Problem: Derive Euler's formula e^(ix) = cos x + i sin x via power series. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-pythag",
+  "family": "math-derivation",
+  "text": "Problem: Derive the Pythagorean theorem using similar triangles. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-harmonic",
+  "family": "math-derivation",
+  "text": "Problem: Derive why the harmonic series diverges (grouping argument). Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-compound",
+  "family": "math-derivation",
+  "text": "Problem: Derive the continuous compounding limit (1 + r/n)^n -> e^r. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-derivation-bayes",
+  "family": "math-derivation",
+  "text": "Problem: Derive Bayes' theorem from the definition of conditional probability. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 812
+ },
+ {
+  "name": "math-wordproblem-trains",
+  "family": "math-wordproblem",
+  "text": "Problem: Two trains leave stations 480 km apart at the same time, one at 70 km/h and the other at 90 km/h, traveling toward each other. A bird flies at 120 km/h back and forth between them until they meet.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-tank",
+  "family": "math-wordproblem",
+  "text": "Problem: A tank holds 1200 liters. Pipe A fills it in 4 hours, pipe B in 6 hours, and drain C empties it in 12 hours. All three are opened together.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-ages",
+  "family": "math-wordproblem",
+  "text": "Problem: A mother is four times as old as her daughter. In 12 years she will be twice as old.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-mixture",
+  "family": "math-wordproblem",
+  "text": "Problem: A chemist has 30% acid solution and 80% acid solution and needs 5 liters of 50% solution.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-workers",
+  "family": "math-wordproblem",
+  "text": "Problem: Six workers can build a wall in 10 days. After 4 days, two workers leave.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-boat",
+  "family": "math-wordproblem",
+  "text": "Problem: A boat travels 24 km upstream in 3 hours and the same distance downstream in 2 hours.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-discount",
+  "family": "math-wordproblem",
+  "text": "Problem: A jacket is discounted 20%, then a further 15% at the register, and the final price is 170.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-orchard",
+  "family": "math-wordproblem",
+  "text": "Problem: An orchard's apple count grows 8% per year and is 5000 today.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-coins",
+  "family": "math-wordproblem",
+  "text": "Problem: A jar contains nickels, dimes and quarters, 60 coins worth 9.45 total, with twice as many dimes as nickels.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-ladder",
+  "family": "math-wordproblem",
+  "text": "Problem: A 10 m ladder leans against a wall, its base 6 m from the wall, and the base slides out at 0.5 m/s.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-probdice",
+  "family": "math-wordproblem",
+  "text": "Problem: Two fair dice are rolled and at least one shows an even number.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "math-wordproblem-garden",
+  "family": "math-wordproblem",
+  "text": "Problem: A rectangular garden's length is 3 m more than twice its width and its perimeter is 66 m.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 687
+ },
+ {
+  "name": "techdoc-networking-tcp",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: TCP connection establishment, flow control and congestion control\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-dns",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: DNS resolution from stub resolver to authoritative server, including caching and TTLs\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-tls",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: the TLS 1.3 handshake and how it differs from TLS 1.2\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-http2",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: HTTP/2 multiplexing, header compression and stream prioritization\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-bgp",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: BGP path selection and why route flaps propagate\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-nat",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: NAT traversal, hole punching and why symmetric NATs break it\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-quic",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: QUIC's 0-RTT connection setup and loss recovery\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-arp",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: ARP resolution and how gratuitous ARP is used in failover\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-vpn",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: how WireGuard establishes tunnels and routes traffic\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-cdn",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: how CDNs use anycast and edge caches to cut latency\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-dhcp",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: the DHCP DORA exchange and lease renewal\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "techdoc-networking-ipv6",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: IPv6 SLAAC address configuration and neighbor discovery\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-relay",
+  "family": "story-scifi",
+  "text": "The story begins: The deep-space relay station at the edge of the heliopause had been silent for nine days. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-terraform",
+  "family": "story-scifi",
+  "text": "The story begins: The terraforming crews on kepler-442b woke to find the atmosphere processors running in reverse. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-archive",
+  "family": "story-scifi",
+  "text": "The story begins: The last librarian of the orbital archive received a checkout request from a reader who had been dead for a century. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-tide",
+  "family": "story-scifi",
+  "text": "The story begins: The generation ship's gravity tide failed during the harvest festival. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-signal",
+  "family": "story-scifi",
+  "text": "The story begins: The radio telescope at parkes caught a narrowband signal that repeated every 11 minutes. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-cartographer",
+  "family": "story-scifi",
+  "text": "The story begins: The asteroid cartographer found a moonlet whose orbit could not be natural. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-winter",
+  "family": "story-scifi",
+  "text": "The story begins: The mars colony's third winter began two hundred sols early. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-courier",
+  "family": "story-scifi",
+  "text": "The story begins: The lightsail courier arrived with a cargo manifest written in a dead language. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-garden",
+  "family": "story-scifi",
+  "text": "The story begins: The hydroponic garden on station twelve started growing plants nobody had planted. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-echo",
+  "family": "story-scifi",
+  "text": "The story begins: Every jump through the wormhole returned the crew to a slightly different earth. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-miner",
+  "family": "story-scifi",
+  "text": "The story begins: The ice miner's sonar showed a perfectly cubic void beneath europa's crust. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-scifi-clockmaker",
+  "family": "story-scifi",
+  "text": "The story begins: The android clockmaker discovered its own blueprints predated its manufacturer. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-lighthouse",
+  "family": "story-mystery",
+  "text": "The lighthouse keeper's log ended mid-sentence on the night the light went dark. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-orchestra",
+  "family": "story-mystery",
+  "text": "The first violinist collapsed during the crescendo, and the poison had to have been administered on stage. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-manuscript",
+  "family": "story-mystery",
+  "text": "The rare-books dealer noticed the forged watermark only after the auction closed. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-garden2",
+  "family": "story-mystery",
+  "text": "Nobody had entered the walled garden in forty years, yet the roses were freshly pruned. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-train2",
+  "family": "story-mystery",
+  "text": "The night train arrived with one more passenger than had boarded. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-archivist",
+  "family": "story-mystery",
+  "text": "The county archivist found her own handwriting in a ledger from 1911. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-chess",
+  "family": "story-mystery",
+  "text": "The grandmaster resigned in a winning position and walked straight into the river fog. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-bells",
+  "family": "story-mystery",
+  "text": "The church bells rang thirteen times the morning the mayor vanished. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-painting",
+  "family": "story-mystery",
+  "text": "Under the varnish, the restorer found a second signature. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-well",
+  "family": "story-mystery",
+  "text": "The village well went dry the same week the new road opened. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-stamp",
+  "family": "story-mystery",
+  "text": "The philatelist paid a fortune for a stamp he then immediately burned. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "story-mystery-tide2",
+  "family": "story-mystery",
+  "text": "The tide brought in a rowboat full of clocks, all stopped at 3:17. What happened next was stranger still. ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-tariffs",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss the economic effects of tariffs on domestic manufacturing and consumer prices.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-ubi",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss the arguments for and against a universal basic income.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-rentcontrol",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss why economists disagree about rent control.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-inflation",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss how central banks fight inflation and the trade-offs involved.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-automation",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss whether automation destroys more jobs than it creates.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-carbontax",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss carbon taxes versus cap-and-trade for reducing emissions.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-minwage",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss the empirical evidence on minimum wage increases and employment.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-housing",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss why housing supply constraints raise prices in productive cities.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-trade",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss comparative advantage and why countries trade even when one is more productive at everything.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-crypto",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss whether cryptocurrencies can function as money.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-debt",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss when government debt matters and when it does not.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "essay-economics-monopoly",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss how network effects create winner-take-most markets.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-beekeeper",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a commercial beekeeper about colony collapse and pollination contracts.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-airtraffic",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with an air traffic controller about how sequencing and separation actually work.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-sommelier",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a sommelier about how professionals actually taste wine.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-smokejumper",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a wildfire smokejumper about the physics of fire behavior.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-luthier",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a violin maker about tonewood selection and varnish.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-submarine",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a retired submarine sonar operator about listening to the ocean.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-glassblower",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a glassblower about working molten glass by eye.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-actuary",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with an actuary about how insurers price hurricane risk.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-shepherd",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a highland shepherd about training border collies.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-volcanolog",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a volcanologist about forecasting eruptions.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-typograph",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a type designer about what makes a font readable.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "dialogue-interview-tunnel",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a tunnel boring machine operator about driving beneath a city.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 875
+ },
+ {
+  "name": "legal-explainer-adverse",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: adverse possession and why the law sometimes rewards trespassers.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-estoppel",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: promissory estoppel and when a promise without a contract binds.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-fairuse",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the four factors of copyright fair use.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-miranda",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: what Miranda rights actually require and common misconceptions.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-hearsay",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the hearsay rule and its major exceptions.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-negligence",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the elements of negligence from duty to damages.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-piercing",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: piercing the corporate veil and when owners become personally liable.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-easement",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: easements by necessity and by prescription.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-doublejeop",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: double jeopardy and why separate sovereigns can both prosecute.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-consideration",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the doctrine of consideration in contract formation.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-defamation",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: defamation law and the actual malice standard for public figures.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "legal-explainer-entrapment",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the entrapment defense and the difference between opportunity and inducement.\n\nExplanation: The core idea is",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-anesthesia",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how general anesthesia works and why patients don't remember surgery.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-insulin",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how insulin regulates blood sugar and what goes wrong in type 2 diabetes.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-mri",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how MRI machines image soft tissue without radiation.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-allergy",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: why the immune system overreacts in allergies and how antihistamines help.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-concussion",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: what happens to the brain during a concussion and why rest matters.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-dialysis",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how dialysis substitutes for failing kidneys.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-statins",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how statins lower cholesterol and who benefits.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-wound",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: the four phases of wound healing.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-pacemaker",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how a cardiac pacemaker senses and paces the heart.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-microbiome",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: the gut microbiome's role in digestion and immunity.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-chemo",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: why chemotherapy causes hair loss and nausea while fighting tumors.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "medical-explainer-bloodtypes",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: blood type compatibility and why O-negative is the universal donor.\n\nOverview: In plain terms,",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-sourdough",
+  "family": "howto-cooking",
+  "text": "Cooking guide: maintaining a sourdough starter and baking a first loaf.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-risotto",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a proper risotto with stock added one ladle at a time.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-brisket",
+  "family": "howto-cooking",
+  "text": "Cooking guide: smoking a brisket low and slow, including the stall and the wrap.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-ramen",
+  "family": "howto-cooking",
+  "text": "Cooking guide: building a bowl of ramen from broth to toppings.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-croissant",
+  "family": "howto-cooking",
+  "text": "Cooking guide: laminating dough for croissants over two days.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-curry",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a Thai green curry from paste to finish.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-pickles",
+  "family": "howto-cooking",
+  "text": "Cooking guide: lacto-fermented dill pickles with a 3.5% brine.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-steak",
+  "family": "howto-cooking",
+  "text": "Cooking guide: reverse-searing a thick ribeye with a thermometer.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-pasta",
+  "family": "howto-cooking",
+  "text": "Cooking guide: fresh egg pasta by hand without a machine.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-stirfry",
+  "family": "howto-cooking",
+  "text": "Cooking guide: wok stir-frying with proper heat management and mise en place.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-mole",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a simplified mole negro with toasted chilies.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "howto-cooking-paella",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a seafood paella with proper socarrat.\n\nStep 1: Begin by",
+  "gen_tokens": 812
+ },
+ {
+  "name": "review-product-espresso",
+  "family": "review-product",
+  "text": "Product review: a mid-range home espresso machine after six months of daily use.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-ebike",
+  "family": "review-product",
+  "text": "Product review: a commuter e-bike ridden through one full winter.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-keyboard",
+  "family": "review-product",
+  "text": "Product review: a hot-swappable mechanical keyboard for programmers.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-tent",
+  "family": "review-product",
+  "text": "Product review: a four-season backpacking tent tested in high wind.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-monitor",
+  "family": "review-product",
+  "text": "Product review: a 32-inch 4K monitor for color-critical work.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-vacuum",
+  "family": "review-product",
+  "text": "Product review: a robot vacuum in a house with two shedding dogs.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-headphones",
+  "family": "review-product",
+  "text": "Product review: noise-cancelling headphones on long-haul flights.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-standdesk",
+  "family": "review-product",
+  "text": "Product review: a standing desk after a year of hybrid work.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-camera",
+  "family": "review-product",
+  "text": "Product review: a compact mirrorless camera for street photography.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-thermostat",
+  "family": "review-product",
+  "text": "Product review: a smart thermostat through a heating season.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-chefknife",
+  "family": "review-product",
+  "text": "Product review: an entry-level Japanese chef's knife versus a German workhorse.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "review-product-watch",
+  "family": "review-product",
+  "text": "Product review: a GPS running watch through marathon training.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 750
+ },
+ {
+  "name": "poetry-sonnet-sea",
+  "family": "poetry",
+  "text": "Commission: write a Shakespearean sonnet about the sea reclaiming a coastal town. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-villanelle",
+  "family": "poetry",
+  "text": "Commission: write a villanelle about insomnia. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-ode-autumn",
+  "family": "poetry",
+  "text": "Commission: write an ode to the first frost of autumn. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-ballad",
+  "family": "poetry",
+  "text": "Commission: write a ballad about a railway ghost. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-haiku-seq",
+  "family": "poetry",
+  "text": "Commission: write a sequence of twelve linked haiku following a river from spring to sea. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-elegy",
+  "family": "poetry",
+  "text": "Commission: write an elegy for a closed village school. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-sestina",
+  "family": "poetry",
+  "text": "Commission: write a sestina about a lighthouse keeper's routine. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-freeverse",
+  "family": "poetry",
+  "text": "Commission: write a free-verse poem about a city waking before dawn. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-pantoum",
+  "family": "poetry",
+  "text": "Commission: write a pantoum about tides and memory. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-limericks",
+  "family": "poetry",
+  "text": "Commission: write a set of eight limericks about failed inventions. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-blankverse",
+  "family": "poetry",
+  "text": "Commission: write blank verse describing a glassblower at work. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "poetry-acrostic",
+  "family": "poetry",
+  "text": "Commission: write an acrostic on the word PERSEVERANCE about polar exploration. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 687
+ },
+ {
+  "name": "translation-style-legalese",
+  "family": "translation-style",
+  "text": "Style exercise: Rewrite the fairy tale of Goldilocks as a legal complaint filed by the three bears.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-noir",
+  "family": "translation-style",
+  "text": "Style exercise: Rewrite the story of the tortoise and the hare as hard-boiled detective noir.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-shakespeare",
+  "family": "translation-style",
+  "text": "Style exercise: Rewrite a smartphone user manual's setup chapter as a Shakespearean scene.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-bureaucrat",
+  "family": "translation-style",
+  "text": "Style exercise: Rewrite the tale of Icarus as an aviation incident report.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-sports",
+  "family": "translation-style",
+  "text": "Style exercise: Narrate a chess world championship game as a boxing commentary.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-nature-doc",
+  "family": "translation-style",
+  "text": "Style exercise: Narrate morning rush hour in a subway station as a wildlife documentary.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-victorian",
+  "family": "translation-style",
+  "text": "Style exercise: Rewrite a food delivery app's FAQ in the style of a Victorian etiquette manual.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-epic",
+  "family": "translation-style",
+  "text": "Style exercise: Retell a group project's missed deadline as Homeric epic.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-weather",
+  "family": "translation-style",
+  "text": "Style exercise: Describe a toddler's birthday party as a severe weather forecast.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-recipe2",
+  "family": "translation-style",
+  "text": "Style exercise: Describe falling in love as a recipe with ingredients and method.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-minutes",
+  "family": "translation-style",
+  "text": "Style exercise: Record the fall of Troy as corporate board-meeting minutes.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "translation-style-insurance",
+  "family": "translation-style",
+  "text": "Style exercise: Summarize Little Red Riding Hood as an insurance claim adjuster's report.\n\nResult:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-knights",
+  "family": "logic-puzzle",
+  "text": "Puzzle: On an island of knights (always truthful) and knaves (always lying), A says 'B is a knave', B says 'A and C are the same kind', and C says 'exactly one of us is a knight.'\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-hats",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Three prisoners wear hats drawn from three red and two blue; each sees the others' hats but not their own, and they are asked in order whether they know their hat color. The first two say no.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-river",
+  "family": "logic-puzzle",
+  "text": "Puzzle: A farmer must ferry a wolf, a goat and a cabbage across a river in a boat that carries only one item at a time.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-scales",
+  "family": "logic-puzzle",
+  "text": "Puzzle: You have twelve coins, one counterfeit and either heavier or lighter, and a balance scale usable three times.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-doors",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Two doors, one to freedom and one to doom, guarded by one truth-teller and one liar; you may ask a single question to one guard.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-bridge",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Four people must cross a bridge at night with one flashlight, taking 1, 2, 5 and 10 minutes, at most two crossing at a time.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-census",
+  "family": "logic-puzzle",
+  "text": "Puzzle: A census taker asks a man for his three daughters' ages. Their product is 36, their sum equals the house number, and the eldest likes chocolate.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-lockers",
+  "family": "logic-puzzle",
+  "text": "Puzzle: A hundred lockers are toggled by a hundred students, student k toggling every kth locker.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-mislabel",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Three boxes labeled apples, oranges and mixed are all mislabeled; you may draw one fruit from one box.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-truthdays",
+  "family": "logic-puzzle",
+  "text": "Puzzle: A lion lies on Mondays, Tuesdays and Wednesdays; a unicorn lies on Thursdays, Fridays and Saturdays. Both say 'yesterday I was lying.'\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-water",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Using only a 3-liter jug and a 5-liter jug, measure exactly 4 liters.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "logic-puzzle-elevator",
+  "family": "logic-puzzle",
+  "text": "Puzzle: In a 100-floor building you have two identical eggs and must find the highest safe drop floor in the fewest worst-case drops.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-bridge",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on the opening of a record-span pedestrian bridge across a mountain gorge, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-fusion",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a university lab sustaining a fusion reaction for a full minute, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-comet",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a newly discovered comet expected to be visible to the naked eye next spring, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-election",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a small town electing its first teenage mayor in a landslide, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-whale",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a whale migration route shifting into busy shipping lanes, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-museum",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a museum returning a disputed artifact after a decade of negotiations, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-drought",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a reservoir dropping to reveal a submerged village, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-marathon",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a marathon won by a local amateur in a photo finish, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-solar",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a desert solar farm powering its first million homes, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-library",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a city library lending tools and musical instruments, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-volcano",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a dormant volcano showing its first unrest in a century, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "news-report-chess2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a chess prodigy defeating three grandmasters in a simultaneous exhibition, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "biography-bridgebuilder",
+  "family": "biography",
+  "text": "Profile: the life and work of a civil engineer who spent forty years building footbridges in remote valleys.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-cartographer2",
+  "family": "biography",
+  "text": "Profile: the life and work of a cartographer who mapped cave systems on three continents.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-organist",
+  "family": "biography",
+  "text": "Profile: the life and work of a cathedral organist who restored a war-damaged instrument over two decades.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-botanist",
+  "family": "biography",
+  "text": "Profile: the life and work of a botanist who catalogued alpine flowers above four thousand meters.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-shipwright",
+  "family": "biography",
+  "text": "Profile: the life and work of a shipwright who kept a traditional dory-building yard alive.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-astronomer",
+  "family": "biography",
+  "text": "Profile: the life and work of an amateur astronomer who discovered a supernova from a rooftop.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-baker2",
+  "family": "biography",
+  "text": "Profile: the life and work of a baker who revived a village's communal oven.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-linguist",
+  "family": "biography",
+  "text": "Profile: the life and work of a field linguist who documented a language with nine remaining speakers.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-clockmaker2",
+  "family": "biography",
+  "text": "Profile: the life and work of a horologist who maintained a city's public clocks for fifty years.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-beacon",
+  "family": "biography",
+  "text": "Profile: the life and work of a lighthouse keeper family's three generations on one rock.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-seedkeeper",
+  "family": "biography",
+  "text": "Profile: the life and work of a farmer who built a seed bank of two thousand heirloom varieties.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "biography-mailpilot",
+  "family": "biography",
+  "text": "Profile: the life and work of a bush pilot who flew mail routes over the tundra.\n\nThe profile begins in their early years:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-compound2",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: compound interest and why starting ten years earlier matters more than doubling contributions.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-indexfunds",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: index funds versus actively managed funds and the arithmetic of fees.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-bonds",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: how bond prices move inversely to interest rates.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-options",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: call and put options explained with concrete payoff examples.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-mortgage",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: how mortgage amortization front-loads interest.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-diversif",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: diversification and why correlation matters more than the number of holdings.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-shortsell",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: short selling mechanics and the risks of unlimited downside.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-etf",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: how ETF creation and redemption keeps prices near net asset value.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-yield",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: the yield curve and what an inversion historically signals.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-taxloss",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: tax-loss harvesting and the wash-sale rule.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-emergency",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: sizing an emergency fund and where to hold it.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "finance-explainer-rebalance",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: portfolio rebalancing and why it forces buying low.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 812
+ },
+ {
+  "name": "history-narrative-silkroad",
+  "family": "history-narrative",
+  "text": "Historical narrative: a caravan's journey along the Silk Road in the ninth century.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-printing",
+  "family": "history-narrative",
+  "text": "Historical narrative: the spread of the printing press through fifteenth-century Europe.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-longitude",
+  "family": "history-narrative",
+  "text": "Historical narrative: the race to solve the longitude problem at sea.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-canal",
+  "family": "history-narrative",
+  "text": "Historical narrative: the engineering of the Panama Canal and the fight against malaria.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-hanseatic",
+  "family": "history-narrative",
+  "text": "Historical narrative: a merchant's life in the Hanseatic League.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-observatory",
+  "family": "history-narrative",
+  "text": "Historical narrative: the building of a great medieval observatory.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-plague",
+  "family": "history-narrative",
+  "text": "Historical narrative: how a fourteenth-century port city responded to the plague.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-telegraph",
+  "family": "history-narrative",
+  "text": "Historical narrative: laying the first transatlantic telegraph cable.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-spice",
+  "family": "history-narrative",
+  "text": "Historical narrative: the Dutch-Portuguese struggle over the spice trade.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-aqueduct",
+  "family": "history-narrative",
+  "text": "Historical narrative: Roman aqueduct construction from survey to delivery.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-goldrush",
+  "family": "history-narrative",
+  "text": "Historical narrative: a forty-niner's season in the California gold fields.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "history-narrative-polar",
+  "family": "history-narrative",
+  "text": "Historical narrative: the sledging journeys of the heroic age of Antarctic exploration.\n\nThe account begins:",
+  "gen_tokens": 875
+ },
+ {
+  "name": "nature-writing-tidepool",
+  "family": "nature-writing",
+  "text": "Field notes: a year observing one tide pool through the seasons.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-oaktree",
+  "family": "nature-writing",
+  "text": "Field notes: the community of species living on a single old oak.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-murmuration",
+  "family": "nature-writing",
+  "text": "Field notes: starling murmurations over winter reed beds.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-fungi",
+  "family": "nature-writing",
+  "text": "Field notes: the mycorrhizal network beneath a beech forest.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-desertbloom",
+  "family": "nature-writing",
+  "text": "Field notes: a desert superbloom after decade rains.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-owls",
+  "family": "nature-writing",
+  "text": "Field notes: listening for owls through a winter night.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-salmonrun",
+  "family": "nature-writing",
+  "text": "Field notes: a salmon run from estuary to spawning gravel.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-bog",
+  "family": "nature-writing",
+  "text": "Field notes: the slow life of a peat bog.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-alpine",
+  "family": "nature-writing",
+  "text": "Field notes: the growing season above the treeline.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-mangrove",
+  "family": "nature-writing",
+  "text": "Field notes: a mangrove nursery at the tide's edge.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-prairie",
+  "family": "nature-writing",
+  "text": "Field notes: the root world of tallgrass prairie.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "nature-writing-reef",
+  "family": "nature-writing",
+  "text": "Field notes: night diving on a coral reef during spawning.\n\nThe notebook opens:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "product-spec-doorbell",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a battery-powered smart doorbell with local-only video storage.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-thermometer",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a Bluetooth meat thermometer with dual probes.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-standpump",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a floor-standing bicycle pump with digital gauge.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-airquality",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for an indoor air quality monitor with CO2 and PM2.5 sensors.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-kettle",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a gooseneck kettle with 1-degree temperature control.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-gps",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a handheld GPS unit for off-trail hiking.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-solarbank",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a foldable solar panel with USB-C power delivery.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-labelprint",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a thermal label printer for small e-commerce sellers.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-dashcam",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a dual-channel dash camera with parking mode.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-microscope",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a student microscope with phone camera adapter.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-weatherstn",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a home weather station with rain gauge and anemometer.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "product-spec-ereader",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a waterproof e-reader with physical page-turn buttons.\n\n# Product Specification\n\n",
+  "gen_tokens": 750
+ },
+ {
+  "name": "travel-guide-kyoto",
+  "family": "travel-guide",
+  "text": "Travel guide: three days in Kyoto for temples, gardens and food.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-patagonia",
+  "family": "travel-guide",
+  "text": "Travel guide: a two-week Patagonia itinerary for hikers.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-istanbul",
+  "family": "travel-guide",
+  "text": "Travel guide: a long weekend in Istanbul across two continents.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-iceland",
+  "family": "travel-guide",
+  "text": "Travel guide: driving Iceland's ring road in summer.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-oaxaca",
+  "family": "travel-guide",
+  "text": "Travel guide: a food-focused week in Oaxaca.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-dolomites",
+  "family": "travel-guide",
+  "text": "Travel guide: hut-to-hut trekking in the Dolomites.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-kerala",
+  "family": "travel-guide",
+  "text": "Travel guide: backwaters and hill stations in Kerala.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-newzealand",
+  "family": "travel-guide",
+  "text": "Travel guide: a South Island campervan route.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-jordan",
+  "family": "travel-guide",
+  "text": "Travel guide: Petra, Wadi Rum and the Dead Sea in six days.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-norway2",
+  "family": "travel-guide",
+  "text": "Travel guide: fjords by ferry on a budget.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-morocco2",
+  "family": "travel-guide",
+  "text": "Travel guide: medinas and mountains from Fez to Marrakech.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "travel-guide-georgia",
+  "family": "travel-guide",
+  "text": "Travel guide: wine country and the Caucasus in the Republic of Georgia.\n\nDay 1 begins:",
+  "gen_tokens": 812
+ },
+ {
+  "name": "sports-commentary-penalty",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a World Cup final decided by penalty shootout.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-ninth",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a baseball game tied in the bottom of the ninth with bases loaded.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-breakaway",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a mountain-stage breakaway holding off the peloton.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-matchpoint",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a Wimbledon final at match point in the fifth set.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-relay",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a 4x100 relay decided by the final exchange.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-buzzer",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a basketball playoff game in the last ten seconds.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-regatta",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: an America's Cup race in shifting winds.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-marathon2",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: the lead pack of a marathon at mile 24.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-curling",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a curling final coming down to the last stone.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-chessblitz",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a blitz chess tiebreak with seconds on both clocks.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-climbing",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a speed-climbing final decided by hundredths.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "sports-commentary-snooker",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a snooker world final at 17-17 in the deciding frame.\n\nCommentator: And here we are.",
+  "gen_tokens": 750
+ },
+ {
+  "name": "education-lesson-photosynth2",
+  "family": "education-lesson",
+  "text": "Lesson plan: a middle-school lesson plan on photosynthesis with a hands-on experiment.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-fractions",
+  "family": "education-lesson",
+  "text": "Lesson plan: teaching fraction division with visual models.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-circuits",
+  "family": "education-lesson",
+  "text": "Lesson plan: an introductory lesson on series and parallel circuits.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-essaywrite",
+  "family": "education-lesson",
+  "text": "Lesson plan: teaching thesis statements to first-year students.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-maps",
+  "family": "education-lesson",
+  "text": "Lesson plan: a geography lesson on map projections and their distortions.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-probability",
+  "family": "education-lesson",
+  "text": "Lesson plan: introducing probability with dice and spinners.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-cells",
+  "family": "education-lesson",
+  "text": "Lesson plan: a biology lab on observing onion cells under a microscope.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-debate",
+  "family": "education-lesson",
+  "text": "Lesson plan: structuring a classroom debate on school uniforms.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-coding",
+  "family": "education-lesson",
+  "text": "Lesson plan: a first programming lesson using turtle graphics.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-music",
+  "family": "education-lesson",
+  "text": "Lesson plan: teaching rhythm notation through body percussion.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-chemistry",
+  "family": "education-lesson",
+  "text": "Lesson plan: a safe kitchen-chemistry lesson on acids and bases.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "education-lesson-astronomy2",
+  "family": "education-lesson",
+  "text": "Lesson plan: a lesson on moon phases with a lamp-and-ball model.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-habit",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: how habits form through cue-routine-reward loops and how to change them.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-memory",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: why we remember the gist but forget the details.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-bystander",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: the bystander effect and how diffusion of responsibility works.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-flow",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: the conditions that produce flow states.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-bias-confirm",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: confirmation bias and why smart people fall for it.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-sleep",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: what each sleep stage does for learning and mood.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-stress",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: the difference between acute and chronic stress physiologically.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-motivation",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: intrinsic versus extrinsic motivation and the overjustification effect.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-grief",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: how grief actually unfolds versus the five-stages myth.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-placebo",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: why placebos work even when patients know they are placebos.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-attention",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: why multitasking is mostly task-switching and what it costs.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "psychology-explainer-anchoring",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: anchoring effects in negotiation and pricing.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 812
+ },
+ {
+  "name": "qa-geography-x-portugal",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Portugal, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Portugal is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-geography-x-vietnam",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Vietnam, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Vietnam is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-geography-x-chile",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Chile, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Chile is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-geography-x-poland",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Poland, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Poland is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-geography-x-new zealand",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of New Zealand, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of New Zealand is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-geography-x-turkey",
+  "family": "qa-geography",
+  "text": "Question: What is the capital of Turkey, and what are five landmarks a first-time visitor should see there?\nAnswer: The capital of Turkey is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "qa-science-x-osmosis",
+  "family": "qa-science",
+  "text": "Question: Explain how osmosis moves water across a cell membrane.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "qa-science-x-greenhouse",
+  "family": "qa-science",
+  "text": "Question: Explain the greenhouse effect and which gases drive it.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "qa-science-x-sound",
+  "family": "qa-science",
+  "text": "Question: Explain why sound travels faster in water than in air.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "qa-science-x-evolution",
+  "family": "qa-science",
+  "text": "Question: Explain how natural selection produces adaptation over generations.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "qa-science-x-magnetism",
+  "family": "qa-science",
+  "text": "Question: Explain how a compass needle aligns with Earth's magnetic field.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "qa-science-x-fermentation",
+  "family": "qa-science",
+  "text": "Question: Explain how yeast turns sugar into alcohol and carbon dioxide.\nAnswer: To understand this, we should start with",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-python-x-unionfind",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a union-find (disjoint set) with path compression and union by rank.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-python-x-ratelimit",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a token-bucket rate limiter class.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-python-x-dijkstra",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement Dijkstra's shortest path with a binary heap.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-python-x-cache_ttl",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a time-to-live cache decorator with lazy expiry.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-python-x-segtree",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a segment tree with range-sum query and point update.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-python-x-statemachine",
+  "family": "code-python",
+  "text": "# Python 3\n# Task: implement a small finite state machine engine driven by a transition table.\n# Below is a clean, well-commented implementation.\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-skiplist",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a skip list with insert and search.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-lru_c",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement an LRU cache using an intrusive doubly linked list and a hash table.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-bitpack",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a variable-length integer (varint) encoder and decoder.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-threadpool2",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a work-stealing thread pool.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-btree",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a B-tree node split and insert.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-c-systems-x-cordic",
+  "family": "code-c-systems",
+  "text": "/* C11. Task: implement a fixed-point CORDIC sine/cosine routine.\n * The implementation below is complete and commented. */\n\n#include <stdint.h>\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "code-js-async-x-lru_js",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement an LRU cache using a Map's insertion order.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-js-async-x-pubsub",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a topic-based pub/sub bus with wildcard subscriptions.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-js-async-x-pipeline",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement an async middleware pipeline (koa-style compose).\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-js-async-x-backoff",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement an exponential-backoff scheduler with jitter and a cap.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-js-async-x-virtuallist",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a windowed virtual-scroll list renderer.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "code-js-async-x-statestore",
+  "family": "code-js-async",
+  "text": "// Modern JavaScript (ES2022, Node 20).\n// Task: implement a tiny redux-like store with middleware.\n// Complete, production-quality implementation with comments:\n\n",
+  "gen_tokens": 650
+ },
+ {
+  "name": "sql-analytics-x-basket",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: market-basket pairs bought together in the same order.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sql-analytics-x-streak",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: longest consecutive-day login streak per user.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sql-analytics-x-pareto",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: the 80/20 revenue split by customer.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sql-analytics-x-latency_pct",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: p50/p95/p99 request latency per endpoint per hour.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sql-analytics-x-ab_test",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: conversion lift and significance between two experiment arms.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sql-analytics-x-dedupe_fuzzy",
+  "family": "sql-analytics",
+  "text": "-- PostgreSQL 16. Task: collapse near-duplicate accounts by normalized email.\n-- Schema and a fully worked query with explanation:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "math-derivation-x-logproduct",
+  "family": "math-derivation",
+  "text": "Problem: Derive the logarithm product rule from the exponent laws. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-derivation-x-cosine_law",
+  "family": "math-derivation",
+  "text": "Problem: Derive the law of cosines from the distance formula. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-derivation-x-variance",
+  "family": "math-derivation",
+  "text": "Problem: Derive the computational formula for variance E[X^2]-E[X]^2. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-derivation-x-arithmetic",
+  "family": "math-derivation",
+  "text": "Problem: Derive the closed form for an arithmetic series sum. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-derivation-x-chain_rule",
+  "family": "math-derivation",
+  "text": "Problem: Derive the chain rule from the limit definition. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-derivation-x-de_moivre",
+  "family": "math-derivation",
+  "text": "Problem: Derive de Moivre's theorem by induction. Give every algebraic step.\nSolution: We begin by writing",
+  "gen_tokens": 650
+ },
+ {
+  "name": "math-wordproblem-x-paint",
+  "family": "math-wordproblem",
+  "text": "Problem: Two painters together finish a house in 6 days; alone the faster one needs 5 fewer days than the slower.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "math-wordproblem-x-clockangle",
+  "family": "math-wordproblem",
+  "text": "Problem: Find the angle between the hour and minute hands at 3:40.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "math-wordproblem-x-interest2",
+  "family": "math-wordproblem",
+  "text": "Problem: An amount doubles in 9 years at simple interest; find the annual rate.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "math-wordproblem-x-fence",
+  "family": "math-wordproblem",
+  "text": "Problem: A rectangular field of area 600 square meters is fenced on three sides using 70 meters of fencing.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "math-wordproblem-x-average_speed",
+  "family": "math-wordproblem",
+  "text": "Problem: A car goes uphill at 40 km/h and returns downhill at 60 km/h over the same road.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "math-wordproblem-x-digits",
+  "family": "math-wordproblem",
+  "text": "Problem: A two-digit number is seven times the sum of its digits, and reversing the digits decreases it by 18.\nQuestion: Work the problem step by step and state the answer.\nSolution: Let us define the variables.",
+  "gen_tokens": 550
+ },
+ {
+  "name": "techdoc-networking-x-mqtt",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: the MQTT publish/subscribe protocol and QoS levels\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "techdoc-networking-x-grpc",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: how gRPC uses HTTP/2 and protobuf for streaming RPC\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "techdoc-networking-x-kafka",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: how Kafka partitions, offsets and consumer groups work\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "techdoc-networking-x-oauth",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: the OAuth 2.0 authorization-code flow with PKCE\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "techdoc-networking-x-ntp",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: how NTP disciplines a clock against stratum servers\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "techdoc-networking-x-loadbalance",
+  "family": "techdoc-networking",
+  "text": "# Engineering Guide\n## Topic: layer-4 vs layer-7 load balancing and health checks\n\nThis guide explains the mechanism end to end. We start with the basics:\n\n",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-seedvault",
+  "family": "story-scifi",
+  "text": "The story begins: The seed vault beneath the glacier logged a withdrawal no one had authorized. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-mirror",
+  "family": "story-scifi",
+  "text": "The story begins: The survey drone returned images of a second identical drone that had never launched. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-orbit",
+  "family": "story-scifi",
+  "text": "The story begins: The elevator cable to the orbital station began humming a note no engineer could explain. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-dust",
+  "family": "story-scifi",
+  "text": "The story begins: On the day the dust storms cleared, the rovers all pointed the same way. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-ferry",
+  "family": "story-scifi",
+  "text": "The story begins: The interstellar ferry arrived a decade early with the same passengers twice. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-scifi-x-beacon2",
+  "family": "story-scifi",
+  "text": "The story begins: The derelict's distress beacon was broadcasting a lullaby. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-cipher",
+  "family": "story-mystery",
+  "text": "The cryptographer received a postcard written in a code she had invented as a child. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-vineyard",
+  "family": "story-mystery",
+  "text": "Every bottle in the locked cellar had been opened and refilled. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-ferryman",
+  "family": "story-mystery",
+  "text": "The ferryman counted one more return trip than crossing. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-portrait",
+  "family": "story-mystery",
+  "text": "The museum's night guard aged in the security footage but not in life. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-recital",
+  "family": "story-mystery",
+  "text": "The piano tuned itself the night before the recital. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "story-mystery-x-almanac",
+  "family": "story-mystery",
+  "text": "The farmer's almanac predicted a storm that arrived a year to the minute late. What happened next was stranger still. ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-gig",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss whether the gig economy improves or erodes worker welfare.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-immigration",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss the labor-market effects of immigration on native wages.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-patents",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss whether patents accelerate or slow innovation.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-congestion",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss congestion pricing as a tool for urban traffic.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-landvalue",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss a land value tax versus property and income taxes.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "essay-economics-x-globalization",
+  "family": "essay-economics",
+  "text": "Essay prompt: Discuss who wins and who loses from trade globalization.\n\nEssay: The debate over this question turns on three considerations. First,",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-perfumer",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a master perfumer about composing a fragrance.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-avalanche",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with an avalanche forecaster about reading a snowpack.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-restorer",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a painting restorer about reversing a century of damage.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-falconer",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a falconer about training a bird of prey.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-bellfounder",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a bell founder about tuning a cast bronze bell.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "dialogue-interview-x-cavediver",
+  "family": "dialogue-interview",
+  "text": "Transcript of an interview with a cave diver about mapping flooded passages.\n\nInterviewer: Thanks for joining me. Let's start simple \u2014 how did you get into this line of work?\n\nGuest: ",
+  "gen_tokens": 700
+ },
+ {
+  "name": "legal-explainer-x-res_ipsa",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: res ipsa loquitur and when negligence is inferred from the accident itself.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "legal-explainer-x-mens_rea",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: mens rea and the levels of criminal intent.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "legal-explainer-x-laches",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: the doctrine of laches and unreasonable delay.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "legal-explainer-x-privity",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: privity of contract and third-party beneficiaries.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "legal-explainer-x-bailment",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: bailment and the duties of someone holding another's property.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "legal-explainer-x-nuisance",
+  "family": "legal-explainer",
+  "text": "Legal concepts explained for non-lawyers.\n\nTopic: private nuisance and the balancing of land uses.\n\nExplanation: The core idea is",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-thyroid",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how the thyroid regulates metabolism and what hypo/hyper mean.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-asthma",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: what happens in the airways during an asthma attack.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-clotting",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how the blood clotting cascade stops bleeding.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-vision",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how the eye focuses light and why glasses correct it.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-fever",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: why the body raises its temperature to fight infection.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "medical-explainer-x-hearing",
+  "family": "medical-explainer",
+  "text": "Patient education handout.\n\nTopic: how the inner ear turns vibration into sound perception.\n\nOverview: In plain terms,",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-tempering",
+  "family": "howto-cooking",
+  "text": "Cooking guide: tempering chocolate for a glossy snap.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-gnocchi",
+  "family": "howto-cooking",
+  "text": "Cooking guide: potato gnocchi from bake to boil.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-kimchi",
+  "family": "howto-cooking",
+  "text": "Cooking guide: napa cabbage kimchi with a proper fermentation.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-consomme",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a crystal-clear consomme using a raft.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-focaccia",
+  "family": "howto-cooking",
+  "text": "Cooking guide: a high-hydration focaccia with a dimpled crust.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "howto-cooking-x-dumplings",
+  "family": "howto-cooking",
+  "text": "Cooking guide: pleated pork dumplings from wrapper to steam.\n\nStep 1: Begin by",
+  "gen_tokens": 650
+ },
+ {
+  "name": "review-product-x-router_wifi",
+  "family": "review-product",
+  "text": "Product review: a mesh Wi-Fi system in a three-story house.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "review-product-x-grinder",
+  "family": "review-product",
+  "text": "Product review: a conical-burr coffee grinder for pour-over.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "review-product-x-trailrunner",
+  "family": "review-product",
+  "text": "Product review: a pair of trail-running shoes over 300 miles.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "review-product-x-projector",
+  "family": "review-product",
+  "text": "Product review: a portable projector for backyard movie nights.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "review-product-x-kayak",
+  "family": "review-product",
+  "text": "Product review: an inflatable touring kayak on lakes and rivers.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "review-product-x-mattress",
+  "family": "review-product",
+  "text": "Product review: a foam mattress after ninety nights.\n\nVerdict summary first, details after. After extensive testing, my overall impression is",
+  "gen_tokens": 600
+ },
+ {
+  "name": "poetry-x-sonnet-city",
+  "family": "poetry",
+  "text": "Commission: write a Petrarchan sonnet about a city at midnight. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "poetry-x-ghazal",
+  "family": "poetry",
+  "text": "Commission: write a ghazal about longing and rain. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "poetry-x-ode-tools",
+  "family": "poetry",
+  "text": "Commission: write an ode to a carpenter's worn hand tools. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "poetry-x-triolet",
+  "family": "poetry",
+  "text": "Commission: write a triolet about a lighthouse. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "poetry-x-ekphrastic",
+  "family": "poetry",
+  "text": "Commission: write an ekphrastic poem on a painting of a storm at sea. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "poetry-x-cinquains",
+  "family": "poetry",
+  "text": "Commission: write a sequence of five cinquains following a candle burning down. Include a short note on the formal choices.\n\n",
+  "gen_tokens": 550
+ },
+ {
+  "name": "translation-style-x-courtroom",
+  "family": "translation-style",
+  "text": "Style exercise: Retell the tortoise and the hare as closing arguments to a jury.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "translation-style-x-cookbook",
+  "family": "translation-style",
+  "text": "Style exercise: Describe a rocket launch as a cookbook recipe.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "translation-style-x-saga",
+  "family": "translation-style",
+  "text": "Style exercise: Retell a lost house-key morning as a Norse saga.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "translation-style-x-techsupport",
+  "family": "translation-style",
+  "text": "Style exercise: Narrate Romeo and Juliet's balcony scene as a tech-support chat.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "translation-style-x-naturalist",
+  "family": "translation-style",
+  "text": "Style exercise: Describe a crowded elevator as a Victorian naturalist's field journal.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "translation-style-x-sportscast",
+  "family": "translation-style",
+  "text": "Style exercise: Call a game of musical chairs as an Olympic final.\n\nResult:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-threehats",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Three logicians are told their hats are all the same color or not; each sees the others'.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-poison",
+  "family": "logic-puzzle",
+  "text": "Puzzle: A king has 1000 barrels, one poisoned, and 10 tasters who react in exactly one hour.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-islanders",
+  "family": "logic-puzzle",
+  "text": "Puzzle: On an island everyone with blue eyes must leave; a visitor says 'at least one of you has blue eyes.'\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-switches",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Three light switches downstairs control one bulb upstairs; you may go up only once.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-weighing2",
+  "family": "logic-puzzle",
+  "text": "Puzzle: Nine identical-looking balls, one slightly heavier, and a balance used twice.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "logic-puzzle-x-handshake",
+  "family": "logic-puzzle",
+  "text": "Puzzle: At a party of couples, everyone shakes a distinct number of hands except the host's partner.\nQuestion: Solve it with complete reasoning.\nSolution: Consider the possibilities carefully.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-seedbank2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a community seed bank opening in a drought-hit region, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-tramway",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a historic mountain tramway reopening after restoration, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-reef2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on divers replanting a bleached coral reef, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-observatory2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a new radio observatory detecting its first pulsar, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-ferry2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on an all-electric passenger ferry entering service, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "news-report-x-archive2",
+  "family": "news-report",
+  "text": "NEWS DESK \u2014 Write the full report on a national film archive digitizing its last nitrate reels, with quotes and background.\n\nThe article:\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "biography-x-bridgetender",
+  "family": "biography",
+  "text": "Profile: the life and work of a canal bridge-tender who kept the same lock for forty years.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "biography-x-glaciologist",
+  "family": "biography",
+  "text": "Profile: the life and work of a glaciologist who measured one glacier's retreat for a lifetime.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "biography-x-puppeteer",
+  "family": "biography",
+  "text": "Profile: the life and work of a shadow-puppet master who revived a dying tradition.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "biography-x-beekeeper2",
+  "family": "biography",
+  "text": "Profile: the life and work of a beekeeper who bred a gentler mountain honeybee.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "biography-x-typefounder",
+  "family": "biography",
+  "text": "Profile: the life and work of a type founder who cut punches by hand into his nineties.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "biography-x-stormchaser",
+  "family": "biography",
+  "text": "Profile: the life and work of a self-taught meteorologist who chased tornadoes for science.\n\nThe profile begins in their early years:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-dca",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: dollar-cost averaging versus lump-sum investing.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-annuity",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: how annuities trade a lump sum for lifetime income.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-credit_score",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: what actually moves a credit score.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-reit",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: how REITs let small investors own real estate.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-ladder",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: a bond or CD ladder for steady maturities.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "finance-explainer-x-expense_ratio",
+  "family": "finance-explainer",
+  "text": "Personal finance, explained clearly.\n\nTopic: why a 1% expense ratio costs more than it looks over decades.\n\nExplanation: Let's build this up from a simple example.",
+  "gen_tokens": 650
+ },
+ {
+  "name": "history-narrative-x-cartography",
+  "family": "history-narrative",
+  "text": "Historical narrative: the mapping of a coastline in the age of sail.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "history-narrative-x-guild",
+  "family": "history-narrative",
+  "text": "Historical narrative: a stonemason's rise through a medieval guild.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "history-narrative-x-monsoon",
+  "family": "history-narrative",
+  "text": "Historical narrative: an Indian Ocean monsoon trading voyage.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "history-narrative-x-railway",
+  "family": "history-narrative",
+  "text": "Historical narrative: driving the first transcontinental railway through the mountains.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "history-narrative-x-library2",
+  "family": "history-narrative",
+  "text": "Historical narrative: the founding and burning of a great ancient library.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "history-narrative-x-clocktower",
+  "family": "history-narrative",
+  "text": "Historical narrative: the building of a city's astronomical clock.\n\nThe account begins:",
+  "gen_tokens": 700
+ },
+ {
+  "name": "nature-writing-x-estuary",
+  "family": "nature-writing",
+  "text": "Field notes: a season watching an estuary's shifting sandbars.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "nature-writing-x-cloudforest",
+  "family": "nature-writing",
+  "text": "Field notes: a week in a dripping tropical cloud forest.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "nature-writing-x-saltmarsh",
+  "family": "nature-writing",
+  "text": "Field notes: the tidal rhythm of a salt marsh.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "nature-writing-x-kelp",
+  "family": "nature-writing",
+  "text": "Field notes: diving a swaying kelp forest through the seasons.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "nature-writing-x-dunes",
+  "family": "nature-writing",
+  "text": "Field notes: the slow migration of coastal sand dunes.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "nature-writing-x-heath",
+  "family": "nature-writing",
+  "text": "Field notes: a year on an upland heath from heather bloom to frost.\n\nThe notebook opens:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "product-spec-x-soilmeter",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a wireless soil moisture and pH meter for gardeners.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "product-spec-x-headlamp",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a rechargeable trail headlamp with a red night mode.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "product-spec-x-sousvide",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for an immersion sous-vide circulator with app control.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "product-spec-x-birdfeeder",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a camera bird feeder with species recognition.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "product-spec-x-windmeter",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a pocket anemometer for sailors and pilots.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "product-spec-x-noisemeter",
+  "family": "product-spec",
+  "text": "Write the complete product specification and user guide introduction for a calibrated sound-level meter for workplaces.\n\n# Product Specification\n\n",
+  "gen_tokens": 600
+ },
+ {
+  "name": "travel-guide-x-lisbon",
+  "family": "travel-guide",
+  "text": "Travel guide: three days in Lisbon by tram and tile.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "travel-guide-x-hokkaido",
+  "family": "travel-guide",
+  "text": "Travel guide: a week in Hokkaido for powder and hot springs.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "travel-guide-x-slovenia",
+  "family": "travel-guide",
+  "text": "Travel guide: lakes and caves across Slovenia.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "travel-guide-x-atacama",
+  "family": "travel-guide",
+  "text": "Travel guide: stargazing and salt flats in the Atacama.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "travel-guide-x-faroe",
+  "family": "travel-guide",
+  "text": "Travel guide: island-hopping the Faroes by ferry and tunnel.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "travel-guide-x-kyushu",
+  "family": "travel-guide",
+  "text": "Travel guide: an onsen and volcano loop of Kyushu.\n\nDay 1 begins:",
+  "gen_tokens": 650
+ },
+ {
+  "name": "sports-commentary-x-triathlon",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: an Ironman finish decided on the marathon leg.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sports-commentary-x-downhill",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a downhill ski run separated by hundredths.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sports-commentary-x-cricket",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a Test match on the final session with the light fading.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sports-commentary-x-rowing",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: an Olympic eights final in a crosswind.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sports-commentary-x-darts",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a darts final needing a checkout on the bull.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "sports-commentary-x-polevault",
+  "family": "sports-commentary",
+  "text": "Live commentary transcript: a pole-vault competition at a world-record height.\n\nCommentator: And here we are.",
+  "gen_tokens": 600
+ },
+ {
+  "name": "education-lesson-x-density",
+  "family": "education-lesson",
+  "text": "Lesson plan: a lesson on density with a sink-or-float experiment.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "education-lesson-x-grammar",
+  "family": "education-lesson",
+  "text": "Lesson plan: teaching parts of speech through sentence building.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "education-lesson-x-moon",
+  "family": "education-lesson",
+  "text": "Lesson plan: a lesson on the phases of the Moon with a model.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "education-lesson-x-percentages",
+  "family": "education-lesson",
+  "text": "Lesson plan: teaching percentages through shopping discounts.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "education-lesson-x-ecosystem",
+  "family": "education-lesson",
+  "text": "Lesson plan: a food-web lesson with a classroom simulation.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "education-lesson-x-magnets",
+  "family": "education-lesson",
+  "text": "Lesson plan: an introductory lesson on magnetism with hands-on stations.\n\nLearning objectives: By the end of this lesson, students will",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-spacing",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: why spaced repetition beats cramming.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-dunning",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: the Dunning-Kruger effect and self-assessment.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-framing",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: how framing changes the same decision.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-hedonic",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: the hedonic treadmill and why raises stop feeling good.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-prospect",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: loss aversion and prospect theory in everyday choices.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ },
+ {
+  "name": "psychology-explainer-x-social_proof",
+  "family": "psychology-explainer",
+  "text": "The science, explained.\n\nTopic: why we copy the crowd under uncertainty.\n\nExplanation: Research on this question shows",
+  "gen_tokens": 650
+ }
+]

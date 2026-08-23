@@ -1,0 +1,32 @@
+.syncthing*
+ref/
+ref
+test-data/*GGUF
+test-data/*NVFP4
+test-data/*-prepacked*
+test-data/*/.gitattributes
+build/
+build-asan/
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.idea
+compile_commands.json
+claude-to-resume*
+.mcp.json
+.cache/
+.serena/
+.claude/
+Testing/
+# GPU loader calibration: the engine's generated/auto-loaded constants are
+# machine-specific (committed reference fixture lives in tests/assets/).
+/gpu_loader_calibration.json
+test-data/glm52-longctx-ckpt*
+test-data/GLM-5.2-prepacked/
+test-data/GLM-5.2-GGUF-Q4_K_XL
+test-data/GLM-5.2-speculator.dspark
+# Routing x-ray capture (1.6 GB local artifact; see test-data/routing-xray/README.md)
+test-data/routing-xray/*.bin
+test-data/routing-xray/route_dump_*

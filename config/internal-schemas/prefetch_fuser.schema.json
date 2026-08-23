@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "x-configFile": "prefetch_fuser.json",
+  "description": "Prefetch signal fusion weights. Loaded from prefetch_fuser.json if not inlined.",
+  "properties": {
+    "prescope_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.5,
+      "x-changeable": true,
+      "description": "PreScope signal weight in fusion formula"
+    },
+    "probe_beta": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "PROBE signal weight in fusion formula"
+    },
+    "speq_gamma": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.2,
+      "x-changeable": true,
+      "description": "MoE-SpeQ signal weight in fusion formula"
+    },
+    "sp_moe_delta": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.15,
+      "x-changeable": true,
+      "description": "SP-MoE signal weight in fusion formula"
+    },
+    "time_decay": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0.1,
+      "x-changeable": true,
+      "description": "Time-aware priority decay factor per layer distance"
+    },
+    "per_layer_us": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 920,
+      "x-changeable": true,
+      "description": "Estimated microseconds per layer for time-until-needed calculation"
+    }
+  },
+  "additionalProperties": false
+}

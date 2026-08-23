@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "x-configFile": "moe_speq.json",
+  "description": "MoE-SpeQ per-pair predictor internal parameters. Loaded from moe_speq.json if not inlined.",
+  "properties": {
+    "hidden_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 7168,
+      "description": "Model hidden dimension for random projection input. Must match model.hidden_size"
+    },
+    "feature_dim": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 256,
+      "description": "Random projection output dimension"
+    },
+    "beta1": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.9,
+      "description": "Adam first moment decay"
+    },
+    "beta2": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.999,
+      "description": "Adam second moment decay"
+    },
+    "epsilon": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1e-8,
+      "description": "Adam numerical stability constant"
+    },
+    "training_batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 32,
+      "x-changeable": true,
+      "description": "Samples per training step"
+    },
+    "min_samples_before_predict": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 64,
+      "x-changeable": true,
+      "description": "Cold-start guard: return empty predictions until this many samples collected"
+    }
+  },
+  "additionalProperties": false
+}

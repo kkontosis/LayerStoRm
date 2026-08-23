@@ -1,0 +1,12 @@
+[submodule "deps/LayerStoRmKernels"]
+	path = deps/LayerStoRmKernels
+	url = ../LayerStoRmKernels
+[submodule "3rd-party/cutlass"]
+	path = 3rd-party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "deps/LayerStoRmGemmKernels"]
+	path = deps/LayerStoRmGemmKernels
+	url = ../LayerStoRmGemmKernels
+[submodule "deps/LayerStoRmExpertKernels"]
+	path = deps/LayerStoRmExpertKernels
+	url = ../LayerStoRmExpertKernels

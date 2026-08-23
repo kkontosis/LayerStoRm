@@ -1,0 +1,94 @@
+{
+  "name": "p11-stage0-glm52",
+  "corpus": {
+    "shards": "/srv/models/epm5-corpus/shards",
+    "routing": "/srv/models/epm5-corpus/routing",
+    "dump_root": null
+  },
+  "collection": {
+    "enabled": false,
+    "_comment": "EPM-5 recipe encoded in collect_epm5.py; enable ONLY for a fresh corpus on an idle 4-GPU box with the arena holder warm. Exit 2 = engine failure, exit 3 = health gate.",
+    "driver": "tools/elb_train/collect_epm5.py",
+    "corpus_root": "build/epm5-corpus",
+    "prompts": "tools/elb_train/prompts_epm5.json",
+    "batch_size": 5,
+    "target_blocks": 105000,
+    "drain_s": 150.0,
+    "acceptance_band": "0.10,0.60",
+    "min_good": 0.25,
+    "cuda_visible_devices": "0,1,2,3"
+  },
+  "router": {
+    "checkpoint": "/srv/models/lukealonso/GLM-5.2-NVFP4",
+    "weight_tmpl": "model.layers.{j}.mlp.gate.weight",
+    "bias_tmpl": "model.layers.{j}.mlp.gate.e_score_correction_bias"
+  },
+  "split": {
+    "seed": 35,
+    "held_fraction": 0.25,
+    "_comment": "seed 35 = the committed EPM-5 selection (studies/epm/epm5-corpus/split_seed_selection.json). For a NEW corpus set seed to null: the split step re-derives it by procedure (never reuse another corpus's seed)."
+  },
+  "stage0": {
+    "windows": "prevpos,prevchunk,trail16,trail64",
+    "sigma_c": "0,0.5,1,2",
+    "pool_m": "8,16,32,64",
+    "deep_lo": 58,
+    "deep_hi": 77,
+    "sigma_seqs": 50,
+    "evict_max_seqs": 24,
+    "evict_caps": "700,1052",
+    "headline_window": "trail16",
+    "headline_c": 1.0
+  },
+  "gates": {
+    "within_headroom_min": 0.035,
+    "rank_set_agreement_min": 0.99,
+    "bar_tolerance": 0.001
+  },
+  "stageb": {
+    "enabled": true,
+    "stride": 32,
+    "jobs": 24,
+    "fit_cap": 8000000,
+    "gbm_rounds": 400,
+    "evict_max_seqs": 24,
+    "evict_caps": "700,1052",
+    "study_dir": "studies/epm/p11-stageb"
+  },
+  "stagec": {
+    "enabled": false,
+    "_enabled_comment": "default OFF per the project's default-off seam convention (2026-08-14 user call); enable explicitly or run --only stagec_*",
+    "jobs": 24,
+    "device": "cuda:2",
+    "_comment": "device set = dense torch engine on one GPU (8-9x one CPU worker, validated vs CPU smoke); empty = CPU sequence-parallel path with `jobs` workers",
+    "evict_max_seqs": 24,
+    "evict_caps": "700,1052",
+    "study_dir": "studies/epm/p11-stagec"
+  },
+  "stagecprime": {
+    "enabled": false,
+    "_enabled_comment": "P11.c' extended-signal saga; default OFF per the default-off seam convention. Steps: stagecprime_prep (embedding k-means luts + the 15 GB draft router-tap cache, one-time per corpus), stagecprime_run (experiments x0..x8 + memo bucket sweep on one GPU), stagecprime_verdict (vs the P11.c bars). Missing luts are auto-prepped lazily during run; run resumes per experiment via --skip-done unless --force.",
+    "device": "cuda:2",
+    "exps": "all",
+    "memo_buckets": "4096,1024,8192,16384,32768,65536,154880",
+    "_memo_buckets_comment": "comma list for prep-kmeans; a count >= vocab yields the identity (per-token) lut with no k-means — the measured champion for GLM-5.2. Per-experiment counts live in the x7* specs (stagecprime.EXPERIMENTS).",
+    "embed_tensor": "model.embed_tokens.weight",
+    "_embed_tensor_comment": "model-specific knob: embedding table tensor name in the checkpoint safetensors",
+    "champion_exp": "x18ship3",
+    "_champion_comment": "x18ship3 = LEADER (2026-08-15 green light): x18ship2 strict stack + HARD xsame Delta=2 (pipelined2 pool 0.75923/+2.234pp, novel 0.62333, addr 0.81566) + own-stream pi-hat tables + S7.2 uncertified sidecars. PIPELINED metrics live under pipelined2_* names — never comparable to strict bars; the strict heads (w_recur/w_manifest) and evictor are ctx+xsame-masked, bit-identical to x18ship2-strict (which remains the certified non-pipelined form, staged). x17ship = Compact (unchanged, strict).",
+    "export_configs": "x18ship3,x17ship",
+    "publish_model_dirs": "x18ship3=/srv/models/GLM-5.2-P11-ExpertRidge,x17ship=/srv/models/GLM-5.2-P11-ExpertRidge-Compact",
+    "_publish_dirs_comment": "run step exports BOTH ship configs and packages each to its model dir (npz + f32 + fp8 safetensors + feature_spec + README; existing dirs get a lineage addendum). Empty = skip publishing.",
+    "publish_model_dir": "",
+    "_publish_comment": "run step ALWAYS leaves the champion_exp deployment export in <workdir>/stagecprime/export/ (ridge w_open/w_valid, sparse per-token memo stamp, xprev/trans tables — like stageb's probes and stagec's ridge_evictor). Set publish_model_dir (e.g. /srv/models/GLM-5.2-P11-ExpertRidge) to additionally package the named model dir (weights + feature_spec.json + lut + README) as the run step's final action; empty = skip.",
+    "study_dir": "studies/epm/p11-stagecprime",
+    "_xsame_comment": "xsame stage knobs are PER-EXPERIMENT registry fields (stagecprime.EXPERIMENTS): xsame in features = on; xsame_lag = Delta (ship3: 2); xsame_soft = form (ship3: False = hard routed-top8 — the soft form is measured-and-killed). The consumer contract ships in feature_spec.pipelined_protocol.",
+    "_pihat_comment": "pi-hat calibration is per-config: cal_head=True in the experiment spec trains tables in-run on that run's OWN score stream (teacher stream-separation rule — pipelined configs grow pipelined tables; never reuse across streams). Certified surface = per-layer marginal functionals (ARCHITECT_CALIBRATION S7); S7.2 sidecars attach at packaging as UNCERTIFIED companions.",
+    "_pihat2d_comment": "pihat2d (2-D rank x gap-quantile adjustment): measured-and-killed on BOTH streams 2026-08-15 (spearman 0.236 pipelined / 0.243 strict vs the 0.5 gate and the 0.4755/0.4646 sidecar bars; beat-const ~4% vs 30%) -> defaults OFF per the outcome rule. Knob = cal2d=True per-experiment (requires cal_head); registry arms x18ship3_p2d / x18ship2_p2d retained for reproduction. S7 forbids further feature-conditioned calibration without a new pre-registration.",
+    "cpp_fixture_out": "tests/assets/expert_ridge_parity.safetensors",
+    "_cpp_fixture_comment": "stagecprime_cppfix step: regenerates the golden parity fixture the C++ ExpertRidge inference module (src/prefetch/) tests against — the E2E contract is that everything the C++ seam consumes (published model dirs + this fixture) is pipeline-produced.",
+    "_x20_comment": "x20 Tier-2 pruning (2026-08-16): x18ship3_pruned = ship3 + prune_memo2_s=16 + prune_tau=0.05 (registry; boundary transforms) — CERTIFIED: metric deltas +0.061/+0.090/+0.039/-0.001pp (gains; only loss 0.001pp topup), tau05 alone exactly 0.000pp, fp8 lossless, pi-hat reliability intact; memo k8 knee REJECTED (novel -1.293pp). Staged at staging/GLM-5.2-P11-ExpertRidge.ship3-pruned; DEFAULT OFF (champion_exp stays x18ship3) until the user ships it. Byte frontier: fp8 bundle 142.0->130.4 MB with dense formats; CSR pair tables + zero-row-free stamps are the remaining format lever (est. ~95-100 MB; the 70-85 MB prediction additionally assumed the rejected memo k-prune)."
+  },
+  "workdir": "build/recur/p11-stage0-pipeline",
+  "study_dir": "studies/epm/p11-stage0"
+}

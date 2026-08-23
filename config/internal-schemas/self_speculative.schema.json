@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "x-configFile": "self_speculative.json",
+  "description": "Self-speculative draft internal parameters. Loaded from self_speculative.json if not inlined.",
+  "properties": {
+    "max_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 5,
+      "x-changeable": true,
+      "description": "Maximum self-speculative draft tokens per iteration"
+    },
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for acceptance rate tracking"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,33 @@
+{
+  "_comment": "EPM-3 synthetic smoke: self-contained end-to-end run on a generated corpus with a planted RECOVERABLE process (per-tap orthogonal feature maps + true routers, tap_assignment=prior so taps.map=prior starts on the correct tap). Tier 0 is ~chance here; the trained Tier-1 adapter should reach recall@8 ~1 held-out (the model class contains the truth: r_base = hidden). Run: python3 tools/elb_train/train.py --config tools/elb_train/configs/synthetic-smoke.json --out build/epm3-synth-smoke",
+  "seed": 0,
+  "device": "cpu",
+  "out_dir": "build/epm3-synth-smoke",
+  "data": {
+    "synthetic": {
+      "n_seqs": 24, "blocks_per_seq": 8, "gamma": 4, "n_taps": 5,
+      "hidden": 24, "moe_layers": [3, 4, 5, 10, 24, 40, 56, 72],
+      "n_experts": 32, "rho": 0.9, "tap_noise": 0.0,
+      "feature_map": "linear", "tap_assignment": "prior", "seed": 1
+    },
+    "held_out_fraction": 0.25,
+    "split_seed": 0,
+    "batch_blocks": 16
+  },
+  "model": {
+    "normalization": {"kind": "none"},
+    "adapter": {
+      "r_base": 24,
+      "delta": {"enabled": true, "budget_params": 40000,
+                "min_rank": 0, "max_rank": 16}
+    }
+  },
+  "wmap": {"kind": "directive", "accept_curve": [0.55, 0.4, 0.25]},
+  "loss": {"kl_weight": 1.0, "kl_temperature": 1.0, "bce_weight": 0.0,
+           "mse_weight": 1.0},
+  "optim": {"lr": 0.02, "weight_decay": 0.0, "schedule": "cosine",
+            "warmup_steps": 20, "max_steps": 2000, "clip_grad_norm": 1.0},
+  "eval": {"every_steps": 500, "m_rank": 32},
+  "checkpoint": {"every_steps": 1000, "keep": 2},
+  "log_every": 100
+}

@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "lookahead_layers": 1,
+  "top_k": 8,
+  "score_threshold": 0.01,
+  "predictor": {
+    "enabled": true,
+    "hidden_size": 7168,
+    "pca_dim": 256,
+    "hidden_dim": 256,
+    "learning_rate": 0.001,
+    "momentum": 0.9,
+    "training_batch_size": 32,
+    "training_buffer_size": 2048,
+    "focal_loss_gamma": 2.0,
+    "balance_loss_lambda": 0.5,
+    "input_group_frac": 0.25,
+    "output_group_frac": 0.25,
+    "min_samples_before_predict": 64,
+    "freq_ema_alpha": 0.01
+  }
+}

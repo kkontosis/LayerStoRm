@@ -1,0 +1,2520 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://layerstorm.dev/config/schema.json",
+  "title": "LayerStoRm Configuration",
+  "description": "Configuration schema for LayerStoRm MoE LLM inference engine",
+  "type": "object",
+  "$defs": {
+    "weight_0_1": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "positive_float": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "positive_int": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "layer_pin_spec": {
+      "x-cType": "LayerPinSpec",
+      "oneOf": [
+        { "const": "all" },
+        {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      ]
+    },
+    "auto_or_positive_int": {
+      "x-cType": "AutoOrInt",
+      "oneOf": [
+        { "const": "auto" },
+        { "type": "integer", "minimum": 1 }
+      ]
+    },
+    "gpu_object": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer", "minimum": 0, "description": "GPU device ID" },
+        "type": { "type": "string", "enum": ["rtx5090", "rtx5080"], "x-cType": "GpuType", "x-externalType": true, "description": "GPU model" },
+        "vram_gb": { "type": ["number", "null"], "exclusiveMinimum": 0, "x-override": true, "description": "GPU VRAM in GiB (CUDA-reported, e.g. 31.25 for RTX 5090); null = auto-detect from hardware" },
+        "pcie_gen": { "type": ["integer", "null"], "minimum": 3, "maximum": 6, "x-override": true, "description": "PCIe generation (null = auto-detect from sysfs)" },
+        "pcie_width": { "type": ["integer", "null"], "enum": [1, 4, 8, 16, null], "x-override": true, "description": "PCIe lane width (null = auto-detect from sysfs)" },
+        "numa_node": { "type": ["integer", "null"], "minimum": 0, "x-override": true, "x-sentinel": -1, "description": "NUMA node affinity (null = auto-detect from sysfs)" },
+        "pcie_bandwidth_loss_ratio": { "$ref": "#/$defs/weight_0_1", "default": 0.85, "description": "Effective PCIe bandwidth as fraction of theoretical (accounts for protocol overhead, contention)" },
+        "compute_weight": { "type": ["number", "null"], "exclusiveMinimum": 0, "default": null, "description": "Relative compute throughput weight for GPU load balancing. null = auto from GPU type lookup (rtx5090=1.0, rtx5080=0.5). Higher = more work assigned. User-settable for unlisted GPU types or custom tuning." },
+        "vram_budget_gb": { "type": ["integer", "null"], "minimum": 1, "default": null, "x-override": true, "description": "Usable VRAM cap in GB (null = auto-detect)" },
+        "roles": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["attention", "resident", "expert_streaming"], "x-cType": "GpuRole" },
+          "uniqueItems": true,
+          "default": ["attention", "resident", "expert_streaming"],
+          "description": "GPU roles: attention = MLA/DSA compute, resident = pinned layers (dense FFN, embedding, gating, output head), expert_streaming = expert cache and streaming execution"
+        },
+        "vram_allocation_gb": {
+          "type": "object",
+          "description": "Per-role VRAM budget for varying roles (null = auto: use remaining after fixed allocations)",
+          "properties": {
+            "resident": { "type": ["number", "null"], "exclusiveMinimum": 0, "default": null, "x-override": true, "description": "VRAM budget for pinned resident layers in GB (null = auto from pinned layer config)" },
+            "expert_streaming": { "type": ["number", "null"], "exclusiveMinimum": 0, "default": null, "x-override": true, "description": "VRAM budget for expert cache in GB (null = use remaining after fixed allocations)" },
+            "stable_zone_fraction": { "type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "x-override": true, "description": "Per-GPU override for stable zone fraction within expert cache (null = use memory.expert_cache.stable_zone_fraction)" },
+            "safety_margin_gb": { "type": ["number", "null"], "minimum": 0, "default": null, "x-override": true, "x-sentinel": -1, "description": "Per-GPU override of memory.vram_safety_margin_gb (null = use the global value). The margin is VRAM left UNALLOCATED on this GPU for CUDA context, host-pinned-arena page tables (~3 MiB per pinned GiB), and late driver allocations — shaving it below the global default trades runtime headroom for a larger expert window (e.g. a TP GPU hosting a quantized DSpark draft, TD-DSPARK-DRAFT-SHARD window probe). The engine-level elastic superchunk/MoE-BIG headroom derivations keep using the GLOBAL margin (conservative)." }
+          },
+          "additionalProperties": false
+        },
+        "ref": { "type": "object", "x-internal": true, "x-cType": "GpuRef", "description": "Lightweight GPU reference (INV-4.18). Set at parse time from id/type/position. Passed through all internal APIs." },
+        "pcie_gen_max": { "type": "integer", "minimum": 1, "maximum": 6, "default": 0, "x-internal": true, "description": "Device PCIe capability (max_link_speed from sysfs); internal, not parsed from config" },
+        "pcie_width_max": { "type": "integer", "minimum": 1, "maximum": 16, "default": 0, "x-internal": true, "description": "Device max lane width capability; internal, not parsed from config" },
+        "pci_bus_id": { "type": "string", "default": "", "x-internal": true, "description": "PCI Bus ID (0000:01:00.0); internal, not parsed from config" }
+      },
+      "required": ["id", "type", "vram_gb"],
+      "additionalProperties": false
+    },
+    "cpu_expert_object": {
+      "type": "object",
+      "description": "A CPU NUMA-node expert-FFN device (C-6, NumaCpuExpertDevice). Runs the routed MoE expert FFN on host cores pinned to one NUMA node, reading nvfp4-sm1xx weights from that node's PinnedExpertArena slabs. Not a CUDA device — it has no GPU ordinal; it is appended to the engine's ExpertDevice list after the GPUs.",
+      "properties": {
+        "numa_node": { "type": "integer", "minimum": 0, "description": "NUMA node this CPU expert device pins its work to and sources weights from. Reused as GpuRef::id (NOT a CUDA ordinal) for the device's cpu GpuRef." },
+        "max_threads": { "type": "integer", "minimum": 0, "default": 0, "description": "Max fork-join threads (physical cores) for the FFN. 0 = use all physical cores on the node (SMT siblings dropped)." },
+        "enabled": { "type": "boolean", "default": true, "description": "Construct this CPU expert device. false = skip (slot ignored)." }
+      },
+      "required": ["numa_node"],
+      "additionalProperties": false
+    },
+    "rope_scaling_object": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["yarn", "default_scaling"], "x-cType": "RopeScalingType", "description": "Scaling method" },
+        "factor": { "$ref": "#/$defs/positive_float", "description": "Context extension factor" },
+        "beta_fast": { "$ref": "#/$defs/positive_float", "description": "YaRN beta_fast parameter" },
+        "beta_slow": { "$ref": "#/$defs/positive_float", "description": "YaRN beta_slow parameter" },
+        "mscale": { "$ref": "#/$defs/positive_float", "description": "YaRN mscale parameter" },
+        "mscale_all_dim": { "$ref": "#/$defs/positive_float", "description": "YaRN mscale_all_dim parameter (drives the softmax-scale mscale^2 factor)" },
+        "original_max_position_embeddings": { "$ref": "#/$defs/positive_float", "description": "Pre-extension context length; YaRN frequency correction applies beyond it" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "preset": {
+      "type": "string",
+      "description": "Name of a config preset. Preset values are merged under user values (user wins). May not set model, quantization, or hardware."
+    },
+    "model": {
+      "type": "object",
+      "description": "Model architecture and weight configuration",
+      "properties": {
+        "architecture": {
+          "type": "string",
+          "enum": ["deepseek_v3", "glm_moe_dsa", "kimi_k25", "deepseek_v4"],
+          "description": "Model architecture class. deepseek_v4: DeepSeek-V4 family (native MQA-over-latent, CSA/HCA hybrid attention, mHC residual streams — spec/DEEPSEEK4_PLAN.md)"
+        },
+        "weights_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to model weight files"
+        },
+        "weights_format": {
+          "type": "string",
+          "enum": ["safetensors", "gguf"],
+          "description": "Weight file format"
+        },
+        "use_mmap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use memory-mapped I/O for weight loading. When false, weights are read into heap-allocated buffers via pread."
+        },
+        "num_hidden_layers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Number of transformer layers"
+        },
+        "hidden_size": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Hidden dimension size"
+        },
+        "num_attention_heads": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Number of attention heads"
+        },
+        "num_key_value_heads": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Number of key-value heads"
+        },
+        "kv_lora_rank": {
+          "$ref": "#/$defs/positive_int",
+          "default": 512,
+          "description": "KV LoRA rank for MLA"
+        },
+        "qk_rope_head_dim": {
+          "$ref": "#/$defs/positive_int",
+          "default": 64,
+          "description": "RoPE dimension in MLA"
+        },
+        "qk_nope_head_dim": {
+          "$ref": "#/$defs/positive_int",
+          "default": 128,
+          "description": "Non-positional QK dimension in MLA"
+        },
+        "v_head_dim": {
+          "$ref": "#/$defs/positive_int",
+          "default": 128,
+          "description": "Value head dimension in MLA"
+        },
+        "q_lora_rank": {
+          "$ref": "#/$defs/positive_int",
+          "default": 1536,
+          "description": "Query LoRA rank for MLA"
+        },
+        "intermediate_size": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Dense FFN intermediate dimension"
+        },
+        "n_routed_experts": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Total number of routed experts per MoE layer"
+        },
+        "n_shared_experts": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1,
+          "description": "Number of shared (always-active) experts"
+        },
+        "num_experts_per_tok": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Top-K experts activated per token"
+        },
+        "n_group": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 8,
+          "description": "Number of expert groups for grouped routing"
+        },
+        "topk_group": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4,
+          "description": "Number of groups selected per token in grouped routing"
+        },
+        "vocab_size": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Vocabulary size = the embedding / output-head tensor ROW count (the logits width, padding included). OPTIONAL: 0 (default) = AUTODETECT from the weights at load (the adopted value is logged). When set explicitly it is CROSS-CHECKED against the weights-derived width at load and a mismatch FAILS LOUD with both numbers (weights are ground truth; config is explicit intent; disagreement is always a bug — a wrong value would silently mis-size logits readbacks, sampling, and guided-decode grammar masks). Both weights formats are covered (safetensors model.embed_tokens.weight / GGUF token_embd.weight, output-head fallback).",
+          "x-devDoc": "Resolved by model::resolve_vocab_size (weight_loader.cpp) called from Engine::init_modules and Engine::run_prepack BEFORE LayerRegistry/VramAllocator consume the value. Engine value re-exported as EngineInfo.vocab_size."
+        },
+        "max_position_embeddings": {
+          "$ref": "#/$defs/positive_int",
+          "description": "Maximum sequence length supported by the model"
+        },
+        "rope_theta": {
+          "$ref": "#/$defs/positive_float",
+          "default": 10000.0,
+          "description": "RoPE base frequency"
+        },
+        "rms_norm_eps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 0.001,
+          "default": 1e-6,
+          "description": "RMSNorm epsilon"
+        },
+        "num_nextn_predict_layers": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 1,
+          "description": "Multi-token prediction depth (0 = disabled)"
+        },
+        "index_topk": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8192,
+          "default": 2048,
+          "description": "DSA top-K token selection (0 = DSA disabled)"
+        },
+        "index_n_heads": {
+          "$ref": "#/$defs/positive_int",
+          "default": 64,
+          "description": "DSA indexer attention heads"
+        },
+        "index_head_dim": {
+          "$ref": "#/$defs/positive_int",
+          "default": 128,
+          "description": "DSA indexer head dimension"
+        },
+        "index_topk_freq": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "IndexShare period: 1 in N post-lead layers recompute the indexer (a 'full' layer); the rest reuse the preceding full layer's top-k (a 'shared' layer). 0 = every layer is full (no sharing)."
+        },
+        "index_skip_topk_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "IndexShare leading-full count: the first N layers are always full. Full-layer set = { l : l < offset OR (l - offset + 1) % index_topk_freq == 0 }."
+        },
+        "rope_scaling": {
+          "$ref": "#/$defs/rope_scaling_object"
+        },
+        "rope_interleave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use interleaved RoPE rotation pattern"
+        },
+        "indexer_rope_interleave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use interleaved RoPE in DSA indexer"
+        },
+        "first_k_dense_replace": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Number of initial layers using dense FFN instead of MoE"
+        },
+        "routed_scaling_factor": {
+          "$ref": "#/$defs/positive_float",
+          "default": 2.5,
+          "description": "Scaling factor for routed expert outputs"
+        },
+        "moe_intermediate_size": {
+          "$ref": "#/$defs/positive_int",
+          "default": 2048,
+          "description": "MoE expert intermediate dimension"
+        },
+        "moe_layer_freq": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Frequency of MoE layers (1 = every eligible layer)"
+        },
+        "norm_topk_prob": {
+          "type": "boolean",
+          "default": true,
+          "description": "Normalize routing probabilities after top-K selection. (Source: DeepSeek V3 Technical Report) [topk_gating.cu]"
+        },
+        "gating_score_fn": {
+          "type": "string",
+          "enum": ["sigmoid", "softmax", "sqrtsoftplus"],
+          "default": "sigmoid",
+          "description": "Scoring function for expert gating. sqrtsoftplus = sqrt(log(1+exp(x))) (DeepSeek V4; GGUF expert_gating_func 4; kernel: deps/LayerStoRmExpertKernels ScoringFunc::kSqrtSoftplus). (Source: DeepSeek V3/V4 Technical Reports) [adaptive_gating.cu, topk_gating.cu]"
+        },
+        "head_dim": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "V4 attention head dimension (nope + rope; V4-Flash: 512 = 448 + 64). Single shared KV latent of this width serves as BOTH K and V (MQA-over-latent, num_key_value_heads = 1). 0 (default) = not a V4 model; REQUIRED > 0 for deepseek_v4. For deepseek_v4 the MLA dims (kv_lora_rank, qk_nope_head_dim, v_head_dim) are IGNORED — head_dim and qk_rope_head_dim are authoritative."
+        },
+        "compress_ratios": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 128 },
+          "default": [],
+          "description": "V4 per-layer attention compression ratios: 0 = sliding-window-only, 4 = CSA (compressed sparse attention + Lightning Indexer), 128 = HCA (heavily compressed, dense). Values must be in {0, 4, 128}. Length must be >= num_hidden_layers; entries beyond num_hidden_layers must be 0 (the HF/GGUF array carries trailing zeros for the MTP layers — V4-Flash ships 46 = 43 + 3) and are ignored. Empty (default) = non-V4 model; REQUIRED non-empty for deepseek_v4."
+        },
+        "compress_rope_theta": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.0,
+          "description": "V4 RoPE base frequency for COMPRESSED-attention layers (compress_ratios[l] != 0; V4-Flash: 160000). Compressed layers apply this theta WITH the model's yarn rope_scaling; uncompressed layers (compress_ratios[l] == 0) use rope_theta with NO yarn (freq_scale 1, ext_factor 0) — ref/llama.cpp/src/models/deepseek4.cpp. 0 (default) = non-V4 model."
+        },
+        "sliding_window": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "V4 sliding-window size in tokens for the raw-KV attention branch (V4-Flash: 128). All V4 layers keep a raw window of this many recent tokens alongside any compressed tier. 0 (default) = no sliding window (non-V4 models)."
+        },
+        "swiglu_limit": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.0,
+          "description": "SwiGLU clamp bound for expert FFN activations (V4: 10.0 on routed AND shared experts; GGUF swiglu_clamp_exp/_shexp). Kernel clamps gate to [-limit, limit] before SiLU and caps SiLU output at limit (deps/LayerStoRmExpertKernels FusedSwigluParams.swiglu_limit). 0 (default) = no clamp (V3.2/GLM behavior, zero overhead)."
+        },
+        "num_hash_layers": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "V4 hash-routed MoE layer count: layers l < num_hash_layers select experts via the ffn_gate_tid2eid token-id lookup table [num_experts_per_tok x vocab] instead of score-based top-K, and carry no exp_probs_b bias (V4-Flash: 3). 0 (default) = no hash layers."
+        },
+        "o_groups": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "V4 grouped output-projection group count (V4-Flash: 8). o_proj is a 2-stage grouped low-rank factorization: per-group down-projection (attn_output_a) to o_lora_rank, then one shared up-projection (attn_output_b) to hidden. Must divide num_attention_heads. 1 (default) = standard ungrouped o_proj."
+        },
+        "o_lora_rank": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "V4 grouped output-projection per-group rank (V4-Flash: 1024). REQUIRED > 0 when o_groups > 1. 0 (default) = no low-rank o_proj."
+        },
+        "hc_mult": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "mHC (manifold-constrained hyper-connections) residual stream count (V4: 4). The residual state is [tokens, hc_mult, hidden]; every attn/FFN sublayer is wrapped in hc_pre (collapse + mix coefficients) / hc_post (re-expand), with a final output_hc collapse before the LM head. 1 (default) = standard single residual stream (no mHC)."
+        },
+        "hc_sinkhorn_iters": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20,
+          "description": "mHC Sinkhorn-Knopp iterations projecting the comb mixing matrix onto the Birkhoff polytope (doubly stochastic); V4: 20. Ignored when hc_mult == 1."
+        },
+        "hc_eps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 0.001,
+          "default": 1e-6,
+          "description": "mHC epsilon: added to the sigmoid pre-mix weights and to Sinkhorn row/column normalization denominators; V4: 1e-6. Ignored when hc_mult == 1."
+        },
+        "vision": {
+          "type": "object",
+          "description": "Vision encoder configuration (Kimi K2.5). Currently unimplemented",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable vision encoder. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            },
+            "hidden_size": {
+              "$ref": "#/$defs/positive_int",
+              "default": 1152,
+              "description": "Vision encoder hidden dimension. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            },
+            "num_layers": {
+              "$ref": "#/$defs/positive_int",
+              "default": 27,
+              "description": "Vision encoder transformer layers. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            },
+            "num_heads": {
+              "$ref": "#/$defs/positive_int",
+              "default": 16,
+              "description": "Vision encoder attention heads. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            },
+            "patch_size": {
+              "$ref": "#/$defs/positive_int",
+              "default": 14,
+              "description": "Vision patch size. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            },
+            "image_size": {
+              "$ref": "#/$defs/positive_int",
+              "default": 384,
+              "description": "Input image resolution. Currently unimplemented. (Source: Kimi K2.5) [vision_encoder.h]"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "architecture", "weights_path", "weights_format",
+        "num_hidden_layers", "hidden_size", "num_attention_heads", "num_key_value_heads",
+        "intermediate_size", "n_routed_experts", "num_experts_per_tok",
+        "max_position_embeddings"
+      ],
+      "additionalProperties": false
+    },
+    "quantization": {
+      "type": "object",
+      "description": "Quantization format configuration",
+      "properties": {
+        "weights": {
+          "type": "string",
+          "enum": ["nvfp4", "fp8_e4m3", "fp8_e5m2", "int4_symmetric", "int4_asymmetric", "gguf", "gguf_q2_k", "gguf_q3_k", "gguf_q4_k", "gguf_q5_k", "gguf_q6_k", "gguf_q8_0", "gguf_mxfp4"],
+          "x-cType": "WeightQuant",
+          "default": "nvfp4",
+          "description": "Model weight quantization format. Supported: nvfp4, fp8 (e4m3/e5m2), and GGUF. GGUF is per-tensor mixed precision: 'gguf' = real GGUF model, each tensor's k-quant type comes from the file metadata (the normal case). 'gguf_q2_k'/'q3_k'/'q4_k'/'q5_k'/'q6_k'/'q8_0'/'mxfp4' = uniform override forcing one type for every tensor (synthetic/test weights; mxfp4 = OCP MX e2m1 + E8M0 block scale, 17 B / 32 values — DeepSeek-V4 QAT routed experts). int4_symmetric/int4_asymmetric are reserved."
+        },
+        "gguf_strategy": {
+          "type": "string",
+          "enum": ["int", "dequant"],
+          "x-cType": "GgufStrategy",
+          "x-enumNames": { "int": "int_strategy", "dequant": "dequant" },
+          "default": "int",
+          "description": "GGUF weight-GEMM strategy: int = Q8_1 dp4a/int8 tensor-core (fast, ~8-bit activation error); dequant = dequant-to-float (lossless activation). Applies to all GGUF weight GEMMs. GGUF-only; ignored when 'weights' is not a gguf_* type."
+        },
+        "attention_compute": {
+          "type": "string",
+          "enum": ["fp8_e4m3", "fp8_e5m2", "fp16"],
+          "x-cType": "AttentionQuant",
+          "default": "fp8_e4m3",
+          "description": "Attention computation precision. Only fp8_e4m3 is currently supported"
+        },
+        "kv_cache": {
+          "type": "string",
+          "enum": ["fp8_e4m3", "fp8_e5m2", "fp16"],
+          "x-cType": "KvCacheQuant",
+          "default": "fp8_e4m3",
+          "description": "KV cache storage precision. Only fp8_e4m3 is currently supported"
+        },
+        "gating_compute": {
+          "type": "string",
+          "enum": ["fp32", "fp16"],
+          "x-cType": "GatingQuant",
+          "default": "fp32",
+          "description": "Router/gating computation precision. Only fp32 is currently supported"
+        }
+      },
+      "required": ["weights", "attention_compute", "kv_cache", "gating_compute"],
+      "additionalProperties": false
+    },
+    "hardware": {
+      "type": "object",
+      "description": "Hardware topology configuration",
+      "properties": {
+        "gpus": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/gpu_object" },
+          "minItems": 1,
+          "description": "GPU device list"
+        },
+        "cpu_expert_devices": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/cpu_expert_object" },
+          "default": [],
+          "description": "CPU NUMA-node expert-FFN devices (C-6). Each entry adds a NumaCpuExpertDevice for one NUMA node, appended to the ExpertDevice list after the GPUs. Empty = GPU-only experts (default)."
+        },
+        "tp_array": {
+          "type": ["array", "null"],
+          "items": { "type": "integer", "minimum": 0 },
+          "uniqueItems": true,
+          "x-override": true,
+          "default": null,
+          "description": "GPU IDs for TP group (null = auto-detect). Length must be power of 2."
+        },
+        "system_ram_gb": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "x-override": true,
+          "description": "Total system RAM in GB (null = auto-detect from /proc/meminfo)"
+        },
+        "nvme_paths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": [],
+          "description": "NVMe mount point(s) for cold tier. Multiple paths enable balanced multi-NVMe loading.",
+          "x-devDoc": "Empty array disables NVMe tier entirely. NvmeTier creates one io_uring ring per physical drive (INV-4.12c). Expert-to-drive assignment is deterministic (hash of ExpertKey). NvmeTier manages warm cache (host RAM) + cold storage (NVMe); ExpertCache manages hot tier (VRAM)."
+        },
+        "nvme_capacity_gb": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 1 }
+          ],
+          "default": null,
+          "description": "NVMe capacity in GB (null = disabled)"
+        },
+        "dcp_enabled": {
+          "type": "boolean",
+          "default": true,
+          "x-internal": true,
+          "description": "Data-Context Parallelism flag. Auto-set by resolver: true when tensor_parallelism >= 2. Not user-configurable."
+        },
+        "dcp_indexer_mode": {
+          "type": "string",
+          "enum": ["replicated", "local"],
+          "default": "replicated",
+          "description": "DSA indexer K cache strategy with DCP. 'replicated': full indexer K on each GPU for exact global top-k scoring. 'local': indexer K sharded round-robin by indexer page (owner = (pos / indexer_k_page_size_tokens) % tp); each GPU scores only its own shard and the per-rank top-k candidates are allgathered and exactly re-merged into the same global top-k (TD-GLM-INDEXER-LOCAL-MERGE) — halves resident indexer K per GPU (~390 MB at 100K context) at the cost of a tiny per-layer candidate allgather. Only affects DSA models (index_topk > 0). Ignored when tensor_parallelism < 2."
+        },
+        "dcp_kv_mode": {
+          "type": "string",
+          "enum": ["replicated", "sharded"],
+          "default": "sharded",
+          "description": "KV cache strategy with DCP (Helix sequence sharding, INV-DCP-6). 'sharded' (DEFAULT): KV is sequence-sharded by token position across ranks (INV-4.9e disjoint round-robin chunks) — each rank attends only its token shard and the DCP LSE combine merges the partial outputs (INV-DCP-KVREP: the combine runs ONLY in this mode). Halves per-GPU KV footprint and is the measured champion recipe (+4.6% end-to-end on the dsp52 champion, 2026-08-17 — replicated doubles KvTiering materialization). 'replicated' (opt-in): every TP rank stores the full KV cache and computes complete attention over its head shard (the legacy validated mode; the only mode where sparse chunk PREFILL is consumed sparse — TD-SPARSE-PREFILL-KVS; DSA sparse DECODE works in both modes). Ignored when tensor_parallelism < 2.",
+          "x-devDoc": "Wired to DcpExecutor::Options::dcp_kv_sharded and CommandDispatcher::build_kv_metadata's sharded branch (KVS-2). Under 'sharded' the split is per shape: DSA sparse DECODE stays active — each rank consumes the KVS-4 translated LOCAL top-k selection (dispatch_attention.cpp TD-KVT-DCP-SHARDED seam, INV-KVT-9) — but sparse chunk PREFILL dense-fallbacks (prefill_sparse_tierable gate excludes kv_sharded_ && dcp_size >= 2; TD-SPARSE-PREFILL-KVS), and B>1 chunk cohorts are dense in every mode. HiSparse KV tiering remains fully active for decode under sharded (prefill chunks non-tierable there, lifted by full cold-page re-promotion)."
+        }
+      },
+      "required": ["gpus", "system_ram_gb"],
+      "additionalProperties": false
+    },
+    "memory": {
+      "type": "object",
+      "description": "Memory management configuration",
+      "properties": {
+        "pinned_layers": {
+          "type": "object",
+          "properties": {
+            "attention": {
+              "$ref": "#/$defs/layer_pin_spec",
+              "default": "all",
+              "description": "Attention layers to pin in VRAM"
+            },
+            "dense_ffn_layers": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "default": [0, 1, 2, 59, 60],
+              "description": "Dense FFN layer indices to pin"
+            },
+            "embedding": {
+              "type": "boolean",
+              "default": true,
+              "description": "Pin token embedding weights"
+            },
+            "output_head": {
+              "type": "boolean",
+              "default": true,
+              "description": "Pin LM head weights"
+            },
+            "gating": {
+              "$ref": "#/$defs/layer_pin_spec",
+              "default": "all",
+              "description": "Gating/router layers to pin in VRAM"
+            }
+          },
+          "additionalProperties": false
+        },
+        "tp_mode_per_layer": {
+          "type": "object",
+          "properties": {
+            "default_mode": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "Default TP mode for components without an explicit field (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "gating": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for gating layers (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "pinned_dense_ffn": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for pinned dense FFN layers (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "attention": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for attention layers (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "shared_expert": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for shared expert layers (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "embedding": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for embedding layer (null = inherit from parallelism.tensor_parallelism)"
+            },
+            "output_head": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 2,
+              "default": null,
+              "x-override": true,
+              "description": "TP mode for output head (lm_head) (null = inherit from parallelism.tensor_parallelism)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "kv_cache": {
+          "type": "object",
+          "properties": {
+            "max_pages_per_gpu": {
+              "$ref": "#/$defs/auto_or_positive_int",
+              "default": "auto",
+              "description": "KV cache PHYSICAL pages per GPU: one page per (sequence, logical page, layer) per INV-KV-LAYER, so an explicit value must include the \u00d7num_layers (incl. MTP) factor; auto sizing does"
+            },
+            "page_size_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 128,
+              "default": 16,
+              "description": "Tokens per KV cache page"
+            },
+            "speculation_pool_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.15,
+              "description": "Fraction of KV pages reserved for speculation"
+            },
+            "indexer_k_page_size_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 8192,
+              "description": "Page size in tokens for DSA indexer K cache. Only used when model has DSA (index_topk > 0). Coarse default: at ~132 B/token the block-table overhead is negligible and a growing sequence claims ~1 MB chunks on demand (amortized-growth behavior with no copies); lower toward 64 only for many-sequence serving where fine-grained multiplexing matters.",
+              "x-devDoc": "PageAllocator Pool::kIndexerK uses this as its page granularity. Separate pool with own base pointer, metadata array, and free list (INV-4.9d). Replication/sharding governed by hardware.dcp_indexer_mode. Page size is a pure capacity-multiplexing policy knob — same code path at any value (see TD-GLM-INDEXER-PAGED)."
+            },
+            "prefill_scratch_preallocated_gb": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.5,
+              "description": "Pre-allocated scratch at tail of KV main pool for prefill workspace (GB). Forms contiguous buffer with streaming spill zone."
+            },
+            "streaming_spill_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.34,
+              "description": "Fraction of streaming zone used as spill zone (top, repurposable for prefill scratch). Remainder is pre-allocated expert prefetch (bottom, permanent)."
+            },
+            "dcp_chunk_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 16,
+              "description": "Consecutive tokens per DCP rank before rotating to the next rank. Round-robin chunking per Helix S2.3. Only used when tensor_parallelism >= 2. Must be a multiple of page_size_tokens."
+            },
+            "naive_prefill_context_ceiling": {
+              "oneOf": [
+                { "type": "null" },
+                { "type": "integer", "minimum": 0 }
+              ],
+              "default": null,
+              "description": "Maximum context length (tokens) for dense naive prefill. Beyond this ceiling, absorbed prefill is used directly (zero scratch, no expert eviction from spill zone). null = no ceiling (use naive whenever scratch fits). Set to limit decompression buffer size and support larger max_sequence_length via absorbed fallback."
+            },
+            "page_growth_chunk_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8192,
+              "default": 1024,
+              "description": "Tokens of headroom beyond prompt_len on CMD_SEQ_CREATE, and auto-growth chunk size in build_kv_metadata. 0 disables."
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced KV cache tuning knobs",
+              "properties": {
+                "fragmentation_tolerance": {
+                  "$ref": "#/$defs/weight_0_1",
+                  "default": 0.15,
+                  "description": "Max internal fragmentation from block alignment before compaction. (Source: PagedAttention/vLLM) [kv_cache.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "kv_tiering": {
+          "type": "object",
+          "description": "GLM-25k: DSA-guided KV tiering (HiSparse-style). Demotes cold main-KV pages to NUMA-local pinned host RAM and materializes exactly the indexer's selected rows into a dense per-layer scratch before sparse attention. Placement-only: token-identical to the non-tiered path by construction (INV-KVT-1). Requires a DSA model (index_topk > 0), replicated KV, snapmla backend, B==1 decode.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable DSA-guided KV tiering. Off = non-tiered path byte-identical."
+            },
+            "hot_buffer_slots": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "description": "Per-layer hot row-cache capacity in token slots AND paged-pool retention window in tokens (HiSparse device_buffer_size analogue, ~2-3x index_topk). 0 = auto (2x index_topk)."
+            },
+            "host_to_device_ratio": {
+              "type": "number",
+              "minimum": 1,
+              "default": 8.0,
+              "description": "Cold host-pool capacity as a multiple of the per-layer hot buffer (HiSparse host_to_device_ratio). When the pool is full further demotions are skipped (pages stay hot, fail-safe)."
+            },
+            "replica_cold_dedup": {
+              "type": "boolean",
+              "default": true,
+              "description": "Under REPLICATED KV at dcp>=2, keep a single cold copy per demoted page (round-robin cold-owner rank) instead of one per rank: pinned cold host RAM divided by dcp, total capacity unchanged. Demotion D2H and cold-burst H2D DMAs stay NUMA-node-local; only the cold-fetch host memcpy may cross nodes for non-owner ranks (INV-KVT-11). Placement-only, token-identical. Ignored under sharded KV (already single-copy) and at dcp==1. Disable to restore per-rank cold copies (all-local host memcpy, dcp x host RAM)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "expert_cache": {
+          "type": "object",
+          "properties": {
+            "eviction_policy": {
+              "type": "string",
+              "enum": ["impact_weighted_lru", "lru", "lfu"],
+              "default": "impact_weighted_lru",
+              "description": "Expert eviction strategy"
+            },
+            "eviction_alpha_recency": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.4,
+              "description": "Recency weight in eviction scoring"
+            },
+            "eviction_beta_frequency": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.35,
+              "description": "Frequency weight in eviction scoring"
+            },
+            "eviction_gamma_routing_weight": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.25,
+              "description": "Routing weight impact in eviction scoring"
+            },
+            "eviction_delta_temporal_autocorr": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.0,
+              "description": "Temporal autocorrelation weight in eviction scoring"
+            },
+            "eviction_epsilon_coactivation": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.0,
+              "description": "Co-activation weight in eviction scoring"
+            },
+            "eviction_zeta_prefetch_score": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.0,
+              "description": "Prefetch signal weight in eviction scoring"
+            },
+            "eviction_eta_hysteresis": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.0,
+              "description": "Hysteresis state weight in eviction scoring. Higher = more protection for frequently-activated experts. Only effective when hysteresis_enabled is true. (Source: MoE-SpAc, arXiv 2603.09983)"
+            },
+            "hysteresis_enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable MoE-SpAc per-expert hysteresis state machine to prevent cache thrashing. When enabled, experts build up caching priority through repeated activation and only lose it gradually. (Source: MoE-SpAc, arXiv 2603.09983)"
+            },
+            "hysteresis_stages": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 5,
+              "description": "Number of hysteresis state levels (TOP_STAT). Higher = more granular caching priority."
+            },
+            "hysteresis_up_threshold": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 5,
+              "description": "Activation count above current state required for promotion. Higher = harder to promote (more stable)."
+            },
+            "hysteresis_down_threshold": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 1,
+              "description": "Activation count below current state required for demotion. Lower = easier to demote."
+            },
+            "duplication_frequency_threshold_percentile": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 99,
+              "default": 95,
+              "description": "Percentile threshold for expert duplication candidates"
+            },
+            "temporal_autocorrelation_bonus": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.8,
+              "description": "Bonus for temporal autocorrelation in eviction"
+            },
+            "stable_zone_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.7,
+              "x-changeable": true,
+              "description": "Fraction of expert cache VRAM reserved for the stable zone (co-activation placements, high-frequency experts with slow eviction). The remaining fraction is the streaming zone (speculative prefetch, layer-ahead loads with fast turnover). Per-GPU override available in gpu_object.vram_allocation_gb.stable_zone_fraction",
+              "x-devDoc": "TransferScheduler uses this value as zone routing threshold: PrefetchPriority >= stable_zone_fraction routes to kStable, below routes to kStreaming. Eviction policy scores both zones but streaming evicts first (kStreamingZoneBonus=500.0 additive). Two-phase protocol: reserve() then mark_ready() (INV-4.5.1)."
+            },
+            "inclusive_cache": {
+              "type": "boolean",
+              "default": true,
+              "description": "Inclusive cache hierarchy (INV-4.12e). When true (default), each tier retains data after promotion — VRAM eviction is metadata-only. When false, host RAM copies are freed after H2D, requiring D_CMD_SLOW_EVICT_TO_HOST for safe VRAM eviction."
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced expert cache tuning knobs",
+              "properties": {
+                "layer_depth_decay_factor": {
+                  "$ref": "#/$defs/weight_0_1",
+                  "default": 0.95,
+                  "description": "Exponential decay for eviction priority by layer depth; deeper layers = less priority. (Source: MoE Infinity) [expert_cache.h]"
+                },
+                "entropy_aware_eviction": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Weight eviction by token entropy; high-entropy tokens = less predictable routing = higher eviction priority. (Source: MoE-SpeQ) [expert_cache.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "nvme_tier": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable NVMe cold tier"
+            },
+            "io_engine": {
+              "type": "string",
+              "enum": ["io_uring", "libaio"],
+              "default": "io_uring",
+              "description": "I/O backend"
+            },
+            "queue_depth": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 512,
+              "default": 64,
+              "description": "I/O ring queue depth"
+            },
+            "prefetch_ahead_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 3,
+              "description": "Layers ahead to prefetch from NVMe"
+            },
+            "host_ram_cache_gb": {
+              "oneOf": [
+                { "type": "null" },
+                { "type": "number", "exclusiveMinimum": 0 }
+              ],
+              "default": null,
+              "description": "Host RAM budget for warm expert cache in GB (null = auto: system_ram - pinned - OS reserve)",
+              "x-devDoc": "Inclusive cache hierarchy (INV-4.12e): host RAM retains copies after H2D promotion. Host RAM eviction is pure LRU (INV-4.12d), simpler than VRAM impact-weighted eviction. Host eviction skips NVMe write when NVMe copy already exists."
+            },
+            "direct_io": {
+              "type": "boolean",
+              "default": true,
+              "description": "Use O_DIRECT for NVMe I/O (bypasses page cache, reduces memory pressure)",
+              "x-devDoc": "When true, NVMe reads bypass kernel page cache via O_DIRECT flag on io_uring submissions. Reduces host memory pressure but requires page-aligned buffers (NvmeTier handles alignment internally)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "numa": {
+          "type": "object",
+          "properties": {
+            "interleave_strategy": {
+              "type": "string",
+              "enum": ["affinity_based", "round_robin"],
+              "x-cType": "NumaStrategy",
+              "default": "affinity_based",
+              "description": "NUMA memory allocation strategy"
+            },
+            "fallback": {
+              "type": "string",
+              "enum": ["round_robin", "sequential"],
+              "x-cType": "NumaFallback",
+              "default": "round_robin",
+              "description": "Fallback allocation strategy"
+            }
+          },
+          "additionalProperties": false
+        },
+        "vram_safety_margin_gb": {
+          "type": "number",
+          "default": 1.0,
+          "minimum": 0.1,
+          "description": "Per-GPU VRAM reserved for CUDA context, driver, streams, and cuBLAS handles (GB)",
+          "x-devDoc": "VramAllocator allocates (total_vram - safety_margin) as one contiguous block per GPU. Must cover CUDA context, cuBLAS handles, NCCL comm buffers, stream allocations, and driver overhead. Increase if cudaMalloc fails during init."
+        },
+        "host_packed_cache_mb": {
+          "type": "integer",
+          "minimum": -1,
+          "default": 0,
+          "description": "Host RAM budget (MB) for retaining packed expert buffers across prefetch cycles. 0 = release after H2D (default, matches legacy TD-82a behavior). -1 = unlimited (never evicts). N > 0 = bounded LRU cache. Reduces ~1ms/expert NVFP4 re-packing cost on re-prefetch.",
+          "x-devDoc": "PackedBufferCache (WP-4). In explicit mode, malloc+LRU with this budget. In mmap mode (preprocessing.host_cache_mode=mmap with prepacked files), this field is ignored — OS page cache manages residency. Eviction uses shared_ptr::use_count() > 1 to skip entries with in-flight DMA references (safe under INV-ELM-1 single-threaded daemon)."
+        },
+        "preload_expert_buffers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Eagerly populate host packed buffer cache at startup. In explicit mode: pack all experts and insert (stops when budget is full). In mmap mode: madvise(MADV_WILLNEED) on prepacked file regions. Adds startup latency (~15s for V3.2) but eliminates runtime packing.",
+          "x-devDoc": "PackedBufferCache (WP-4) preload. Explicit mode calls ensure_expert_packed() for all routed experts and inserts owned_buf into cache. Mmap mode calls madvise on PrepackedSource mmap regions. No-op if host_packed_cache_mb=0 in explicit mode."
+        },
+        "pin_host_expert_pool": {
+          "type": "boolean",
+          "default": true,
+          "description": "Page-lock the host expert pool, NUMA-bound to each expert's home node, so H2D DMAs the source directly at full PCIe bandwidth (no staging copy). Requires preload_expert_buffers. P-24: builds one anonymous mbind'd arena per GPU-attached NUMA node and registers it ONCE with cudaHostRegisterPortable (~tens of ms/GB), slab-managed with LRU + a multi-GPU in-flight refcount; expert preload becomes a plain file read into a pinned slot. Startup is seconds/node (vs the 481-1 per-file path's ~5.7 s/GB, TD-100c). Leave off for fast test/dev startup (falls back to the mmap + pinned staging pool — byte-for-byte today's behavior). 481-1/P-23/P-24.",
+          "x-devDoc": "When on, Engine builds a memory::PinnedExpertArena (one PinnedNodeArena per node) and wires it as host_source priority -1 (PinnedExpertArena* in HostSourceDeps); resolve fills a slot via PrepackedSource::load_into on miss and returns pinned=true. When off, host_source uses the mmap path (preload_mmap madvise) + staging pool. cudaHostRegisterReadOnly is unsupported on SM120; the arena is anonymous writable memory so Portable register succeeds fast."
+        },
+        "pin_host_expert_pool_sizing": {
+          "type": "object",
+          "description": "Per-NUMA-node budget for pin_host_expert_pool (replaces the legacy pin_host_expert_pool_fraction). A global mode/value plus optional per-node overrides; the arena slab is capped at this budget per node (and never exceeds the full routed-expert set). Regions over budget fall back to staging. Prevents oversubscribing a node (INV-4.12f).",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["fraction_free", "fraction_total", "absolute_gb"],
+              "x-cType": "HostPoolSizingMode",
+              "default": "fraction_total",
+              "description": "fraction_free: value x node available RAM (MemFree + reclaimable page cache + SReclaimable). fraction_total: value x node MemTotal. absolute_gb: value GB flat (decimals ok)."
+            },
+            "value": {
+              "type": "number",
+              "default": 0.9,
+              "minimum": 0.0,
+              "description": "Fraction in (0,1] for fraction_* modes, or GB (>0, decimals ok) for absolute_gb. Default 0.9 = the keeper52 full-fit arena (paired with the pin_host_expert_pool_preload + direct O_DIRECT defaults, so the page cache is not relied on). With preload/direct OFF, prefer ~0.15: a larger lazy arena evicts the prepacked file's page cache (which backs cold loads), forcing them to disk and collapsing tok/s when the prepacked store is comparable to total RAM."
+            },
+            "per_node": {
+              "type": "array",
+              "default": [],
+              "description": "Per-NUMA-node overrides of {mode,value}, keyed by node index. A node absent here uses the global mode/value.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "node": { "type": "integer", "minimum": 0, "description": "NUMA node index (matches gpu_attached_nodes)." },
+                  "mode": { "type": "string", "enum": ["fraction_free", "fraction_total", "absolute_gb"], "x-cType": "HostPoolSizingMode", "description": "Sizing mode for this node." },
+                  "value": { "type": "number", "minimum": 0.0, "description": "Fraction in (0,1] or GB (>0) per mode." }
+                },
+                "required": ["node", "mode", "value"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "pin_host_expert_pool_extra_scratch_bytes": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "Bytes of GENERAL shared scratch reserved at the FRONT of EACH per-NUMA-node pinned arena (PinnedNodeArena), before the normal expert-slot region. The slot region starts after this reservation; expert slot pointers and capacity are unaffected by its presence other than the offset. Default 0 = byte-for-byte the prior arena layout (no scratch, zero behavior change). First consumer: MultiNumaCpuExpertDevice (C-6), which stages a node's contiguous N-row weight slices into this scratch so each node computes its expert-FFN partition from LOCAL, page-locked, NUMA-bound memory. The reservation is pinned + mbind'd to the node along with the rest of the arena slab.",
+          "x-devDoc": "Threaded into memory::PinnedExpertArena(numa, slot_size, total, sizing, spill, extra_scratch_bytes) → each PinnedNodeArena allocates extra_scratch_bytes (page-rounded) at base_, exposes node_scratch()/node_scratch_bytes(), and offsets slot 0 to base_ + scratch. total_bytes_ = scratch + num_slots*slot_size."
+        },
+        "pin_host_expert_pool_preload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Eagerly load the pinned arena from the prepacked source at startup (warm-by-definition) instead of lazily on first miss, then drop the prepacked mmap page cache (MADV_DONTNEED). Removes the runtime dependency on the prepacked page cache (which a large arena would otherwise evict, forcing cold loads to disk). Each node arena is loaded to capacity with its home-node experts; experts beyond capacity stay on the cold path. Adds startup latency (one bulk read of the pinned bytes). NOTE: this preloads expert WEIGHTS into host RAM — unrelated to LLM prefill (prompt/KV-cache processing). Requires pin_host_expert_pool.",
+          "x-devDoc": "Engine calls PinnedExpertArena::preload(prepacked_source, num_hidden_layers, n_routed_experts) after building the arena + ArenaLoader, then PrepackedSource::advise_dontneed(). preload iterates expert-major, skips non-MoE layers via PrepackedSource::has(key), and reserve+load_into+mark_ready until each node arena is full."
+        },
+        "cross_node_spill": {
+          "type": "object",
+          "description": "Weighted cross-NUMA-node RAM spill tier for the pinned expert arena. When a computing GPU's local-node arena is full, an overflowing expert is placed in another node's RAM arena (including a GPU-less node) instead of being evicted to disk — the multi-node arenas act as one warm cache, NVMe is the last resort. A cross-NUMA H2D is slower (~-38%, INV-4.12h) but ~10x faster than an NVMe reload. Requires pin_host_expert_pool.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable the cross-node RAM spill tier (keeper52 default). NOTE: takes effect only with a non-empty `nodes` list (there is no auto node discovery; an empty list = no spill arenas — a config wanting the full-fit arena must list its spill nodes, see the GLM-5.2 configs). When false, the arena is GPU-attached-node-only — strict no-op."
+            },
+            "nodes": {
+              "type": "array",
+              "default": [],
+              "description": "Candidate spill nodes with weights. Higher weight is consistently preferred until that node fills, then the next; equal weights interleave (fewest-occupied). A node may be GPU-less (e.g. idle node 1) or a GPU node not currently computing (e.g. node 0). The computing GPU's own local node is always tier-1 and excluded from spill selection.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "node": { "type": "integer", "minimum": 0, "description": "NUMA node index." },
+                  "weight": { "type": "integer", "minimum": 0, "description": "Spill preference weight (>0 to be a candidate; higher fills first)." }
+                },
+                "required": ["node", "weight"],
+                "additionalProperties": false
+              }
+            },
+            "sizing_mode": {
+              "type": "string",
+              "enum": ["fraction_free", "fraction_total", "absolute_gb"],
+              "x-cType": "HostPoolSizingMode",
+              "default": "fraction_total",
+              "description": "How each spill node's arena is sized (independent of pin_host_expert_pool_sizing; no /total clamp — spill is extra capacity). A GPU-less spill node can be sized generously."
+            },
+            "sizing_value": {
+              "type": "number",
+              "default": 0.9,
+              "minimum": 0.0,
+              "description": "Fraction in (0,1] for fraction_* modes, or GB (>0) for absolute_gb, applied to each spill node (0.9 = keeper52 full-fit)."
+            },
+            "per_node": {
+              "type": "array",
+              "default": [],
+              "description": "Per-NUMA-node overrides of {mode,value} for spill nodes (TD-NUMA-HBM-BANKS): e.g. size the small CPU-less HBM nodes by fraction_free (safe against the tiny node's free capacity) while big RAM spill nodes keep the global fraction_total. A node absent here uses sizing_mode/sizing_value.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "node": { "type": "integer", "minimum": 0, "description": "NUMA node index." },
+                  "mode": { "type": "string", "enum": ["fraction_free", "fraction_total", "absolute_gb"], "x-cType": "HostPoolSizingMode", "description": "Sizing mode for this node." },
+                  "value": { "type": "number", "minimum": 0.0, "description": "Fraction in (0,1] or GB (>0) per mode." }
+                },
+                "required": ["node", "mode", "value"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "pin_host_expert_pool_direct_load": {
+          "type": ["boolean", "null"],
+          "default": null,
+          "description": "Stage 2: read expert slots directly from the prepacked files (pread) instead of via mmap memcpy, so the page cache never competes with the pinned arena (the arena/spill RAM is the deterministic warm tier). In direct mode the prepacked files are NOT mmapped — fds are kept open and reads pread into the slot. null (default) = mirror pin_host_expert_pool_preload (on when preload is on). Requires pin_host_expert_pool. With cross_node_spill this is the regime where spill beats disk.",
+          "x-devDoc": "Engine computes effective = direct_load.value_or(preload) and passes {direct, o_direct} to PrepackedSource. load_into() dispatches to pread_into() in direct mode; resolve()/host_ptr() return null (no mmap); host_source returns kPending when reserve_for_fill is momentarily full (no mmap fallback)."
+        },
+        "pin_host_expert_pool_direct_o_direct": {
+          "type": "boolean",
+          "default": true,
+          "description": "When pin_host_expert_pool_direct_load is on: true → O_DIRECT reads (truly bypass the page cache; requires slot_size + offsets + slot buffers 4096-aligned, else falls back to buffered with a warning); false (default) → buffered pread + posix_fadvise(DONTNEED) on the just-read range (any slot size, no alignment constraint). NOTE: measured ~14% SLOWER than buffered (no readahead/caching) — leave off unless your hardware favors it."
+        },
+        "pin_host_expert_pool_iouring": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stage 3: use an io_uring backend for the ArenaLoader cold reads — submit reads to a ring and reap completions on the daemon poll, with NO worker threads, so concurrency = queue depth (≫ a thread pool) and many misses in one fetch overlap. Requires pin_host_expert_pool_direct_load (needs open fds) and a liburing build (cmake -DLAYERSTORM_USE_NVME=ON); falls back to the worker pool otherwise. Forward-looking: helps the many-concurrent-misses regime; the current bottleneck is the fetch round-trip, not read concurrency.",
+          "x-devDoc": "Engine builds ArenaLoader with Backend::kIoUring when set AND PrepackedSource is in direct mode; submit() issues io_uring_prep_read on the prepacked fd into the pinned slot, poll_completed() reaps CQEs."
+        },
+        "pin_host_expert_pool_thp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Transparent huge pages for the persistent-arena shared segments (madvise(MADV_HUGEPAGE) before first touch): 512x fewer PTEs to pin makes the warm-attach cudaHostRegister dramatically cheaper and relieves CPU-expert GEMV TLB pressure. Requires the kernel's shmem THP mode to allow madvise (/sys/kernel/mm/transparent_hugepage/shmem_enabled = advise/always/within_size; NOT the default 'never' on many distros — e.g. `echo advise | sudo tee .../shmem_enabled`, not persisted across reboots). Falls back to 4K pages with a warning when disallowed. A store created with 4K pages stays 4K until its next cold rebuild. Only affects arena_attach shared segments.",
+          "x-devDoc": "Engine calls NumaManager::set_shared_thp(cfg) before the arena build; NumaManager::advise_hugepage runs in allocate_on_node_shared (pre-fault — placement + hugeness both decided at first touch) and adopt_shared (future faults only). Detection: shmem_thp_available() parses the bracketed mode. Geometry identity (ArenaCache::hash_config) deliberately EXCLUDES page size."
+        },
+        "arena_attach": {
+          "type": "object",
+          "description": "P-24b persistent arena: back the pinned expert arena with memfd segments whose fds are kept alive by the CUDA-free `layerstorm_arena_holder` daemon, so the preloaded expert bytes (and their NUMA placement) survive engine restarts. On attach the engine validates the stored geometry/source identity (ArenaCache meta) and ADOPTS still-valid slots — skipping the NVMe preload for them; any mismatch (config geometry change, re-packed files via per-file mtime/size, schema bump) wipes and rebuilds cold — via a REASONED kWipe (kIdentityMismatch + the named failing check), which the holder honors while the holder PROCESS stays up to host the successor store, so a box can switch the model it serves without restarting the holder. Exactly ONE engine may be attached at a time (a second attach fails FATALLY — never silently double-allocates host RAM); detach is automatic on process exit/kill (the attachment IS the holder socket connection, INV-ARENA-HOLD). Requires pin_host_expert_pool + prepacked files.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Attach to (auto-spawning if needed) the arena holder. When the holder is unreachable the engine falls back to the classic process-private arena for that run (warning logged, no persistence). false = byte-for-byte the prior private-arena behavior.",
+              "x-devDoc": "Engine builds memory::ArenaIpcClient + ArenaCache and passes ArenaBacking{kAdopt|kSharedCreate} to PinnedExpertArena. Warm validation: ArenaCache::hash_geometry over PinnedExpertArena::plan_geometry + hash_source_id(prepacked dir, manifest format_version, stride) vs the stored meta header; segment sizes byte-checked against slab_bytes(). Record stamping follows INV-ARENA-CACHE-ORDER (invalidate before first byte, ACTIVE only after load completes)."
+            },
+            "socket_path": {
+              "type": "string",
+              "default": "@layerstorm-arena",
+              "description": "Unix socket of the holder. A leading '@' selects the Linux abstract namespace (no filesystem entry — recommended). Use distinct paths to run independent persistent arenas (e.g. per model/box share)."
+            },
+            "holder_binary": {
+              "type": "string",
+              "default": "",
+              "description": "Path to the layerstorm_arena_holder executable for auto_spawn. Empty = try build/tools/layerstorm_arena_holder (repo-root runs), then PATH."
+            },
+            "auto_spawn": {
+              "type": "boolean",
+              "default": true,
+              "description": "Spawn the holder (detached --daemon) when the socket is unreachable, then attach. false = attach only to an already-running holder (falls back to a private arena when absent)."
+            },
+            "persist": {
+              "type": "boolean",
+              "default": false,
+              "description": "Store-protection mode for production serving: THIS engine never wipes or displaces the holder's store, and the store SURVIVES this engine's exit for the next boot to adopt. On warm-attach validation failure (identity/geometry mismatch) or any adoption error, the boot FAILS LOUD with the mismatch reason instead of silently wiping + cold-rebuilding — and there is no fallback to a process-private arena either (on a box sized around the store, a second full-size arena OOMs; 2026-08-18 incident: a mismatch wipe + rebuild destroyed a 504 GB warm store when the rebuilding engine was OOM-killed). Cold BUILD into an EMPTY holder is still allowed (persist protects an existing store, it does not prevent creating one). To intentionally rebuild: boot once with persist=false, or run `layerstorm_arena_ctl --wipe` with every engine stopped. false = historical behavior (mismatch wipes + rebuilds cold, adoption errors fall back to a private arena). ACKNOWLEDGED TRADE (2026-08-22, when the kWipe REASON contract landed): the holder now honors every reasoned wipe — kIdentityMismatch from a discovering engine, kOperatorRequest from the CLI — and its old --persist veto is RETIRED, so this config field is the ONLY thing protecting a precious store; any other engine reaching the same socket with persist=false (resolved on_conflict 'kill') WILL wipe it. Set persist=true on every production config that can reach the socket. Interacts with on_conflict: an absent on_conflict derives from persist (false → 'kill', true → 'fail'), and persist=true is compatible ONLY with on_conflict='fail' (rejected at config parse otherwise).",
+              "x-devDoc": "engine.cpp arena-early worker: the !ok mismatch branch and the catch-all both key on config::resolved_arena_on_conflict() — persist=true resolves to 'fail' → arena_early_.fatal (rethrown at join, engine-fatal) instead of wipe()/private-fallback. Holder-unreachable stays a private-arena fallback (no store exists to protect). Mismatch diagnostics name the failed check (meta-invalid | config-identity | node-count | slab-size) and that same string rides the kWipe as WipeRequest::detail on the 'kill' path."
+            },
+            "on_conflict": {
+              "type": "string",
+              "enum": ["new", "fail", "kill"],
+              "x-cType": "ArenaOnConflict",
+              "x-enumNames": { "new": "new_arena" },
+              "x-unsetMember": "unset",
+              "description": "What an attach-enabled engine does when the holder HAS a store but identity validation MISMATCHES (named checks: meta-invalid | config-identity | node-count | slab-size). 'kill': wipe the holder store and cold-rebuild it in place (the historical persist=false reaction, now explicit) — the wipe is REASONED (WipeReason::kIdentityMismatch carrying the named failing check, logged holder-side), the holder honors it and stays up to host the successor store. 'fail': fail the boot LOUDLY naming the failed check; the store stays untouched (the historical persist=true reaction, now selectable independently). 'new': LEAVE the holder store untouched and run THIS engine on a fresh process-private arena for the run — the same fallback machinery as when the holder is unreachable; persistence is bypassed for the run (loud warning) and the private arena is allocated BESIDE the retained store (fraction_free sizing shrinks it to the remaining RAM), so use only where host RAM allows. DEFAULT: 'kill' (the historical reaction). Under persist=true the only permitted and effective mode is 'fail', so an absent field there resolves to 'fail' — the behavior matrix for existing configs is unchanged. Compatibility, enforced at config PARSE (not at attach): persist=true is compatible ONLY with 'fail' — persist + 'kill' is a flat contradiction (persist means the store is never wiped), and persist + 'new' is contradictory too (the deployment declared its arena must be the persistent store; silently serving from a throwaway private arena would violate that and double-allocate ~500 GB host RAM behind the operator). A holder that does not speak the kWipe REASON contract (a binary older than 2026-08-22, or one started with the retired --persist flag) refuses the wipe (kError); the engine then ESCALATES to 'fail' naming the refusal — it never silently degrades to 'new'.",
+              "x-devDoc": "engine.cpp arena_attach_early_worker_: the !ok mismatch branch switches on config::resolved_arena_on_conflict() (inline in config_validator.h; 'unset' resolves via persist). 'new' detaches (arena_ipc_.reset()) and returns → the late block builds the classic private arena, exactly the holder-unreachable path. 'kill' checks ArenaIpcClient::wipe()'s reply and escalates a holder refusal to arena_early_.fatal. The adoption-EXCEPTION catch-all keeps the historical matrix: 'fail' → fatal, 'kill'/'new' → private-arena fallback (no wipe — an adoption error is not an identity mismatch). Parse-time rejection: finalize_config (config_preset.cpp, throwing) + validate_arena_attach (config_validator.cpp, structured). x-unsetMember gives the C++ enum a JSON-invisible 'unset' first member so absence stays distinguishable from every explicit value."
+            }
+          },
+          "additionalProperties": false
+        },
+        "arena_placement": {
+          "type": "object",
+          "description": "M3 frequency-aware static arena placement (spec/reports/DSP52_BOOST.md M3, spec/reports/FETCH_XRAY.md): HBM-first + per-layer anti-gang slot→NUMA-node plan for the pinned expert arena, applied at arena BUILD (preload) time only. Performance-only: the same expert bytes DMA from a different host node — tokens are byte-identical ON vs OFF. The table's content hash folds into the ArenaCache store identity, so switching tables (or turning placement on/off) invalidates a persisted holder store and triggers ONE cold rebuild; subsequent warm attaches keep the placed layout.",
+          "properties": {
+            "freq_table": {
+              "type": "string",
+              "default": "",
+              "description": "Path to the per-(layer,expert) fetch-count CSV ('layer,expert,count'; # comments allowed), e.g. tools/loader_xray/freq_table.py output over an LS_PERF_TRACE dump. \"\" = legacy frequency-blind placement. Relative paths resolve against the engine's working directory (same as the env var). Env LS_ARENA_PLACE_FREQ OVERRIDES this field: a path replaces it; 'off'/'none'/'0' force-disables (the way to get the legacy or pure-online placement when a model config carries a default table); unset/empty env defers here. Fail-closed: a configured-but-unreadable table aborts engine init.",
+              "x-devDoc": "memory::ArenaPlacementPolicy::resolve(cfg.memory.arena_placement.freq_table); identity = FNV-1a-64(tag + file bytes), path/source-agnostic. Interplay: arena_placement.online=true (the M3b migrator) treats a placed store as its bootstrap and refines it online; online=false keeps the static layout verbatim."
+            },
+            "online": {
+              "type": "boolean",
+              "default": true,
+              "description": "M3b online self-tuning arena placement (the EMA-driven migrator): observes live fetch traffic and migrates hot experts toward better NUMA nodes in the background, refining whatever layout the store booted with (static table or legacy). Byte-identical tokens ON vs OFF (placement is performance-only); migrations mutate the persisted holder store IN PLACE (no identity change, no rebuild). Default ON (2026-08-18 champion decision: online 10.459 tok/s vs 10.23-10.42 static anchors on dsp52; keeper prefers online per the M6 scoreboard; near-converged stores see ~10 migrations/run). No-ops with a warning when the pinned arena path or HBM arena nodes are absent. Env LS_ARENA_PLACE_ONLINE OVERRIDES this field: non-'0' forces ON, '0' forces OFF, unset defers here.",
+              "x-devDoc": "Consumed in engine.cpp M3b migrator boot (env-over-config precedence there); arena_migrator.h documents the migrator knobs (still env-only tuning). The migrator requires the pinned arena + HBM nodes; absent => warn + disable, never fatal."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "orchestrator": {
+      "type": "object",
+      "description": "Orchestrator scheduling configuration",
+      "properties": {
+        "performance_objective": {
+          "type": "object",
+          "properties": {
+            "latency_weight": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.6,
+              "x-changeable": true,
+              "description": "Weight for latency optimization"
+            },
+            "throughput_weight": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.4,
+              "x-changeable": true,
+              "description": "Weight for throughput optimization"
+            }
+          },
+          "additionalProperties": false
+        },
+        "max_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512,
+          "default": 64,
+          "x-changeable": false,
+          "description": "Maximum tokens per batch in expert FFN"
+        },
+        "expert_batching": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable grouped GEMM batching"
+            },
+            "max_wait_us": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 50,
+              "x-changeable": true,
+              "description": "Max wait for batch completeness (microseconds)"
+            },
+            "min_batch_tokens_per_expert": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 4,
+              "description": "Minimum tokens to start expert batch"
+            }
+          },
+          "additionalProperties": false
+        },
+        "coactivation_graph": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Track expert co-activation patterns"
+            },
+            "decay_factor": {
+              "type": "number",
+              "minimum": 0.9,
+              "maximum": 1.0,
+              "default": 0.999,
+              "description": "Exponential decay factor per token"
+            },
+            "reoptimize_interval_seconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 3600,
+              "default": 300,
+              "description": "Placement re-optimization frequency (seconds)"
+            },
+            "workload_shift_decay": {
+              "type": "number",
+              "minimum": 0.01,
+              "maximum": 0.5,
+              "default": 0.1,
+              "description": "Aggressive decay factor on workload shift detection"
+            }
+          },
+          "additionalProperties": false
+        },
+        "workload_detection": {
+          "type": "object",
+          "properties": {
+            "ewma_alpha": {
+              "type": "number",
+              "minimum": 0.001,
+              "maximum": 0.1,
+              "default": 0.01,
+              "description": "EWMA decay rate for workload detection"
+            },
+            "shift_threshold_std_devs": {
+              "type": "number",
+              "minimum": 1.0,
+              "maximum": 5.0,
+              "default": 3.0,
+              "description": "Standard deviations for shift detection threshold"
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced workload detection tuning knobs",
+              "properties": {
+                "token_window_size": {
+                  "$ref": "#/$defs/positive_int",
+                  "default": 32,
+                  "description": "Sliding window of tokens for workload distribution sampling. (Source: DALI) [workload_detector.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "ipc_transaction": {
+          "type": "object",
+          "description": "IPC state transaction tuning (see spec/IPC_TX.md)",
+          "properties": {
+            "writer_yield_interval": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1024,
+              "default": 16,
+              "description": "Writer yields every N completed outermost transactions"
+            },
+            "publish_interval_us": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "default": 5000,
+              "description": "Minimum interval between StateSnapshot publishes (us, measured from publish END). The spinning daemon otherwise publishes every ~us cycle, keeping the seqlock churning and starving Python readers (INV-IPC-PUBLISH-THROTTLE). 0 = publish every cycle (legacy; C++-only readers)"
+            },
+            "reader_max_retries": {
+              "type": "integer",
+              "minimum": 1000,
+              "default": 200000000,
+              "description": "Max retry iterations before TimeoutError (~3min practical at ~850ns/iter, ~2min theoretical at ~547ns/iter sched_yield)"
+            },
+            "reader_backoff_stage_size": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 65536,
+              "default": 4096,
+              "description": "Iterations per backoff stage"
+            },
+            "reader_stage0_yield_every": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 64,
+              "description": "In stage 0 (tight spin), yield every N iterations"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "prefetch": {
+      "type": "object",
+      "description": "Expert prefetch pipeline configuration",
+      "properties": {
+        "prescope": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable exact 1-layer gating lookahead"
+            },
+            "lookahead_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3,
+              "default": 1,
+              "description": "Layers to look ahead"
+            },
+            "top_k": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256,
+              "default": 8,
+              "x-changeable": true,
+              "description": "Max experts per token to consider from gating output"
+            },
+            "score_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.01,
+              "x-changeable": true,
+              "description": "Min routing weight to include expert in prefetch hints"
+            },
+            "predictor_enabled": {
+              "type": "boolean",
+              "default": false,
+              "x-changeable": true,
+              "description": "Enable LLaPor learned predictor (MEDIUM confidence, zero GPU cost). Predictor params in _internal-prescope section."
+            }
+          },
+          "additionalProperties": false
+        },
+        "probe": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable multi-layer predictive prefetching"
+            },
+            "probe_points": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/weight_0_1" },
+              "default": [0.25, 0.5, 0.75],
+              "description": "Network depth fractions for probe insertion points"
+            },
+            "confidence_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.6,
+              "x-changeable": true,
+              "description": "Minimum prediction confidence to trigger prefetch"
+            }
+          },
+          "additionalProperties": false
+        },
+        "moe_speq": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable online-trained per-pair MoE predictor"
+            },
+            "predictor_hidden_size": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 1024,
+              "default": 256,
+              "description": "Hidden size of MLP predictors"
+            },
+            "learning_rate": {
+              "$ref": "#/$defs/positive_float",
+              "default": 1e-4,
+              "x-changeable": true,
+              "description": "Adam learning rate"
+            },
+            "training_buffer_size": {
+              "type": "integer",
+              "minimum": 1000,
+              "maximum": 100000,
+              "default": 10000,
+              "description": "Ring buffer size for training samples"
+            },
+            "train_interval_steps": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 1000,
+              "default": 100,
+              "x-changeable": true,
+              "description": "Background training frequency (steps)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "speculative": {
+          "type": "object",
+          "description": "Speculative prefetch from draft gating outputs. (Source: SP-MoE) [speculative_prefetch.h]",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable speculative prefetch from draft gating outputs. (Source: SP-MoE) [speculative_prefetch.h]"
+            },
+            "max_prefetch_depth_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 5,
+              "default": 3,
+              "description": "Max layers ahead to prefetch from draft gating; cache thrashing starts beyond 3. (Source: SP-MoE) [speculative_prefetch.h]"
+            },
+            "confidence_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.4,
+              "x-changeable": true,
+              "description": "Min draft gating confidence to trigger prefetch. (Source: SP-MoE) [speculative_prefetch.h]"
+            }
+          },
+          "additionalProperties": false
+        },
+        "fusion_weights": {
+          "type": "object",
+          "properties": {
+            "prescope_alpha": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.5,
+              "x-changeable": true,
+              "description": "PreScope signal weight in fusion"
+            },
+            "probe_beta": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.3,
+              "x-changeable": true,
+              "description": "PROBE signal weight in fusion"
+            },
+            "speq_gamma": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.2,
+              "x-changeable": true,
+              "description": "MoE-SpeQ signal weight in fusion"
+            },
+            "sp_moe_delta": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.15,
+              "x-changeable": true,
+              "description": "SP-MoE speculative signal weight in prefetch fusion scoring. (Source: SP-MoE) [prefetch_fuser.h]"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "speculation": {
+      "type": "object",
+      "description": "Speculative decoding configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "x-changeable": true,
+          "description": "Enable all speculative decoding"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["none", "null", "mtp", "prompt_lookup", "dspark"],
+          "x-cType": "SpeculationMethodType",
+          "default": "none",
+          "description": "Engine-side (C++) speculative-decoding method, constructed via make_speculation_method at engine init (src/speculation/). none (DEFAULT): no method constructed — byte-identical to non-speculative behavior. null: no-op stub (drafts nothing; plumbing/diagnostic only). mtp: MtpSpeculationMethod (#16 / GLM-25g) — self-draft off the frozen trunk via the model's MTP head (requires num_nextn_predict_layers >= 1 and speculation.mtp.enabled). prompt_lookup: reserved — engine init fails until the concrete method lands. dspark: reserved (DSP-1 config surface; the DSparkSpeculationMethod lands in DSP-5) — engine init fails closed. Init-time selection (not hot-reloadable). Orthogonal to the sibling speculation.* sub-sections (mtp/dspark/prompt_lookup/... tuning knobs consumed by the selected method and the Phase-12 orchestrator pipelines)."
+        },
+        "mtp": {
+          "type": "object",
+          "description": "Multi-token prediction head draft",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable MTP head draft generation"
+            },
+            "max_depth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 3,
+              "description": "Maximum MTP draft tokens"
+            },
+            "dynamic_depth": {
+              "type": "boolean",
+              "default": true,
+              "description": "Vary depth based on confidence"
+            },
+            "confidence_threshold": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0,
+              "default": 0.4,
+              "description": "Dynamic-depth early exit: stop chaining MTP draft steps when the previous step's top-1 probability falls below this threshold (dynamic_depth only; step 0 always runs). Mirrors orchestrator MtpDraftConfig.confidence_threshold."
+            },
+            "batched_verify": {
+              "type": "boolean",
+              "default": true,
+              "description": "Verify the round's K MTP draft tokens in ONE teacher-forced K+1-token forward on the MAIN sequence (chunked-prefill-shaped attention + FETCH_AND_RUN_MOE over the batch + multi-token OUTPUT_HEAD argmax readback) instead of K+1 sequential full-model feeds - the throughput-bearing mode. Lossless either way (INV-MTP-LOSSLESS: only main-model outputs are ever committed). false = the sequential early-stop schedule (the MtpLossless golden's reference shape). Mirrors orchestrator MtpDraftConfig.batched_verify."
+            }
+          },
+          "additionalProperties": false
+        },
+        "dspark": {
+          "type": "object",
+          "description": "DSpark — confidence-scheduled speculative decoding (Phase 28; spec/DSpark_NOTES.md). Semi-autoregressive draft: parallel DFlash-style backbone emits base logits/hiddens for a whole block in ONE forward, then a lightweight sequential Markov head adds intra-block dependency left-to-right; a trained confidence head + hardware-aware prefix scheduler pick per-request verification lengths. Knobs consumed by the dspark SpeculationMethod (DSP-5) and the DSP-6..DSP-9 confidence/scheduler pipeline. (Source: DSpark, DeepSeek-AI + PKU 2026; reference engines vLLM @8484ca5d, DeepSpec @afdfa7c)",
+          "properties": {
+            "block_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16,
+              "default": 8,
+              "description": "Draft block size γ: tokens drafted per DSpark step (γ inputs → γ logits, anchor-as-first-prediction — INV-DSPARK-ANCHOR). One backbone forward covers the whole block, so draft latency is ~independent of γ. Default 8 = the shipped RedHatAI GLM-5.2 speculator checkpoint (speculators v0.5, block_size 8 / speculative_tokens 7); must match the trained checkpoint (DSP-2 cross-validates). The paper sweeps up to 16 offline."
+            },
+            "speculative_tokens": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16,
+              "default": 7,
+              "description": "Tokens proposed per block (speculators_config.proposal_methods[0].speculative_tokens). γ−1 in the shipped checkpoint (block 8 → anchor + 7 speculative). Must match the trained checkpoint; must not exceed block_size."
+            },
+            "aux_hidden_state_layer_ids": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "default": [8, 23, 39, 55, 70],
+              "description": "TARGET layer indices whose hidden states feed the draft's EAGLE-style fc fusion (fc.weight [hidden, N_aux*hidden] over their concat). Strictly increasing; each < model.num_hidden_layers. Default = the shipped GLM-5.2 speculator ([8,23,39,55,70] of 78 target layers). Must match the trained checkpoint; DSP-3 exports these hiddens from the target forward."
+            },
+            "mask_token_id": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 154856,
+              "description": "Token id whose embedding row serves as the DFlash mask/query-slot embedding (speculators v0.5 ships NO separate mask_embedding tensor — the row lives in the draft's embed_tokens). Indexes the draft's EMBED vocab (= the checkpoint transformer vocab_size, which can exceed a reduced draft_vocab_size); must be < max(draft_vocab_size, model.vocab_size) and match the trained checkpoint."
+            },
+            "max_anchors": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1024,
+              "description": "Maximum anchor positions per DSpark drafting pass (checkpoint max_anchors). Must match the trained checkpoint."
+            },
+            "draft_vocab_size": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 154880,
+              "description": "Draft vocabulary size (lm_head/markov_w2 leading dim — the space the draft's logits and transition bias live in). Equals the GLM-5.2 target vocab (154880) in the shipped checkpoint (identity remap). Reduced-vocab checkpoints (draft_vocab_size < vocab_size) must ship a d2t [draft_vocab_size] I64 offset tensor; sampled draft ids are remapped on-device to target ids (target_id = draft_id + d2t[draft_id], vLLM convention). embed_tokens/markov_w1 stay target-vocab sized. Must match the trained checkpoint."
+            },
+            "checkpoint_path": {
+              "type": "string",
+              "default": "test-data/GLM-5.2-speculator.dspark",
+              "description": "DSpark draft checkpoint: a DIRECTORY (speculators v0.5 format: config.json + model.safetensors — the GLM-5.2 speculator) or a `.gguf` FILE (ticket J: a `dflash`-arch DSpark speculator GGUF — the DeepSeek-V4-Flash draft; V4-shaped SWA-only blocks + MXFP4 MoE, single-rank only, embed/lm_head aliased from model.weights_path). Relative paths resolve against the engine working directory. Default = the RedHatAI GLM-5.2 speculator symlink used by the goldens."
+            },
+            "draft_gpus": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 },
+              "default": [],
+              "description": "GPU positions (index into hardware.gpus[], INV-4.18) hosting the draft weights. Empty (DEFAULT) = auto: the first non-TP GPU (the secondary GPUs are idle while the TP GPUs run the target; the 7.61 GB BF16 GLM-5.2 draft fits a 16 GB 5080). DSP-2 places the WHOLE draft replicated on the first resolved GPU; TP-sharding across draft GPUs is deferred (TD-DSPARK-DRAFT-SHARD). Fails closed when empty and all GPUs are in hardware.tp_array."
+            },
+            "draft_weights_quant": {
+              "type": "string",
+              "enum": ["bf16", "fp8_e4m3", "nvfp4"],
+              "x-cType": "DsparkDraftWeightsQuant",
+              "default": "bf16",
+              "description": "Requantize the DSpark draft's GEMM weight operands at upload (TD-DSPARK-DRAFT-QUANT): the 7 per-layer projections (q/k/v/o/gate/up/down) plus fc and lm_head are converted BF16 -> fp8_e4m3 (per-128-column-group FP32 scales, ~2x smaller) or nvfp4 (E2M1 g=16 + UE8M0 scales, ~3.5x smaller) and consumed by a fused-dequant GEMM; norms, embeddings, markov and confidence heads stay BF16. bf16 (DEFAULT) uploads verbatim — byte-identical to the pre-quant engine. Quantization is a drafting-QUALITY trade only (acceptance rate may dip; verification keeps the output lossless); it shrinks the draft's VRAM charge so the draft can host on a TP 5090 beside the target weights.",
+              "x-affects": "VRAM budget on the draft GPU (LayerRegistry dspark charge)"
+            },
+            "markov_rank": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096,
+              "default": 256,
+              "description": "Rank r of the low-rank first-order Markov transition factorization B = W1·W2 (markov_w1 [V_draft, r] embedding lookup, markov_w2 [r, V_draft] logit projection). Must match the trained DeepSpec checkpoint."
+            },
+            "head_type": {
+              "type": "string",
+              "enum": ["markov", "gated", "rnn"],
+              "x-cType": "DsparkHeadType",
+              "default": "markov",
+              "description": "Sequential head variant (DeepSpec markov_head.py: VanillaMarkov / GatedMarkovHead / RNNHead). markov is the deployed default (the only variant vLLM ships); gated and rnn are RESERVED enum values — selecting them fails closed until implemented."
+            },
+            "confidence_enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Wire the trained per-position survival confidence head into inference (DSP-6). This is the TRAINED sigmoid survival estimator (cumprod-composable), NOT the output-head {top1_prob, entropy} heuristic (INV-DSPARK-CONF). Required for any scheduler_mode other than off."
+            },
+            "scheduler_mode": {
+              "type": "string",
+              "enum": ["off", "static_threshold", "throughput"],
+              "x-cType": "DsparkSchedulerMode",
+              "default": "off",
+              "description": "Verification-length scheduling (DSP-9). off: fixed-block verification (vLLM-equivalent). static_threshold: per-request cutoff on cumulative survival a_{r,j} at confidence_threshold (DeepSpec-offline-eval-equivalent baseline). throughput: hardware-aware prefix scheduler, paper Alg. 1 — maximize Θ = τ·SPS(B) via the DSP-8 cost table. Non-off modes require confidence_enabled."
+            },
+            "confidence_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.5,
+              "description": "static_threshold scheduler mode: verify a draft position only while its (STS-calibrated) cumulative survival probability a_{r,j} stays >= this cutoff. Ignored by the other scheduler modes."
+            },
+            "sts_temperatures": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/positive_float" },
+              "default": [],
+              "description": "Sequential Temperature Scaling calibration temperatures, one per block position (length must equal block_size when non-empty). Empty (DEFAULT) = identity (no calibration). Fitted offline / filled by DSP-7 calibration."
+            },
+            "draft_context_capacity_tokens": {
+              "type": "integer",
+              "minimum": 256,
+              "default": 8192,
+              "description": "Capacity (tokens) of the draft backbone's context KV arena on the draft GPU (DSP-3): per layer, K and V rows of n_kv_heads*head_dim BF16 per target position, keyed by absolute position from the target's fused aux hiddens. Sequences longer than this fail closed for drafting (TD-DSPARK-CTX-CAP) — the target is unaffected. Default 8192 = max_anchors(1024) x block_size(8); 1.34 GB for the GLM-5.2 draft (5 layers x 4096 dims x 2 tensors x BF16)."
+            },
+            "aux_capture_max_rows": {
+              "type": "integer",
+              "minimum": 16,
+              "default": 2048,
+              "description": "Row capacity of the aux-hidden capture staging buffer on the draft GPU (DSP-3): [rows, N_aux*hidden] BF16 receiving the target's exported layer hiddens before the fc fusion + context-KV ingest. Target steps larger than this (whole-prompt prefills, oversized prefill chunks) are ingested in staging-sized pieces per aux slot (chunked fc accumulation) — drafting stays armed up to draft_context_capacity_tokens, so this knob only sizes the staging/ingest granularity. Default 2048 rows = 126 MB for GLM-5.2 (5 x 6144 BF16 columns)."
+            },
+            "epm_dump_dir": {
+              "type": "string",
+              "default": "",
+              "description": "EPM-1 training-data dump directory (spec/MoE-SpeQ_NOTES.md §7). Empty (DEFAULT) = OFF: zero overhead — no allocations, no extra copies or kernel work on any path. Non-empty = per-speculative-block raw dumps into this directory: the daemon appends EPMB records (draft per-backbone-layer residual hiddens [gamma, n_layers, hidden] BF16 + draft ids + raw c_k) to epm_blocks.bin after every D_CMD_RUN_DSPARK_STEP, and EPMR records (per decode position: all routed layers' 256 pre-top-k router logits FP16 + top-8 ids/weights from the F-1 attention-end gate — the exact buffers the FETCH_AND_RUN seam consumes) to epm_routing.bin; the Python orchestrator appends block metadata (anchor pos, draft/verify tokens, accepted length, c_k) to manifest.jsonl, joined on (seq_id, anchor_pos) by tools/elb_train/dataset.py. Dump-ON adds D2H+sync at every capture (timing changes are expected and irrelevant for collection). Env override: LS_EPM_DUMP=<dir> forces ON at <dir>; LS_EPM_DUMP=0 forces OFF."
+            },
+            "verify_chunk_prefetch": {
+              "type": "boolean",
+              "default": false,
+              "description": "Lever-4 verify-chunk expert prefetch (DSP52_BOOST campaign; batched verify only). During each batched verify chunk, at the LAUNCH of MoE layer L's attention (the H2D-idle window), the orchestrator fires ONE fire-and-forget D_B_CMD_PREFETCH_BATCH carrying the PREVIOUS chunk's layer-L routed expert union at its previous (expert, gpu) placement, at DMA priority -1.0 (strictly below demand fetches, which the FED issues at 0.0/kDemandFetchPriority). Advisory residency warm-up ONLY: the same weights land in the same cache seam the demand fetch would use, so tokens stay byte-identical prefetch-on vs prefetch-off (no numerics change, no routing change). Policy lives in the orchestrator (Python bridge / dsp52 test); the engine only executes the generic prefetch command. DEFAULT false: measured a NET LOSS on this DMA-bound box — -1.0% champion wall (9.562 vs 9.650 tok/s, 2026-08-17 arm C4), hit-neutral ~+0.6% wall tax under EPM-0, and the perfect-predictor oracle upper bound lost in every arm (top-1 -5.9%, all-misses -3.1%, bulk -7.5%). Kept as a reusable knob for future work (B>1 batching, sub-expert grain) where an idle H2D window may exist. Env override at the test interface: DSP52_PREFETCH=1 forces ON, DSP52_PREFETCH=0 forces OFF.",
+              "x-devDoc": "Orchestrator-side policy, not an engine behavior: dsp52_test.cpp dsp52_prefetch() and tests/integration/test_dsp52_bridge.py read this field (env DSP52_PREFETCH wins when set). Companion env-only modulators (NOT config fields): DSP52_PREFETCH_MISS=n (fire only the top-n board-non-resident predicted-reuse experts) and DSP52_PREFETCH_AHEAD=k (predict layer L+k). Superseded by DSP52_ELB when that seam is armed (both would double-write the sideband prefetch region). Evidence: spec/reports/DSP52_BOOST.md (lever 4, EPM-0 keeppred sweep, TD-KEEPPRED-HYBRID, 'Oracle upper-bound'), scratchpad/GAP_EXPERIMENTS_9_1.md arm C4."
+            }
+          },
+          "additionalProperties": false
+        },
+        "self_speculative": {
+          "type": "object",
+          "description": "Self-speculative draft with reduced experts",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable reduced-expert self-speculative draft"
+            },
+            "draft_expert_count": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 1,
+              "description": "Top-K experts used in draft (quality-reducing)"
+            },
+            "adaptive_exit_enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Stop drafting when per-token confidence drops below threshold. (Source: Self-Speculative Decoding) [self_speculative.h]"
+            },
+            "draft_confidence_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.4,
+              "description": "Confidence threshold for adaptive draft exit. (Source: Self-Speculative Decoding) [self_speculative.h]"
+            },
+            "residual_correction": {
+              "type": "object",
+              "description": "Online-trained residual correction model",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Enable residual correction MLP"
+                },
+                "hidden_size": {
+                  "type": "integer",
+                  "minimum": 64,
+                  "maximum": 512,
+                  "default": 128,
+                  "description": "Residual model hidden size"
+                },
+                "learning_rate": {
+                  "$ref": "#/$defs/positive_float",
+                  "default": 5e-5,
+                  "description": "Residual model learning rate"
+                },
+                "training_buffer_size": {
+                  "type": "integer",
+                  "minimum": 5000,
+                  "maximum": 200000,
+                  "default": 50000,
+                  "description": "Training sample ring buffer size"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "prompt_lookup": {
+          "type": "object",
+          "description": "N-gram suffix matching in prompt",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable prompt-lookup speculation"
+            },
+            "min_ngram_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 2,
+              "description": "Minimum N-gram length to match"
+            },
+            "max_ngram_size": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 8,
+              "default": 4,
+              "description": "Maximum N-gram length to match (greedy longest first). Formerly 'ngram_size'."
+            },
+            "max_continuation_length": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 5,
+              "description": "Maximum draft tokens from a matched N-gram. Formerly 'max_candidates'."
+            }
+          },
+          "additionalProperties": false
+        },
+        "verification": {
+          "type": "object",
+          "description": "Verification and quality control",
+          "properties": {
+            "moe_spec_max_loaded_experts_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.8,
+              "description": "Fraction of experts required for verification (quality-reducing)"
+            },
+            "adaptive_topk_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.92,
+              "x-changeable": true,
+              "description": "Cumulative routing weight threshold for adaptive top-K (1.0 = full quality)"
+            },
+            "verification_quality_floor": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.85,
+              "description": "Minimum expert coverage for verification acceptance (INV-B)"
+            },
+            "in_flight_transfer_mode": {
+              "type": "string",
+              "enum": ["conservative", "optimistic"],
+              "default": "conservative",
+              "description": "How to handle arriving experts during verification (INV-C)"
+            },
+            "sparse_verification": {
+              "type": "boolean",
+              "default": false,
+              "description": "Skip some verification positions (quality-reducing)"
+            },
+            "ranking_strategy": {
+              "type": "string",
+              "enum": ["router_based", "static_calibration"],
+              "default": "router_based",
+              "description": "How to rank experts for budget allocation: aggregate draft routing probs vs static calibration. (Source: MoE-Spec) [verifier.h]"
+            },
+            "substitution_policy": {
+              "type": "string",
+              "enum": ["substitution", "discard"],
+              "default": "substitution",
+              "description": "When a token's natural experts aren't loaded: replace with best available, or discard token. (Source: MoE-Spec) [verifier.h]"
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced verification tuning knobs",
+              "properties": {
+                "max_draft_tree_size": {
+                  "$ref": "#/$defs/positive_int",
+                  "default": 64,
+                  "description": "Max total draft tokens to verify in one pass across all draft methods. (Source: MoE-Spec) [verifier.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "layer_skip_draft": {
+          "type": "object",
+          "description": "Layer skipping during self-speculative draft (INV-4.15a)",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "x-changeable": true,
+              "description": "Enable layer skipping in draft (quality-reducing)"
+            },
+            "method": {
+              "type": "string",
+              "enum": ["cosine_similarity", "clsap", "static_exit"],
+              "x-cType": "LayerSkipMethod",
+              "default": "cosine_similarity",
+              "description": "Skip detection method. (Source: LayerSkip, CLaSp) [layer_skip.h]"
+            },
+            "threshold": {
+              "type": "number",
+              "minimum": 0.90,
+              "maximum": 1.0,
+              "default": 0.995,
+              "description": "Cosine similarity threshold for skipping"
+            },
+            "min_acceptance_rate_to_enable": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.5,
+              "description": "Minimum acceptance rate to keep layer skipping enabled"
+            },
+            "exit_layer": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/positive_int" }
+              ],
+              "default": null,
+              "description": "Layer index for static early exit (used when method is static_exit). (Source: LayerSkip) [layer_skip.h]"
+            },
+            "target_skip_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.5,
+              "description": "Target fraction of layers to skip during draft; 50-60% maintains acceptance. (Source: CLaSp) [layer_skip.h]"
+            },
+            "no_skip_first": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20,
+              "default": 3,
+              "description": "First N layers never skipped (embeddings still forming)"
+            },
+            "no_skip_last": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20,
+              "default": 3,
+              "description": "Last N layers never skipped (output distribution critical)"
+            },
+            "min_contiguous": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 1,
+              "description": "Require N consecutive layers above threshold before skipping next; 1 = single-layer check"
+            },
+            "product_window": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 1,
+              "description": "Window size for product gate; 1 = disabled. Product of last N similarities must exceed product_threshold"
+            },
+            "product_threshold": {
+              "type": "number",
+              "minimum": 0.9,
+              "maximum": 1.0,
+              "default": 0.985,
+              "description": "Threshold for windowed product gate (requires product_window > 1)"
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced layer skip tuning knobs",
+              "properties": {
+                "layer_optimization_interval": {
+                  "$ref": "#/$defs/positive_int",
+                  "default": 128,
+                  "description": "Tokens between CLaSp dynamic programming updates; beyond 128, speedup declines. (Source: CLaSp) [layer_skip.h]"
+                },
+                "decaying_threshold_temperature": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 10,
+                  "default": 0.0,
+                  "description": "Temperature for CALM-style threshold decay over sequence; 0 = no decay, 4 = permissive late tokens. (Source: CALM) [layer_skip.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "transfer_cancellation": {
+          "type": "object",
+          "description": "Control cancellation of in-flight expert transfers when speculation state changes (#62h-cancel)",
+          "properties": {
+            "cancel_abort_transfers": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Cancel SP-MoE verification transfers on draft abort.  When false, orphaned transfers complete into cache (useful if temporal autocorrelation is high)."
+            },
+            "cancel_skip_transfers": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Cancel in-flight transfers for LayerSkip stably-skipped layers.  When false, transfers complete into cache (prefetch hint suppression still active)."
+            },
+            "cancel_stability_window": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 2,
+              "x-changeable": true,
+              "description": "Consecutive self-spec steps a layer must be skipped before its transfers are cancelled.  Higher = more conservative (fewer false cancellations)."
+            },
+            "transfer_origin_expiry_cycles": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 100000,
+              "default": 10000,
+              "description": "Cycles before stale transfer origin entries are swept.  Default 10000 (~1 sec at 100us/cycle)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "reasoning_mode": {
+          "type": "object",
+          "description": "Reasoning block detection and parameter adjustment (INV-4.8)",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "x-changeable": true,
+              "description": "Enable think block detection"
+            },
+            "think_token_detection": {
+              "type": "boolean",
+              "default": true,
+              "description": "Detect <think>/<\/think> tokens"
+            },
+            "aggressive_speculation_depth_multiplier": {
+              "type": "number",
+              "minimum": 1.0,
+              "maximum": 4.0,
+              "default": 2.0,
+              "description": "Depth multiplier inside think blocks"
+            },
+            "relaxed_verification_threshold": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.85,
+              "description": "Relaxed expert coverage threshold in reasoning"
+            }
+          },
+          "additionalProperties": false
+        },
+        "calibration": {
+          "type": "object",
+          "description": "Online acceptance rate calibration",
+          "properties": {
+            "min_acceptance_rate": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.3,
+              "x-changeable": true,
+              "description": "Trigger quality increase if acceptance rate falls below"
+            },
+            "target_acceptance_rate": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.6,
+              "x-changeable": true,
+              "description": "Target acceptance rate"
+            },
+            "adjustment_interval_tokens": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 5000,
+              "default": 500,
+              "x-changeable": true,
+              "description": "Token interval between calibration checks"
+            },
+            "acceptance_ema_alpha": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.5,
+              "x-changeable": true,
+              "description": "EMA smoothing factor (beta_1) for acceptance rate tracking. (Source: Self-Speculative Decoding) [online_calibrator.h]"
+            },
+            "draft_count_ema_alpha": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.9,
+              "x-changeable": true,
+              "description": "EMA smoothing factor (beta_2) for draft count adjustment. (Source: Self-Speculative Decoding) [online_calibrator.h]"
+            },
+            "adjustment_step_size": {
+              "$ref": "#/$defs/positive_float",
+              "default": 0.01,
+              "x-changeable": true,
+              "description": "Step size (epsilon) for draft count update per calibration cycle. (Source: Self-Speculative Decoding) [online_calibrator.h]"
+            },
+            "_advanced": {
+              "type": "object",
+              "description": "Advanced calibration tuning knobs",
+              "properties": {
+                "cascade_test_iterations": {
+                  "$ref": "#/$defs/positive_int",
+                  "default": 4,
+                  "description": "Iterations per K-value during test phase. (Source: Lookahead Utility-Driven Speculative Decoding) [online_calibrator.h]"
+                },
+                "cascade_set_iterations": {
+                  "$ref": "#/$defs/positive_int",
+                  "default": 16,
+                  "description": "Iterations to use utility-maximizing K before re-testing. (Source: Lookahead Utility-Driven Speculative Decoding) [online_calibrator.h]"
+                },
+                "cascade_adaptive_backoff": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Double set-phase duration when K=0 to reduce testing overhead. (Source: Lookahead Utility-Driven Speculative Decoding) [online_calibrator.h]"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "utility_scorer": {
+          "type": "object",
+          "description": "Utility-driven speculation depth control. (Source: Lookahead Utility-Driven Speculative Decoding) [utility_scorer.h]",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable utility-driven speculation depth control. (Source: Lookahead Utility-Driven Speculative Decoding) [utility_scorer.h]"
+            },
+            "strategy": {
+              "type": "string",
+              "enum": ["cascade", "ema", "fixed"],
+              "default": "cascade",
+              "description": "Depth selection strategy: cascade (Lookahead hill-climbing), ema (sglang-style acceptance EMA), fixed (fixed depth)"
+            },
+            "static_depth": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10,
+              "default": 3,
+              "description": "Fixed speculation depth when strategy is static"
+            },
+            "utility_threshold": {
+              "$ref": "#/$defs/positive_float",
+              "default": 1.0,
+              "description": "Disable speculation when utility score falls below threshold; 1.0 = break-even. (Source: Lookahead Utility-Driven Speculative Decoding) [utility_scorer.h]"
+            },
+            "vram_headroom_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.1,
+              "description": "VRAM fraction to keep free when computing max speculative depth. (Source: Lookahead Utility-Driven Speculative Decoding) [utility_scorer.h]"
+            }
+          },
+          "additionalProperties": false
+        },
+        "draft_combiner": {
+          "type": "object",
+          "description": "Multi-source draft combining: prompt-lookup + MTP + self-speculative. Per-position utility-based selection. (Source: IMPLEMENTATION_GUIDE.md §4.7)",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "x-changeable": true,
+              "description": "Enable multi-source draft combining"
+            },
+            "prompt_lookup_priority_boost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 10.0,
+              "default": 1.0,
+              "description": "Additive utility boost for prompt-lookup candidates (zero compute cost, INV-0.8d)"
+            },
+            "mtp_compute_cost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1.0,
+              "default": 0.1,
+              "description": "Relative compute cost for MTP draft tokens (0 = free, 1 = full forward pass)"
+            },
+            "self_spec_compute_cost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1.0,
+              "default": 0.5,
+              "description": "Relative compute cost for self-speculative draft tokens"
+            },
+            "dspark_compute_cost": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1.0,
+              "default": 0.05,
+              "description": "Relative compute cost for DSpark draft tokens (DSP-5). Whole-gamma-block DFlash forward on a dedicated draft GPU: per-token cost is well below MTP's per-token chained steps"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "parallelism": {
+      "type": "object",
+      "description": "Parallelism and expert placement configuration",
+      "properties": {
+        "tensor_parallelism": {
+          "type": "integer",
+          "enum": [1, 2],
+          "default": 2,
+          "description": "TP+DCP parallelism degree. When 2: TP=2 (head-parallel weight sharding for q_b_proj, kv_b_proj, o_proj) + DCP=2 (KV cache sequence-sharding) on the same GPU pair. DCP is always enabled when tensor_parallelism >= 2."
+        },
+        "expert_affinity": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "soft",
+              "x-cType": "AffinityMode",
+              "default": "soft",
+              "description": "Affinity mode (only soft assignment supported)"
+            },
+            "initial_assignment": {
+              "type": "string",
+              "enum": ["round_robin", "coactivation"],
+              "default": "round_robin",
+              "description": "Initial expert placement strategy"
+            },
+            "rebalance_interval_seconds": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 3600,
+              "default": 300,
+              "description": "Placement optimization frequency (seconds)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "expert_duplication": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable hot expert duplication across GPUs"
+            },
+            "max_duplicated_fraction": {
+              "$ref": "#/$defs/weight_0_1",
+              "default": 0.05,
+              "description": "Maximum VRAM fraction for duplicate experts"
+            }
+          },
+          "additionalProperties": false
+        },
+        "node_routing": {
+          "type": "object",
+          "description": "Cross-node expert routing constraints. (Source: DeepSeek V3 Technical Report) [expert_placement.h]",
+          "properties": {
+            "max_nodes_per_token": {
+              "$ref": "#/$defs/positive_int",
+              "default": 4,
+              "description": "Max GPU nodes a token's experts can be distributed to. (Source: DeepSeek V3 Technical Report) [expert_placement.h]"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "transfer": {
+      "type": "object",
+      "description": "Expert transfer engine configuration. (Source: Implementation Guide) [transfer_engine.h]",
+      "properties": {
+        "fine_grained": {
+          "type": "object",
+          "description": "Sub-component expert transfer tracking. Deprioritized; see spec/FINE_GRAINED_TRANSFER.md. [fine_grained.h]",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable sub-component expert transfers. [fine_grained.h]"
+            },
+            "max_in_flight_per_gpu": {
+              "$ref": "#/$defs/positive_int",
+              "default": 4,
+              "description": "Max concurrent sub-component transfers per GPU. [fine_grained.h]"
+            },
+            "prefetch_distance_layers": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 4,
+              "description": "Layers ahead to start sub-component prefetch; 3-6 optimal. [fine_grained.h]"
+            }
+          },
+          "additionalProperties": false
+        },
+        "streams_per_gpu": {
+          "$ref": "#/$defs/positive_int",
+          "default": 2,
+          "description": "CUDA transfer streams per GPU. (Source: Implementation Guide) [transfer_engine.h]"
+        },
+        "priority_levels": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 4,
+          "default": 3,
+          "description": "Priority classes in transfer scheduler queue. (Source: Implementation Guide) [transfer_scheduler.h]"
+        }
+      },
+      "additionalProperties": false
+    },
+    "compute": {
+      "type": "object",
+      "description": "Compute kernel configuration",
+      "properties": {
+        "cuda_graphs": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable CUDA graph capture"
+            },
+            "capture_attention": {
+              "type": "boolean",
+              "default": true,
+              "description": "Graph-capture attention layers"
+            },
+            "capture_gating": {
+              "type": "boolean",
+              "default": true,
+              "description": "Graph-capture gating computation"
+            },
+            "capture_tp_allreduce": {
+              "type": "boolean",
+              "default": true,
+              "description": "Graph-capture TP=2 allreduce"
+            },
+            "capture_expert_ffn": {
+              "type": "boolean",
+              "const": false,
+              "default": false,
+              "description": "Expert FFN capture (always false per INV-0.6)"
+            }
+          },
+          "additionalProperties": false
+        },
+        "gemm": {
+          "type": "object",
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": ["cutlass"],
+              "x-cType": "GemmBackend",
+              "default": "cutlass",
+              "description": "GEMM kernel backend"
+            },
+            "grouped_gemm": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable grouped GEMM for batched expert execution"
+            },
+            "fused_swiglu": {
+              "type": "boolean",
+              "default": true,
+              "description": "Fuse gate+up SwiGLU projection"
+            }
+          },
+          "additionalProperties": false
+        },
+        "attention_backend": {
+          "type": "string",
+          "enum": ["snapmla", "turboquant_mla", "csa_hca", "csa_hca_tq", "csa_hca_tq_mix"],
+          "x-cType": "AttentionBackendType",
+          "default": "snapmla",
+          "description": "Attention kernel library. snapmla: FP8 MLA (644 B/tok). turboquant_mla: TQ_MSE 4-bit (386 B/tok, 1.67x compression). V4-only (architecture deepseek_v4; MLA backends rejected for V4 and vice versa): csa_hca = FP8 compressed KV, csa_hca_tq = TQ 4-bit on ALL compressed tiers, csa_hca_tq_mix = TQ on CSA tiers + FP8 on HCA tiers (recommended TQ variant, validation gate V4K-10a passed). Engine wiring lands in spec/DEEPSEEK4_PLAN.md Phase V4-5/V4-7; selecting a csa_hca* backend before then fails loud at engine init."
+        },
+        "prefill_superchunk_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 32768,
+          "default": 0,
+          "description": "TD-PREFILL-SUPERCHUNK: decoupled prefill superchunk capacity in TOKENS. When > 0, the MoE pipeline scratch and the paired hidden-state buffers are sized for max(512, this many) tokens, so ONE FETCH_AND_RUN_MOE[_BIG] (or dense RUN_MOE) can batch the post-attention hidden states of K attention sub-chunks per layer — amortizing the per-layer routed-expert H2D fetch over K x chunk tokens while attention/tiering stay at the natural sub-chunk granularity (RUN_ATTENTION row_offset + superchunk flag). With prefill_moe_big (default on) this is the REQUEST; the effective capacity K is DERIVED at engine init from free VRAM (elastic, never OOM; 0 = derive up to the elastic bound) and reported in EngineInfo.moe_batch_capacity. With prefill_moe_big=false, 0 = disabled (byte-identical legacy sizing) and the legacy halving fail-safe applies."
+        },
+        "prefill_moe_big": {
+          "type": "boolean",
+          "default": true,
+          "description": "TD-PREFILL-MOE-BIG: never-OOM big-batch MoE (E_CMD_FETCH_AND_RUN_MOE_BIG + chunked grouped-GEMM execution). When true, the MoE TRANSIENT scratch (permute/gate-up/activation/expert-out/wave-accum/quant) is bounded at moe_big_chunk_tokens (~48 MB) instead of the full superchunk (~1.5 GB @2048 tok); any MoE dispatch whose token batch exceeds the chunk capacity runs the grouped GEMMs in chunks, reusing that scratch (only the [B,H] hidden output persists), and the effective superchunk capacity is DERIVED at engine init from free VRAM (elastic K — never OOM by construction; floor 512, cap 32768). Batches at or below the chunk capacity (all decode paths) run the byte-identical legacy single-shot pipeline. false = legacy sizing + single-shot only."
+        },
+        "moe_big_chunk_tokens": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 512,
+          "default": 512,
+          "description": "TD-PREFILL-MOE-BIG: token chunk size for the chunked grouped-GEMM execution (prefill_moe_big). The MoE transient scratch is sized for this many tokens (x topk expansion) and reused across chunks; batches larger than max(this, orchestrator.max_batch_size) are processed chunk-by-chunk. LARGER IS FASTER until the transient set outgrows the ~512 MB prefill-scratch tail it is homed in: each grouped-GEMM sweep pays a ~(num_experts x tile_m=64) tile-row floor regardless of real rows (a 64-token chunk = avg 2 rows/expert against a 64-row tile), so total MoE cost scales with waves x ceil(batch/chunk) sweeps (measured 64-tok chunks ~4x slower than single-shot at n=876; see TD-MOE-BIG-GEMM-SWEEP). 512 tokens ~= 262 MB transients — still tail-resident."
+        },
+        "dsa_sparse_prefill": {
+          "type": "boolean",
+          "default": false,
+          "description": "DSA sparse CHUNK PREFILL attention (TD-SPARSE-CHUNK-PREFILL). When true, a dispatcher-blessed prefill/chunked-prefill step of a DSA model (index_topk > 0) runs the lightning indexer per chunk-query position and each chunk row attends only its own causal top-k (<= index_topk) selection instead of the DENSE full causal prefix — the pattern the model is TRAINED with (DeepSeek-V3.2/GLM-5.2 DSA is sparse end-to-end), removing the full-KV-attend prefill peak and enabling prefill KV tiering (TD-KVT-PREFILL half 2). Changes prefill numerics versus dense chunks (sparse selection prunes beyond index_topk context); validated against the DSA reference next-token. Default false: chunks stay dense (byte-identical legacy behavior). Requires replicated indexer + replicated KV in this pass — dcp_indexer_mode=local (TD-SPARSE-PREFILL-LOCAL-INDEXER) and dcp_kv_mode=sharded (TD-SPARSE-PREFILL-KVS) fall back to dense chunks."
+        },
+        "dsa_indexer_rewind": {
+          "type": "boolean",
+          "default": true,
+          "description": "INV-DSA-REWIND: bless SAME-SEQUENCE contiguous OVERWRITE-REWINDS in the DSA indexer coverage guard (pos0 <= high-water — the speculative batched-verify partial-acceptance re-feed shape) so those decode rows stay SPARSE-eligible instead of failing closed to per-row DENSE attention. Sound because every indexer-K append is POSITION-keyed: a re-feed overwrites its rows in place exactly as it overwrites the KV rows, and sparse validity comes from each step's own kv-meta seqlens bound. Token-correct either way; dense-vs-sparse kernel numerics differ in principle, but the dsp52 champion A/B (2026-08-18) measured IDENTICAL fingerprints (acc/tau/lookups) and a bit-identical 107-token trajectory on vs off — hence DEFAULT TRUE (production posture; sparse stays alive across speculative re-feeds). Gaps, mixed-sequence chunks, foreign sequences, and superchunk shapes stay fail-closed regardless. Env LS_INDEXER_REWIND OVERRIDES either way (set & !='0' -> on, '0' -> off, unset defers here). Set false for the legacy fail-closed guard (per-row dense fallback at pos < high-water).",
+          "x-devDoc": "Read once at CommandDispatcher construction (command_dispatcher.cpp, indexer_rewind_ok_); the coverage-guard consume site is dispatch_attention.cpp (INV-DSA-REWIND)."
+        },
+        "deterministic_reduce": {
+          "type": "boolean",
+          "default": true,
+          "description": "Bit-reproducible attention softmax-denominator reduction (DET-REDUCE Phase 1). When true (DEFAULT), the cross-warp denominator combine uses a fixed-order (vLLM block_sum-style) sum instead of warp-scheduling-order atomicAdd, eliminating run-to-run routing drift from near-tie flips. Perf-neutral (measured: full-pool keeper within noise; attention per-op marginally faster). Set false (or env LAYERSTORM_DETERMINISTIC_REDUCE=0) for the legacy atomic path."
+        },
+        "deterministic_ep_combine": {
+          "type": "boolean",
+          "default": false,
+          "description": "Placement-invariant MoE EP combine (DET-REDUCE Phase 1b). When true, the per-token routed expert sum is computed in a canonical fixed-slot order that is bit-identical regardless of which GPU holds each expert: each GPU writes its K per-slot contributions separately, the cross-GPU EP allreduce GATHERS slots, and a fixed-order K-reduce rounds to bf16 once — killing the placement->bf16->routing drift behind the spurious ACT+decay 'win'. Has a real cost (the routed EP-combine gather grows from [B,H] to [B,topk,H]), so DEFAULT false (opt-in). Payload precision is set by deterministic_ep_combine_precision. Override either way with env LAYERSTORM_DETERMINISTIC_EP_COMBINE (set & !=0 -> on, 0 -> off). Default-off is byte-identical to the legacy bf16 combine (goldens unchanged)."
+        },
+        "deterministic_ep_combine_precision": {
+          "type": "string",
+          "enum": ["fp32", "bf16"],
+          "default": "bf16",
+          "description": "Per-slot payload precision for the placement-invariant MoE EP combine (only used when deterministic_ep_combine=true). bf16 (DEFAULT): per-slot contributions rounded to bf16 once and gathered as BF16 [B,topk,H] — HALF the gather bytes, with the K slots still accumulated in FP32 in fixed order (matches the vLLM/llama.cpp convention: fp32 math, 16-bit payload); collective −31% (decode) / −42% (B=8) vs fp32, measured. fp32: per-slot contributions gathered as FP32 [B,topk,H]. Placement-invariance holds for both (it comes from the fixed slot ORDER, not the payload dtype). Override with env LAYERSTORM_DETERMINISTIC_EP_COMBINE_PRECISION (bf16|fp32)."
+        },
+        "ipc_pin": {
+          "type": "boolean",
+          "default": true,
+          "description": "TD-14d: CUDA-pin (cudaHostRegister, portable) the daemon's IPC shared region at engine init so every sideband D2H readback (CMD_SAMPLE_TOKENS token ids, D_CMD_RUN_DSPARK_STEP draft state, checkpoint payloads) is a TRUE async DMA. Unpinned, cudaMemcpyAsync into pageable host memory is internally synchronous and blocks the DAEMON THREAD until the SOURCE stream drains — measured 85.0 ms per DSpark draft readback (the whole draft pipeline queued ahead of it), serializing all command dispatch and defeating draft/target command-level overlap; pinned, the same handler costs 0.17 ms (DSP52_BOOST lever 2). DEFAULT true (production posture). The region is a private ~4.9 MB aligned_alloc mapping, disjoint from the pinned expert arena and every NUMA DMA buffer, so it can never partial-overlap another registration; registration failure is non-fatal (loud warn, sideband degrades to the pageable/blocking path) and the region is unregistered before its free at shutdown. Skipped entirely for null/CPU-only backends (skip_hardware_detection). Override either way with env LS_IPC_PIN (set & !=0 -> on, 0 -> off, unset defers here). Set false for the legacy unpinned sideband.",
+          "x-devDoc": "Read once in Engine::allocate_ipc_region (src/daemon/engine.cpp); the unregister site is Engine::shutdown, gated by ipc_region_registered_."
+        }
+      },
+      "additionalProperties": false
+    },
+    "serving": {
+      "type": "object",
+      "description": "HTTP serving configuration",
+      "properties": {
+        "host": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "description": "HTTP server bind address"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8000,
+          "description": "HTTP server port"
+        },
+        "max_concurrent_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "default": 32,
+          "description": "Maximum simultaneous requests"
+        },
+        "max_sequence_length": {
+          "type": "integer",
+          "minimum": 128,
+          "maximum": 1048576,
+          "default": 32768,
+          "description": "Maximum supported sequence length"
+        },
+        "tokenizer_path": {
+          "type": "string",
+          "default": "auto",
+          "description": "HuggingFace tokenizer path (\"auto\" = detect from weights_path)"
+        },
+        "tool_call_parser": {
+          "type": "string",
+          "default": "",
+          "description": "Named tool-call parser for the OpenAI endpoint (e.g. \"glm47\" for the GLM-4.x/5.x <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> wire format). \"\" = legacy model_type-based parser. Consumed by the Python serving layer (server.tool_parsers registry); CLI override: --tool-call-parser."
+        },
+        "enable_auto_tool_choice": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable auto tool choice: run the named tool-call parser when a request carries tools and tool_choice is absent/\"auto\" (tool_choice \"none\" bypasses). Requires tool_call_parser. CLI override: --enable-auto-tool-choice."
+        },
+        "reasoning_parser": {
+          "type": "string",
+          "default": "",
+          "description": "Named reasoning parser (e.g. \"glm45\" for <think>...</think>, \"deepseek_v4\" for the structural start boundary): splits reasoning_content from content in chat responses, token-id based via the tokenizer's think-marker ids. \"\" = no reasoning split. Consumed by the Python serving layer (server.reasoning_parsers registry); CLI override: --reasoning-parser."
+        },
+        "reasoning_config": {
+          "type": "string",
+          "default": "",
+          "description": "JSON reasoning config passthrough (vLLM ReasoningConfig field names: reasoning_start_str/reasoning_end_str) — marker-string overrides for the named reasoning parser; empty markers = structural boundary (output begins in reasoning). \"\" = no overrides. Consumed by the Python serving layer; CLI override: --reasoning-config."
+        },
+        "tokenizer_mode": {
+          "type": "string",
+          "default": "auto",
+          "description": "Serving tokenizer mode (vLLM TokenizerMode parity subset). \"auto\" resolves from model.architecture (deepseek_v4 models -> \"deepseek_v4\", else \"hf\"); \"deepseek_v4\" switches chat-template kwarg normalization + thinking defaults to the DeepSeek-V4 rules (thinking defaults OFF; reasoning_effort none->off, max/xhigh->\"max\", other->\"high\"). Consumed by the Python serving layer; CLI override: --tokenizer-mode."
+        },
+        "prefix_cache": {
+          "type": "object",
+          "description": "Basic prompt-prefix KV caching (successor orchestrator, B=1): after each request's prompt prefill the orchestrator SEQ_FORKs a frozen PREFIX HOLDER sequence whose refcounted CoW pages keep the prompt's KV (VRAM + tiered host) resident; a later request whose prompt starts with a registered prefix forks FROM the holder and prefills only the delta. Token-identical ON vs OFF under the deterministic stack (INV-PREFIX-CACHE-1): reused KV bytes are the recomputed bytes; only prefill wall changes. Registry is LRU-bounded and evicts (frees holder sequences) on budget pressure or page-pool exhaustion.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable the prefix registry + SEQ_FORK reuse. false = byte-identical to the pre-cache request flow (create/prefill/free every request)."
+            },
+            "max_cached_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1048576,
+              "default": 8192,
+              "description": "LRU token budget: the sum of registered prefix lengths is kept at or below this by evicting oldest entries (0 = unbounded is NOT allowed; use enabled=false to disable). Retained holders are cheap in pages (shared refcounts + one CoW append-frontier logical page group per fork) but each pins its prefix's pages against reuse-by-free."
+            },
+            "max_entries": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 8,
+              "description": "Maximum retained prefix holder sequences (LRU). Also bounded by the engine page budget's max_concurrent_forks sizing."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "preprocessing": {
+      "type": "object",
+      "description": "Expert weight pre-processing configuration",
+      "properties": {
+        "prepacked_dir": {
+          "type": "string",
+          "default": "",
+          "description": "Path to pre-processed expert directory (manifest.json + expert_NNN.bin). Empty = not available."
+        },
+        "auto_preprocess": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true and no valid prepacked_dir, pre-process raw safetensors at engine init."
+        },
+        "auto_preprocess_target": {
+          "type": "string",
+          "default": "",
+          "description": "Directory to write auto-preprocessed files. Required when auto_preprocess=true and target is disk."
+        },
+        "host_cache_mode": {
+          "type": "string",
+          "enum": ["mmap", "explicit_alloc"],
+          "x-cType": "HostCacheMode",
+          "default": "mmap",
+          "description": "Host RAM caching strategy. 'mmap' = OS page cache. 'explicit_alloc' = engine-managed malloc+LRU."
+        },
+        "legacy_weights": {
+          "type": "boolean",
+          "default": false,
+          "description": "Force legacy weight loading (routed experts from safetensors) even when prepacked_dir exists. For A/B testing and migration validation."
+        }
+      },
+      "additionalProperties": false
+    },
+    "_internal-prescope": {
+      "$ref": "internal-schemas/prescope.schema.json"
+    },
+    "_internal-residual_correction": {
+      "$ref": "internal-schemas/residual_correction.schema.json"
+    },
+    "_internal-utility_scorer": {
+      "$ref": "internal-schemas/utility_scorer.schema.json"
+    },
+    "_internal-mtp_draft": {
+      "$ref": "internal-schemas/mtp_draft.schema.json"
+    },
+    "_internal-prompt_lookup": {
+      "$ref": "internal-schemas/prompt_lookup.schema.json"
+    },
+    "_internal-self_speculative": {
+      "$ref": "internal-schemas/self_speculative.schema.json"
+    },
+    "_internal-probe": {
+      "$ref": "internal-schemas/probe.schema.json"
+    },
+    "_internal-moe_speq": {
+      "$ref": "internal-schemas/moe_speq.schema.json"
+    },
+    "_internal-speculative_prefetch": {
+      "$ref": "internal-schemas/speculative_prefetch.schema.json"
+    },
+    "_internal-prefetch_fuser": {
+      "$ref": "internal-schemas/prefetch_fuser.schema.json"
+    },
+    "_internal-scheduler": {
+      "$ref": "internal-schemas/scheduler.schema.json"
+    },
+    "_internal-gpu_load_balancer": {
+      "$ref": "internal-schemas/gpu_load_balancer.schema.json"
+    },
+    "_internal-draft_combiner": {
+      "$ref": "internal-schemas/draft_combiner.schema.json"
+    },
+    "_internal-verifier": {
+      "$ref": "internal-schemas/verifier.schema.json"
+    },
+    "_internal-dspark": {
+      "$ref": "internal-schemas/dspark.schema.json"
+    },
+    "_internal-orchestrator": {
+      "$ref": "internal-schemas/orchestrator.schema.json"
+    },
+    "gpu_loader": {
+      "type": "object",
+      "description": "GPU loader transfer-cost calibration (spec/GPU_LOADER_MODEL.md, ticket I8b)",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "Run/load the GPU-loader calibration at init (off until the loader solver consumes the constants)." },
+        "calibration_mode": { "type": "string", "enum": ["loaded", "quick", "full"], "default": "loaded", "description": "loaded = load from calibration_path, falling back to a full calibration (and writing the file) if it is absent; quick = fast cache-hot benchmark; full = DDR-accurate (~32 GiB rotating footprint)." },
+        "calibration_path": { "type": "string", "default": "", "description": "JSON file the loader constants are loaded from / written to. The calibration is weight/config-specific (the compute curve depends on the model's expert FFN dims), so it lives ADJACENT to the weights: an empty value (default) resolves to '<weights_path dir>/gpu_loader_calibration.json'; a bare filename resolves in the weights dir; an absolute path is used verbatim." }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["model", "quantization", "hardware"],
+  "additionalProperties": false
+}

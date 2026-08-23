@@ -1,0 +1,311 @@
+{
+  "banks": [
+    {
+      "contention": 0.037401844630227256,
+      "egress_us": 445.50400972366333,
+      "node": 0
+    },
+    {
+      "contention": 0.02837284518457417,
+      "egress_us": 441.18401408195496,
+      "node": 2
+    },
+    {
+      "contention": 0.06659792895247023,
+      "egress_us": 444.0320134162903,
+      "node": 3
+    }
+  ],
+  "contention": [
+    {
+      "bank": 0,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 736.3168080647787,
+      "factor": 0.926772203054529,
+      "solo_us": 839.4240140914917
+    },
+    {
+      "bank": 0,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 2,
+      "dual_us": 627.7621587117513,
+      "factor": 1.0813343419666763,
+      "solo_us": 580.5439949035645
+    },
+    {
+      "bank": 0,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 3,
+      "dual_us": 597.5456237792969,
+      "factor": 1.0306217571330818,
+      "solo_us": 580.4160237312317
+    },
+    {
+      "bank": 0,
+      "config": 1,
+      "device_a": 1,
+      "device_b": 2,
+      "dual_us": 727.7952194213867,
+      "factor": 1.037420557354698,
+      "solo_us": 720.3199863433838
+    },
+    {
+      "bank": 0,
+      "config": 2,
+      "device_a": 1,
+      "device_b": 3,
+      "dual_us": 737.9722595214844,
+      "factor": 1.0566386661923537,
+      "solo_us": 721.5039730072021
+    },
+    {
+      "bank": 0,
+      "config": 1,
+      "device_a": 2,
+      "device_b": 3,
+      "dual_us": 574.3658701578776,
+      "factor": 1.0183957451345538,
+      "solo_us": 573.3439922332764
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 526.034132639567,
+      "factor": 0.7007360196742667,
+      "solo_us": 829.7280073165894
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 2,
+      "dual_us": 618.1194941202799,
+      "factor": 1.0673721601060326,
+      "solo_us": 579.1040062904358
+    },
+    {
+      "bank": 2,
+      "config": 0,
+      "device_a": 0,
+      "device_b": 3,
+      "dual_us": 446.43414815266925,
+      "factor": 1.0105807328598981,
+      "solo_us": 441.76000356674194
+    },
+    {
+      "bank": 2,
+      "config": 2,
+      "device_a": 1,
+      "device_b": 2,
+      "dual_us": 585.698127746582,
+      "factor": 1.0555423908278818,
+      "solo_us": 579.2639851570129
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 1,
+      "device_b": 3,
+      "dual_us": 527.5840123494467,
+      "factor": 1.0242281493663146,
+      "solo_us": 515.1039958000183
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 2,
+      "device_b": 3,
+      "dual_us": 581.5903981526693,
+      "factor": 1.0125136379473179,
+      "solo_us": 581.1520218849182
+    },
+    {
+      "bank": 3,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 496.38614654541016,
+      "factor": 0.5892874316257242,
+      "solo_us": 859.8080277442932
+    },
+    {
+      "bank": 3,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 2,
+      "dual_us": 738.2474899291992,
+      "factor": 1.131209693331169,
+      "solo_us": 723.2319712638855
+    },
+    {
+      "bank": 3,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 3,
+      "dual_us": 522.5215911865234,
+      "factor": 1.0720766493569038,
+      "solo_us": 491.456001996994
+    },
+    {
+      "bank": 3,
+      "config": 1,
+      "device_a": 1,
+      "device_b": 2,
+      "dual_us": 726.7210642496744,
+      "factor": 1.060740124476029,
+      "solo_us": 723.1360077857971
+    },
+    {
+      "bank": 3,
+      "config": 1,
+      "device_a": 1,
+      "device_b": 3,
+      "dual_us": 499.5690663655599,
+      "factor": 1.0143287449967606,
+      "solo_us": 492.5119876861572
+    },
+    {
+      "bank": 3,
+      "config": 2,
+      "device_a": 2,
+      "device_b": 3,
+      "dual_us": 739.1498565673828,
+      "factor": 1.1212323615539588,
+      "solo_us": 724.4160175323486
+    }
+  ],
+  "devices": [
+    {
+      "compute": {
+        "P": 1,
+        "a_us": 0.0,
+        "b_us": 0.0
+      },
+      "numa_node": 2,
+      "position": 0,
+      "recon_added_us": 0.0,
+      "recon_overhead_us": 0.0,
+      "xfer_lat_us": 2.1120000164955854
+    },
+    {
+      "compute": {
+        "P": 1,
+        "a_us": 0.0,
+        "b_us": 0.0
+      },
+      "numa_node": 3,
+      "position": 1,
+      "recon_added_us": 0.0,
+      "recon_overhead_us": 0.0,
+      "xfer_lat_us": 2.240000059828162
+    },
+    {
+      "compute": {
+        "P": 1,
+        "a_us": 0.0,
+        "b_us": 0.0
+      },
+      "numa_node": 0,
+      "position": 2,
+      "recon_added_us": 0.0,
+      "recon_overhead_us": 0.0,
+      "xfer_lat_us": 2.1120000164955854
+    },
+    {
+      "compute": {
+        "P": 1,
+        "a_us": 0.0,
+        "b_us": 0.0
+      },
+      "numa_node": 2,
+      "position": 3,
+      "recon_added_us": 0.0,
+      "recon_overhead_us": 0.0,
+      "xfer_lat_us": 2.208000048995018
+    }
+  ],
+  "expert_bytes": 24772992.0,
+  "matrix": [
+    [
+      {
+        "lat_us": 2.1120000164955854,
+        "rate_us": 835.7759714126587,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.240000059828162,
+        "rate_us": 719.8079824447632,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.1120000164955854,
+        "rate_us": 445.50400972366333,
+        "tier": 1
+      },
+      {
+        "lat_us": 2.208000048995018,
+        "rate_us": 574.6560096740723,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 2.7840000111609697,
+        "rate_us": 830.9440016746521,
+        "tier": 1
+      },
+      {
+        "lat_us": 2.8800000436604023,
+        "rate_us": 514.6239995956421,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.8800000436604023,
+        "rate_us": 567.1039819717407,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.7520000003278255,
+        "rate_us": 441.18401408195496,
+        "tier": 1
+      }
+    ],
+    [
+      {
+        "lat_us": 2.816000021994114,
+        "rate_us": 835.9040021896362,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.7840000111609697,
+        "rate_us": 444.0320134162903,
+        "tier": 1
+      },
+      {
+        "lat_us": 2.7840000111609697,
+        "rate_us": 723.5199809074402,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.816000021994114,
+        "rate_us": 492.000013589859,
+        "tier": 2
+      }
+    ]
+  ],
+  "ncf": [
+    0.0,
+    1.0,
+    1.2174398627810255
+  ],
+  "num_banks": 3,
+  "num_devices": 4,
+  "source": "calibrated",
+  "version": 1
+}

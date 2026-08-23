@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "x-configFile": "draft_combiner.json",
+  "description": "Draft combiner internal parameters. Loaded from draft_combiner.json if not inlined.",
+  "properties": {
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for per-source acceptance rate tracking"
+    },
+    "latency_per_position_us": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 920.0,
+      "x-changeable": true,
+      "description": "Estimated latency saved per accepted draft position in microseconds"
+    },
+    "min_utility_threshold": {
+      "type": "number",
+      "default": 0.0,
+      "x-changeable": true,
+      "description": "Minimum utility score for a candidate to be included. 0 = accept all."
+    },
+    "coverage_discount_floor": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.5,
+      "x-changeable": true,
+      "description": "Floor for expert coverage discount (INV-A). P(accept) is never discounted below this fraction."
+    }
+  },
+  "additionalProperties": false
+}

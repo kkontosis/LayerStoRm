@@ -1,0 +1,9 @@
+- dataset:
+    id: Idavidrein/gpqa
+    task_id: diamond
+  value: 75.2
+  date: '2026-01-27'
+  source:
+    url: https://huggingface.co/zai-org/GLM-4.7-Flash
+    name: Model Card
+    user: burtenshaw

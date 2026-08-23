@@ -1,0 +1,50 @@
+{
+  "_comment": "P-26 deploy_fit end-to-end (2026-07-19, FIXED sim units): winner 60/0.1/2000/150, sim 0.7331, keeper-CONFIRMED 0.7325 @ 8.756 == the regrid's independently-measured tau150 fingerprint. Plateau-equivalent to defaults; kept as the first fully-confirmed pipeline artifact.",
+  "epoch": "2026-07-19-e2e",
+  "freq_w": 60.0,
+  "freq_decay": 0.1,
+  "reuse_w": 2000.0,
+  "reuse_tau": 150.0,
+  "provenance": {
+    "epoch": "2026-07-19-e2e",
+    "generated_by": "tools/loader_fit/deploy_fit.py",
+    "generated_at": "2026-07-19T06:14:57",
+    "inputs": {
+      "dump": "(transient local capture) e2e_capture.jsonl",
+      "calib": "tests/assets/gpu_loader_calibration_4gpu_hbm.json",
+      "caps": [
+        203,
+        203,
+        443,
+        443
+      ]
+    },
+    "grid": {
+      "freq_w": [
+        0.0,
+        30.0,
+        45.0,
+        60.0,
+        90.0,
+        120.0
+      ],
+      "reuse_w": [
+        1000.0,
+        2000.0,
+        4000.0
+      ],
+      "reuse_tau": [
+        150.0,
+        300.0,
+        600.0
+      ],
+      "freq_decay": 0.1
+    },
+    "sim_hit": 0.7331,
+    "sim_fetch_per_tok": 160.15,
+    "sim_pred_ms_per_tok": 53.45,
+    "keeper_fingerprint": 0.7325,
+    "keeper_tok_s": 8.756,
+    "verdict": "CONFIRMED \u2014 plateau point, statistically tied with the landed defaults (0.7327 @ 8.8-8.9); defaults remain; first green end-to-end deploy_fit run (fixed sim)"
+  }
+}

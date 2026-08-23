@@ -1,0 +1,65 @@
+{
+    "_comment": "EPM-5 arms grid (run by run_epm4_grid.py off epm5-base.json). The full-scale re-run the EPM-4 DECISION.md ordered: both output arms (direct vs router-replica) under the ratified BCE-primary/rmsnorm/fusion priors, the capacity re-sweep that was data-limited at 319 blocks, AND the headline new arm — the b0_prev-HYBRID re-ranker (prior.enabled: beta_j * prev-membership + trained residual logits; needs dataset.build_prev_membership_sidecars on the shards first). Every cell scored on the SAME held-out split by the DIRECTIVE-W deployment score (E4). Bars: b0_prev recall@8 0.302 (model-side, must beat by >=15% rel -> 0.35 for an integration candidate); prev-union deep-coverage 0.509 (deployed/manifest-side).",
+    "cells": [
+        {
+            "name": "c00_tier0",
+            "note": "Tier-0 reference (0 steps, prior taps, direct arm)",
+            "overrides": ["optim.max_steps=0"]
+        },
+        {
+            "name": "c01_direct_bce",
+            "note": "DEFAULT: direct head x BCE x rmsnorm x fusion (EPM-4 c17 shape at scale)",
+            "overrides": []
+        },
+        {
+            "name": "c02_router_bce",
+            "note": "router-replica arm x BCE (recall-vs-ECE trade, EPM-4 c12 shape)",
+            "overrides": ["model.arm=router"]
+        },
+        {
+            "name": "c03_hybrid_layer",
+            "note": "HEADLINE: b0_prev-hybrid re-ranker, per-layer beta (direct head)",
+            "overrides": ["model.prior={\"enabled\":true,\"init_beta\":3.0,\"per\":\"layer\"}"]
+        },
+        {
+            "name": "c04_hybrid_scalar",
+            "note": "b0_prev-hybrid, single global beta",
+            "overrides": ["model.prior={\"enabled\":true,\"init_beta\":3.0,\"per\":\"scalar\"}"]
+        },
+        {
+            "name": "c05_hybrid_router",
+            "note": "b0_prev-hybrid on the router arm",
+            "overrides": ["model.arm=router", "model.prior={\"enabled\":true,\"init_beta\":3.0,\"per\":\"layer\"}"]
+        },
+        {
+            "name": "c06_hybrid_lowbeta",
+            "note": "hybrid, weaker prior init (head leads earlier)",
+            "overrides": ["model.prior={\"enabled\":true,\"init_beta\":1.0,\"per\":\"layer\"}"]
+        },
+        {
+            "name": "c07_cap_double",
+            "note": "capacity re-sweep: 2x delta budget (was data-limited at 319 blocks)",
+            "overrides": ["model.direct_head.delta.budget_params=120000000", "model.direct_head.delta.max_rank=160"]
+        },
+        {
+            "name": "c08_cap_half",
+            "note": "capacity re-sweep: 0.5x delta budget",
+            "overrides": ["model.direct_head.delta.budget_params=30000000"]
+        },
+        {
+            "name": "c09_rbase128",
+            "note": "capacity: larger shared base",
+            "overrides": ["model.direct_head.r_base=128"]
+        },
+        {
+            "name": "c10_uniform_loss",
+            "note": "W-loss ablation: uniform loss weights (BCE unchanged)",
+            "overrides": ["wmap={\"kind\":\"uniform\"}"]
+        },
+        {
+            "name": "c11_single_tap",
+            "note": "fusion ablation: single prior tap per layer",
+            "overrides": ["model.taps={\"mode\":\"fixed\",\"map\":\"prior\"}"]
+        }
+    ]
+}

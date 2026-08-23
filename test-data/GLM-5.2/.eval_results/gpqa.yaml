@@ -1,0 +1,7 @@
+- dataset:
+    id: Idavidrein/gpqa
+    task_id: diamond
+  value: 91.2
+  source:
+    url: https://huggingface.co/zai-org/GLM-5.2
+    name: Model Card

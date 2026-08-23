@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "x-configFile": "residual_correction.json",
+  "description": "Residual correction MLP internal training parameters. Loaded from residual_correction.json if not inlined.",
+  "properties": {
+    "training_batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 32,
+      "x-changeable": true,
+      "description": "Samples per training step"
+    },
+    "min_samples_before_predict": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 64,
+      "x-changeable": true,
+      "description": "Cold-start guard: return zeros until this many samples collected"
+    },
+    "beta1": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.9,
+      "description": "Adam first moment decay"
+    },
+    "beta2": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.999,
+      "description": "Adam second moment decay"
+    },
+    "epsilon": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 1e-8,
+      "description": "Adam numerical stability constant"
+    }
+  },
+  "additionalProperties": false
+}

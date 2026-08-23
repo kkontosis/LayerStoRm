@@ -1,0 +1,103 @@
+{
+  "type": "object",
+  "x-configFile": "gpu_load_balancer.json",
+  "description": "GPU load balancer 7-term scoring weights and priority bin thresholds. Loaded from gpu_load_balancer.json if not inlined.",
+  "properties": {
+    "weight_residency": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.25,
+      "x-changeable": true,
+      "description": "Weight for expert residency overlap term"
+    },
+    "weight_capacity": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.20,
+      "x-changeable": true,
+      "description": "Weight for compute capacity term (queue depth / compute_weight)"
+    },
+    "weight_headroom": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.10,
+      "x-changeable": true,
+      "description": "Weight for VRAM headroom term (free fraction)"
+    },
+    "weight_affinity": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.15,
+      "x-changeable": true,
+      "description": "Weight for soft affinity match term"
+    },
+    "weight_transfer_cost": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.15,
+      "x-changeable": true,
+      "description": "Weight for transfer cost term (bin-aware, urgency-modulated)"
+    },
+    "weight_cache_quality_stable": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.10,
+      "x-changeable": true,
+      "description": "Weight for stable-zone cache quality (mean eviction score of stable residents)"
+    },
+    "weight_cache_quality_streaming": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.05,
+      "x-changeable": true,
+      "description": "Weight for streaming-zone cache quality (mean eviction score of streaming residents)"
+    },
+    "priority_bin_thresholds": {
+      "type": "array",
+      "items": { "type": "number", "minimum": 0, "maximum": 1 },
+      "default": [0.3, 0.7],
+      "x-changeable": true,
+      "description": "Sorted ascending priority thresholds defining N+1 bins. Must match TransferEngine::Options::priority_bin_thresholds."
+    },
+    "learned_scorer_enabled": {
+      "type": "boolean",
+      "default": false,
+      "x-changeable": true,
+      "description": "Enable online-trained MLP latency predictor as alternative to heuristic scorer. Falls back to heuristic when cold."
+    },
+    "learned_scorer_hidden_size": {
+      "type": "integer",
+      "minimum": 4,
+      "default": 32,
+      "description": "Hidden layer size for learned GPU scorer MLP"
+    },
+    "learned_scorer_learning_rate": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 0.0001,
+      "x-changeable": true,
+      "description": "Adam learning rate for learned GPU scorer"
+    },
+    "learned_scorer_buffer_size": {
+      "type": "integer",
+      "minimum": 64,
+      "default": 10000,
+      "description": "Ring buffer capacity for training samples"
+    },
+    "learned_scorer_min_samples": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 128,
+      "x-changeable": true,
+      "description": "Minimum samples before MLP predictions are used (cold-start guard)"
+    }
+  },
+  "additionalProperties": false
+}

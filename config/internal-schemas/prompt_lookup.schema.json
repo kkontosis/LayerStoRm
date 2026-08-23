@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "x-configFile": "prompt_lookup.json",
+  "description": "Prompt lookup internal parameters. Loaded from prompt_lookup.json if not inlined.",
+  "properties": {
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for acceptance rate tracking"
+    }
+  },
+  "additionalProperties": false
+}

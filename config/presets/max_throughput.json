@@ -1,0 +1,54 @@
+{
+  "orchestrator": {
+    "performance_objective": {
+      "latency_weight": 0.2,
+      "throughput_weight": 0.8
+    },
+    "max_batch_size": 128,
+    "expert_batching": {
+      "max_wait_us": 100,
+      "min_batch_tokens_per_expert": 8
+    }
+  },
+  "speculation": {
+    "enabled": true,
+    "mtp": {
+      "max_depth": 5,
+      "dynamic_depth": true
+    },
+    "self_speculative": {
+      "enabled": false
+    },
+    "layer_skip_draft": {
+      "enabled": false
+    },
+    "verification": {
+      "adaptive_topk_threshold": 0.92,
+      "verification_quality_floor": 0.75,
+      "in_flight_transfer_mode": "optimistic"
+    },
+    "calibration": {
+      "target_acceptance_rate": 0.5
+    }
+  },
+  "prefetch": {
+    "speculative": {
+      "max_prefetch_depth_layers": 2,
+      "confidence_threshold": 0.4
+    },
+    "probe": {
+      "confidence_threshold": 0.4
+    }
+  },
+  "memory": {
+    "expert_cache": {
+      "stable_zone_fraction": 0.6
+    },
+    "kv_cache": {
+      "speculation_pool_fraction": 0.25
+    }
+  },
+  "serving": {
+    "max_concurrent_requests": 64
+  }
+}

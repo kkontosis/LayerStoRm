@@ -1,0 +1,157 @@
+{
+  "banks": [
+    {
+      "contention": 0.05252875451929695,
+      "egress_us": 581.0880064964294,
+      "node": 0
+    },
+    {
+      "contention": 0.046331576638814376,
+      "egress_us": 603.3920049667358,
+      "node": 1
+    },
+    {
+      "contention": 0.019068349778951887,
+      "egress_us": 441.0879909992218,
+      "node": 2
+    },
+    {
+      "contention": 0.01441256776644062,
+      "egress_us": 441.47199392318726,
+      "node": 3
+    }
+  ],
+  "compute_K": 7168,
+  "compute_N": 4096,
+  "compute_tokens": 1,
+  "contention": [
+    {
+      "bank": 0,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 736.0053380330404,
+      "factor": 1.052528754519297,
+      "solo_us": 719.1359996795654
+    },
+    {
+      "bank": 1,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 750.6805419921875,
+      "factor": 1.0463315766388144,
+      "solo_us": 763.7119889259338
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 522.7413177490234,
+      "factor": 1.0190683497789519,
+      "solo_us": 512.9600167274475
+    },
+    {
+      "bank": 3,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 493.7024116516113,
+      "factor": 1.0144125677664406,
+      "solo_us": 486.6879880428314
+    }
+  ],
+  "devices": [
+    {
+      "compute": {
+        "P": 64,
+        "a_us": 16.59048344465674,
+        "b_us": 63.94509001563301
+      },
+      "name": "NVIDIA GeForce RTX 5090",
+      "numa_node": 2,
+      "position": 0,
+      "recon_added_us": 2.0000003278255463,
+      "recon_overhead_us": 17.023999243974686,
+      "uuid": "GPU-0bb7512a-f3dc-fb8d-ad30-84fc27f76f3",
+      "xfer_lat_us": 1.6639999812468886
+    },
+    {
+      "compute": {
+        "P": 64,
+        "a_us": 16.51587029784972,
+        "b_us": 63.37321145558838
+      },
+      "name": "NVIDIA GeForce RTX 5090",
+      "numa_node": 3,
+      "position": 1,
+      "recon_added_us": 2.0000003278255463,
+      "recon_overhead_us": 17.023999243974686,
+      "uuid": "GPU-11ce54c2-ef9f-197f-a5da-179a27928d4",
+      "xfer_lat_us": 1.5999999595806003
+    }
+  ],
+  "expert_bytes": 24772992.0,
+  "fixed_overhead_us": 0.0,
+  "matrix": [
+    [
+      {
+        "lat_us": 3.1679999083280563,
+        "rate_us": 581.0880064964294,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 720.0959920883179,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 740.6079769134521,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.848000032827258,
+        "rate_us": 603.3920049667358,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 441.0879909992218,
+        "tier": 1
+      },
+      {
+        "lat_us": 1.5999999595806003,
+        "rate_us": 512.5439763069153,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 486.01600527763367,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 441.47199392318726,
+        "tier": 1
+      }
+    ]
+  ],
+  "ncf": [
+    0.0,
+    1.0,
+    1.3762025714206183
+  ],
+  "num_banks": 4,
+  "num_devices": 2,
+  "recon_payload_bytes": 14336.0,
+  "source": "calibrated",
+  "version": 2
+}

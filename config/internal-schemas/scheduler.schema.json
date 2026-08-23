@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "x-configFile": "scheduler.json",
+  "description": "Orchestrator scheduler scoring weights. Loaded from scheduler.json if not inlined.",
+  "properties": {
+    "urgency_weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.4,
+      "x-changeable": true,
+      "description": "Weight for urgency term in work item scoring"
+    },
+    "readiness_weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.4,
+      "x-changeable": true,
+      "description": "Weight for readiness (expert residency) term in work item scoring"
+    },
+    "batching_weight": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.2,
+      "x-changeable": true,
+      "description": "Weight for batching bonus term in work item scoring"
+    },
+    "max_batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 64,
+      "x-changeable": true,
+      "description": "Maximum items per compute batch"
+    },
+    "speculation_penalty": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.1,
+      "x-changeable": true,
+      "description": "Score penalty applied to speculative work items"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "x-configFile": "verifier.json",
+  "description": "Verifier internal parameters. Loaded from verifier.json if not inlined.",
+  "properties": {
+    "acceptance_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for acceptance rate tracking"
+    }
+  },
+  "additionalProperties": false
+}

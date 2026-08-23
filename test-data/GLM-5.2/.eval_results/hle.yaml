@@ -1,0 +1,16 @@
+- dataset:
+    id: cais/hle
+    task_id: hle
+  value: 40.5
+  source:
+    url: https://huggingface.co/zai-org/GLM-5.2
+    name: Model Card
+
+- dataset:
+    id: cais/hle
+    task_id: hle
+  value: 54.7
+  source:
+    url: https://huggingface.co/zai-org/GLM-5.2
+    name: Model Card
+  notes: "With tools"

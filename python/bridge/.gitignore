@@ -1,0 +1,5 @@
+# Cython build artifacts (rebuild with build_fastbridge.py)
+_fastbridge*.so
+_fastbridge.c
+.cython_build/
+__pycache__/

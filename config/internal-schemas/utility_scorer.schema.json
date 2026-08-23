@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "x-configFile": "utility_scorer.json",
+  "description": "Cascade/EMA utility scorer internal parameters. Loaded from utility_scorer.json if not inlined.",
+  "properties": {
+    "candidate_depths": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 },
+      "default": [0, 1, 2, 3, 5, 7],
+      "description": "K values to evaluate during Cascade test phase"
+    },
+    "test_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4,
+      "x-changeable": true,
+      "description": "Iterations per K during Cascade test phase"
+    },
+    "set_iterations": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 16,
+      "x-changeable": true,
+      "description": "Iterations to hold best K during Cascade set phase"
+    },
+    "convergence_tolerance": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.1,
+      "description": "Early exit when utility values converge within this fraction"
+    },
+    "backoff_multiplier": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2,
+      "description": "Multiply set duration by this when speculation unprofitable"
+    },
+    "ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "x-changeable": true,
+      "description": "EMA decay for per-K utility tracking (Cascade) and acceptance length (EMA strategy)"
+    },
+    "ema_up_threshold": {
+      "type": "number",
+      "default": 0.0,
+      "description": "Hysteresis for EMA strategy depth increase (sglang-style)"
+    },
+    "ema_down_threshold": {
+      "type": "number",
+      "default": -0.25,
+      "description": "Hysteresis for EMA strategy depth decrease (sglang-style)"
+    },
+    "coverage_discount_floor": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.5,
+      "description": "Minimum coverage discount for INV-A MoE-Spec degradation"
+    }
+  },
+  "additionalProperties": false
+}

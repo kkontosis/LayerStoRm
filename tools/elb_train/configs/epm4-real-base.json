@@ -1,0 +1,59 @@
+{
+  "_comment": "EPM-4 campaign base (real corpus). Every grid cell = this file + --set overrides (tools/elb_train/configs/epm4-grid.json). Shared across ALL cells: shards, sequence split (INV-EPM-DATA), seed, step budget (pilot-picked), eval protocol. budget_params = 4725 rank-units x (6144+6144) exactly, so the uniform-rank control (delta.min_rank=max_rank=9, 525 cells x 9 = 4725 units) matches the W-shaped allocation at EQUAL total delta parameters.",
+  "seed": 0,
+  "device": "cuda",
+  "out_dir": "build/epm4-grid/default",
+  "data": {
+    "shards": "build/epm4-shards",
+    "held_out_fraction": 0.25,
+    "split_seed": 0,
+    "in_sample": false,
+    "batch_blocks": 8,
+    "token_mismatch_weight": 1.0,
+    "unknown_provenance_matched": true
+  },
+  "router": {
+    "checkpoint_dir": "/srv/models/lukealonso/GLM-5.2-NVFP4",
+    "npz": null
+  },
+  "model": {
+    "arm": "router",
+    "normalization": {"kind": "rmsnorm", "learnable": true, "eps": 1e-6},
+    "taps": {"mode": "fixed", "map": "prior"},
+    "layer_groups": "per_layer",
+    "adapter": {
+      "r_base": 64,
+      "residual": true,
+      "activation": "none",
+      "delta": {"enabled": true, "budget_params": 58060800,
+                "min_rank": 0, "max_rank": 96}
+    },
+    "direct_head": {
+      "r_base": 64,
+      "logit_bias": true,
+      "use_router_bias_for_selection": true,
+      "residual": false,
+      "activation": "none",
+      "delta": {"enabled": true, "budget_params": 30000000,
+                "min_rank": 0, "max_rank": 96}
+    }
+  },
+  "wmap": {
+    "kind": "directive",
+    "accept_curve": [0.43, 0.28, 0.27, 0.21, 0.11, 0.07, 0.09],
+    "k0_value": 1.0,
+    "k1_early_layers": 4,
+    "k1_early_value": 0.8,
+    "depth_taper_min": 0.5,
+    "floor": 0.02
+  },
+  "loss": {"kl_weight": 1.0, "kl_temperature": 1.0, "bce_weight": 0.25,
+           "mse_weight": 0.0},
+  "optim": {"lr": 3e-4, "weight_decay": 0.01, "betas": [0.9, 0.999],
+            "schedule": "cosine", "warmup_steps": 50,
+            "min_lr_ratio": 0.0, "grad_accum": 1, "clip_grad_norm": 1.0,
+            "max_steps": 800},
+  "eval": {"every_steps": 0, "m_rank": 32},
+  "checkpoint": {"every_steps": 0, "keep": 1},
+  "log_every": 50
+}

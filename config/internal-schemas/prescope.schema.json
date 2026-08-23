@@ -1,0 +1,97 @@
+{
+  "type": "object",
+  "x-configFile": "prescope.json",
+  "description": "LLaPor learned predictor internal parameters. Ref: Yu et al., arXiv:2509.23638. Loaded from prescope.json if not inlined.",
+  "properties": {
+    "hidden_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 7168,
+      "description": "Model hidden dimension for random projection input. Must match model.hidden_size"
+    },
+    "pca_dim": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 256,
+      "description": "Random projection output dimension"
+    },
+    "hidden_dim": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 256,
+      "description": "MLP hidden layer size"
+    },
+    "learning_rate": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 0.001,
+      "x-changeable": true,
+      "description": "SGD learning rate"
+    },
+    "momentum": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.9,
+      "x-changeable": true,
+      "description": "SGD momentum"
+    },
+    "training_batch_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 32,
+      "x-changeable": true,
+      "description": "Samples per training step"
+    },
+    "training_buffer_size": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 2048,
+      "description": "Per-layer ring buffer capacity"
+    },
+    "focal_loss_gamma": {
+      "type": "number",
+      "minimum": 0,
+      "default": 2.0,
+      "x-changeable": true,
+      "description": "Focal loss gamma (hard-example weighting)"
+    },
+    "balance_loss_lambda": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0.5,
+      "x-changeable": true,
+      "description": "Expert balance loss weight"
+    },
+    "input_group_frac": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.25,
+      "description": "Fraction of MoE layers in input group (shallow predictor)"
+    },
+    "output_group_frac": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.25,
+      "description": "Fraction of MoE layers in output group (shallow predictor)"
+    },
+    "min_samples_before_predict": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 64,
+      "x-changeable": true,
+      "description": "Cold-start guard: return zeros until this many samples collected"
+    },
+    "freq_ema_alpha": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.01,
+      "x-changeable": true,
+      "description": "EMA smoothing for expert frequency tracking in loss"
+    }
+  },
+  "additionalProperties": false
+}
