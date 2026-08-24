@@ -289,7 +289,7 @@ reference implementations, design ideas, and (where noted in
 
 - [vLLM](https://github.com/vllm-project/vllm)
 - [SGLang](https://github.com/sgl-project/sglang)
-- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 - [ktransformers](https://github.com/kvcache-ai/ktransformers)
 - [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
