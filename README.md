@@ -90,6 +90,8 @@ Honest boundaries, as of today:
 
 ## Building
 
+> **Dependencies note:** release archives don't carry submodule contents — clone the sibling repos / CUTLASS listed in `.gitmodules` into their paths (or use `git clone --recurse-submodules` once published with resolvable URLs) before configuring.
+
 Toolchain: **CMake 3.25+, CUDA 12.8+, GCC with C++20, NCCL 2.20+**, pybind11 for
 the Python module; `libnuma` and `liburing` unlock NUMA pinning and the NVMe tier
 (`nlohmann_json`/`spdlog`/CUTLASS are fetched automatically if absent).
