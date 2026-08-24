@@ -48,7 +48,8 @@ its regime — no projections:
 - [x] **DSpark speculative decoding** — lossless draft/verify; 10.5 tok/s champion-corpus decode, +36% over plain at matched trajectory
 - [ ] B>1 batched decoding
 - [ ] CPU hybrid decoding
-- [ ] Predictive fetching / eviction models
+- [ ] **EPM predictive fetching** — hide expert fetch behind compute on the decode critical path via learned next-token expert prediction; the identified route to substantially higher streaming-decode throughput
+- [ ] **EPM predictive eviction** — recurrence-prediction cache eviction approaching Belady-class capture (AUC ≥ 0.9 acceptance gate)
 - [ ] AMD Radeon AI support
 - [ ] Networked multi-node support
 
