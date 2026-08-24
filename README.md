@@ -107,7 +107,7 @@ The kernel collections live in sibling repositories, wired in as submodules
 `deps/LayerStoRmExpertKernels`, plus `3rd-party/cutlass`):
 
 ```sh
-git clone --recursive https://github.com/<org>/LayerStoRm.git
+git clone --recursive https://github.com/kkontosis/LayerStoRm.git
 cd LayerStoRm
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -145,9 +145,10 @@ The I8 solver needs to know *your* box. Two steps:
    the file absent, the engine runs a full calibration at init and writes it
    (it self-heals the same way if you delete the file).
 
-   Example (ours — force a fresh full calibration, written weights-adjacent):
+   Example:
 
    ```sh
+   export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3
    rm -f test-data/GLM-5.2-GGUF-Q4_K_XL/gpu_loader_calibration_5090x2.json
    LS_LOADER_SHADOW=1 ./build/tests/integration/keeper52_test \
      --gtest_filter='Keeper52Test.HundredTokenDecodeFetchAndRun_FullFit_EP2_GLM52'
@@ -162,6 +163,19 @@ The I8 solver needs to know *your* box. Two steps:
      LS_PERF_TRACE=1 LS_PERF_TRACE_OUT=/tmp/train_trace.csv \
      LS_LOADER_TRAIN_OUT=calib.trained.json LS_LOADER_TRAIN_MODEL=current \
      <your decode run>
+   ```
+
+   Example:
+
+   ```sh
+   export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3
+   LS_LOADER_SHADOW=1 \
+     LS_LOADER_SHADOW_DUMP=/tmp/keeper52_shadow.jsonl \
+     LS_PERF_TRACE=1 LS_PERF_TRACE_OUT=/tmp/keeper52_train_trace.csv \
+     LS_LOADER_TRAIN_OUT=test-data/GLM-5.2-GGUF-Q4_K_XL/gpu_loader_calibration_5090x2.trained.json \
+     LS_LOADER_TRAIN_MODEL=current \
+     ./build/tests/integration/keeper52_test \
+     --gtest_filter='Keeper52Test.HundredTokenDecodeFetchAndRun_FullFit_EP2_GLM52'
    ```
 
    (`tools/loader_xray/trainer_apply.py` joins predicted-vs-actual and writes the
