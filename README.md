@@ -280,3 +280,16 @@ Issues and PRs are welcome — measurements from other SM120 boxes especially.
 Performance claims in a PR need a number and its regime; correctness changes need
 the golden-token gates under `tests/` green. Start with
 [`docs/DESIGN.md`](docs/DESIGN.md) and `DEVELOPMENT.md`.
+
+## Thanks
+
+LayerStoRm stands on the shoulders of the open inference ecosystem — for
+reference implementations, design ideas, and (where noted in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)) adapted code:
+
+- [vLLM](https://github.com/vllm-project/vllm)
+- [SGLang](https://github.com/sgl-project/sglang)
+- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [ktransformers](https://github.com/kvcache-ai/ktransformers)
+- [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
