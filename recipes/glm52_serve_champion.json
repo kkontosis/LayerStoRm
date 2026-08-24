@@ -58,7 +58,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 3.25,
+          "expert_streaming": 1.65,
           "stable_zone_fraction": 0.95
         }
       },
@@ -74,7 +74,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 3.25,
+          "expert_streaming": 1.65,
           "stable_zone_fraction": 0.95
         }
       },
@@ -139,7 +139,7 @@
       "output_head": null
     },
     "kv_cache": {
-      "max_pages_per_gpu": 4096,
+      "max_pages_per_gpu": 81920,
       "page_size_tokens": 16,
       "speculation_pool_fraction": 0.15,
       "indexer_k_page_size_tokens": 8192,
@@ -415,7 +415,7 @@
     "host": "0.0.0.0",
     "port": 8000,
     "max_concurrent_requests": 32,
-    "max_sequence_length": 32768,
+    "max_sequence_length": 25600,
     "tokenizer_path": "auto"
   },
   "preprocessing": {
