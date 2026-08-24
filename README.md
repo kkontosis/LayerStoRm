@@ -18,11 +18,14 @@ per GPU, measured aggregate fetch 105–149 GiB/s across four GPUs) that budget 
 enough to keep expert FFNs on the GPU, where they belong. The full argument and
 every mechanism at reimplementation depth is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
+LayerStoRm's vision is to optimally combine devices of potentially unrelated
+architectures for parallel MoE expert compute, with per-layer precision.
+
 ## Current status
 
 > **GLM-5.2 (744 B params, MIT weights) at UD-Q4_K_XL on one box — 512 GB RAM + 64 GB HBM +
 > 2× RTX 5090 + 2× RTX 5080 — expert streaming at up to 10.5 tok/s decode,
-> 60–95 tok/s prefill, 25k-token validated context.**
+> 60–95 tok/s prefill, context size TBD.**
 
 Every number below is a banked measurement from the internal ledgers, labeled with
 its regime — no projections:
@@ -33,7 +36,7 @@ its regime — no projections:
 | Decode, plain (no speculation) | ~6.8–7.7 tok/s | 100-token keeper benchmark, harness, bare-seed / corpus bands |
 | Prefill, superchunk, C++ harness | **60.5 tok/s** current head (best banked 94.9) | 2876-token prompt, warm arena, golden-token-checked; expert H2D ~32 GB/s sustained |
 | Prefill, served | **39.6–44.4 tok/s** | HTTP, 672/1300-token prompts, full champion serving shape (EP4 incl. 5080s, sparse attention + KV tiering live); mini-superchunk strides, default on |
-| Context | **25k-token runs validated** | long-context harness: golden + needle-retrieval + checkpoint/restore under KV tiering. The architecture targets GLM-5.2's 1M positions (allocation-level 1M smoke passes); a max-context measurement is planned, not claimed |
+| Context | **TBD** | long-context harness: golden + needle-retrieval + checkpoint/restore under KV tiering. The architecture targets GLM-5.2's 1M positions (allocation-level 1M smoke passes); a max-context measurement is planned, not claimed |
 | Boot to serving | ~83–108 s warm attach; cold arena rebuild ~146 s preload at 3.37 GB/s NVMe | persistent arena holder keeps the 494 GB store across engine restarts |
 
 ### Milestones
@@ -138,6 +141,14 @@ The I8 solver needs to know *your* box. Two steps:
    `gpu_loader.calibration_path` pointing at a writable JSON. On first run with
    the file absent, the engine runs a full calibration at init and writes it
    (it self-heals the same way if you delete the file).
+
+   Example (ours — force a fresh full calibration, written weights-adjacent):
+
+   ```sh
+   rm -f test-data/GLM-5.2-GGUF-Q4_K_XL/gpu_loader_calibration_5090x2.json
+   LS_LOADER_SHADOW=1 ./build/tests/integration/keeper52_test \
+     --gtest_filter='Keeper52Test.HundredTokenDecodeFetchAndRun_FullFit_EP2_GLM52'
+   ```
 2. **Train** (fit the cost model to real decode timings): run a representative
    decode workload with the solver's prediction dump and the perf trace enabled,
    then bake workload-corrected constants:
@@ -166,6 +177,23 @@ workload ships in `test-data/placement/`). To fit one to your workload:
 LS_PERF_TRACE=1 LS_PERF_TRACE_OUT=/tmp/trace.csv <your run>
 # fit (multiple traces accumulate — mix the regimes you serve)
 python3 tools/loader_xray/freq_table.py my_freq.csv /tmp/trace.csv
+```
+
+Example (ours — one traced champion iteration, then fit; the result ships as
+`test-data/placement/glm52_fetch_freq_m3.csv`):
+
+```sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,2,3 \
+LS_PERF_TRACE=1 LS_PERF_TRACE_OUT=/tmp/champ_trace.csv \
+LS_IPC_PIN=1 KEEPER52_REEF_ORCH=1 \
+LS_ARENA_PLACE_FREQ=test-data/placement/glm52_fetch_freq_m3.csv \
+DSP52_VB=batched DSP52_OVERLAP=1 DSP52_CONF_THRESH=0.1 \
+DSP52_QUANT=nvfp4 DSP52_SHARD=1 \
+DSP52_PROMPT=test-data/prompts/glm52_longctx_tokens3.txt DSP52_PROMPT_TOKENS=512 \
+DSP52_FORCE_TRAJ=test-data/prompts/dsp52_forced_traj_r1.txt \
+./build/tests/integration/dsp52_test \
+  --gtest_filter='Dsp52Test.SpeculativeHundredTokenDecodeFetchAndRun_FullFit_EP4_GLM52'
+python3 tools/loader_xray/freq_table.py my_freq.csv /tmp/champ_trace.csv
 ```
 
 Changing the table changes the arena identity: expect **one** cold store rebuild,
