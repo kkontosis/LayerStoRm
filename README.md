@@ -15,8 +15,10 @@ the activated experts it doesn't already hold — deduplicated, NUMA-correct,
 cost-model-placed across GPUs, and overlapped with attention/compute — so **PCIe
 streaming bandwidth, not VRAM size, is the budget**. On PCIe 5.0 links (~56 GB/s
 per GPU, measured aggregate fetch 105–149 GiB/s across four GPUs) that budget is
-enough to keep expert FFNs on the GPU, where they belong. The full argument and
-every mechanism at reimplementation depth is in [`docs/DESIGN.md`](docs/DESIGN.md).
+enough to keep expert FFNs on the GPU, where they belong. The full **initial** argument and
+every mechanism at reimplementation depth is in [`docs/DESIGN.md`](docs/DESIGN.md) —
+read together with [`docs/DESIGN-REVISIONS.md`](docs/DESIGN-REVISIONS.md), which
+records where implementation experience has since revised it.
 
 LayerStoRm's vision is to optimally combine devices of potentially unrelated
 architectures for parallel MoE expert compute, with per-layer precision.
