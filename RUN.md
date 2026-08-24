@@ -175,5 +175,5 @@ LS_ARENA_PLACE_FREQ=NEW_TABLE.csv LS_ARENA_PLACE_ONLINE=0 <champion run>
 
 ## License
 
-LayerStoRm is licensed under the Apache License 2.0 — see LICENSE.md.
+LayerStoRm is licensed under the MIT License — see LICENSE.md.
 Third-party notices: THIRD_PARTY_NOTICES.md.

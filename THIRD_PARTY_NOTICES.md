@@ -1,6 +1,6 @@
 # Third-Party Notices — LayerStoRm
 
-LayerStoRm is licensed under the Apache License 2.0 (see `LICENSE.md`).
+LayerStoRm is licensed under the MIT License (see `LICENSE.md`).
 Portions of this repository are derived from, adapted from, or reference the
 third-party projects listed below. This file collects the required upstream
 attributions and license notices. The dependency repositories
@@ -215,7 +215,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Appendix C — Apache License 2.0
 
-The Apache License 2.0 text is reproduced in this repository as `LICENSE.md`.
+This repository is licensed under the MIT License — see `LICENSE.md`.
 It applies both to LayerStoRm itself (Copyright 2026 Kimon Kontosis) and to
 the Apache-2.0-licensed upstream material identified above (vLLM, SGLang,
 NVIDIA TensorRT-LLM).

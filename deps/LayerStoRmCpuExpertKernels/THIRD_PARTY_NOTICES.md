@@ -61,7 +61,7 @@ SOFTWARE.
 
 ## Apache License 2.0
 
-The Apache License 2.0 text is reproduced in this repository as `LICENSE.md`
+This repository is licensed under the MIT License — see `LICENSE.md`
 (Copyright 2026 Kimon Kontosis). It applies to the first-party code in this
 repository; the `ik_vendor/` closure and the other MIT-derived material above
 remain under the MIT License with the upstream copyrights.

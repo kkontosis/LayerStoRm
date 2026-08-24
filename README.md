@@ -85,7 +85,7 @@ Honest boundaries, as of today:
 
 - **Hardware**: PCIe 5.0 consumer GPUs only — NVIDIA SM120 (RTX 5090/5080 class); kernels build as `120f`. PCIe 4.0 or datacenter parts are unexplored territory.
 - **Models**: MLA-family MoE only — **GLM-5.2**, **DeepSeek-V4-Flash**, **DeepSeek-V3.2** are the bring-up targets with golden-token gates.
-- **Single node**, **batch size 1** decode. Concurrent requests queue; prefix cache makes that cheap for shared prompts.
+- **Single node**, **batch size 1** decode. Concurrent requests queue (bounded FIFO, `serving.max_queued_requests`; overflow answers 503 + Retry-After); prefix cache makes that cheap for shared prompts.
 - **Active development** — interfaces and configuration still move. Every performance change is gated on bit-identical golden-token tests.
 
 ## Building
@@ -222,7 +222,7 @@ notes and the remaining env knobs.
 
 ## License and attributions
 
-Apache License 2.0 — see [LICENSE.md](LICENSE.md). Third-party notices are
+MIT License — see [LICENSE.md](LICENSE.md). Third-party notices are
 collected in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md); in one line: the
 SM120 MLA attention kernels derive from FlashMLA (MIT) and CUTLASS (BSD-3-Clause),
 the CPU/GGUF quantized-GEMM and MXFP4/GGUF decode paths derive from the
