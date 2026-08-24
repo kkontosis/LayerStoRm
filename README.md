@@ -37,7 +37,7 @@ its regime — no projections:
 | Decode, speculative champion | **10.5 tok/s** (best banked 10.498) | harness free-run on the draft-friendly champion corpus; acceptance 0.56 |
 | Decode, plain (no speculation) | ~6.8–7.7 tok/s | 100-token keeper benchmark, harness, bare-seed / corpus bands |
 | Prefill, superchunk, C++ harness | **60.5 tok/s** current head (best banked 94.9) | 2876-token prompt, warm arena, golden-token-checked; expert H2D ~32 GB/s sustained |
-| Prefill, served | **39.6–44.4 tok/s** | HTTP, 672/1300-token prompts, full champion serving shape (EP4 incl. 5080s, sparse attention + KV tiering live); mini-superchunk strides, default on |
+| Prefill, served | **39.6–44.6 tok/s** | HTTP, 672-token through **25k-token** prompts — sustained at depth (windowed KV admission + batched tiered prefill); full champion serving shape (EP4 incl. 5080s, sparse attention + KV tiering live) |
 | Context | **TBD** | long-context harness: golden + needle-retrieval + checkpoint/restore under KV tiering. The architecture targets GLM-5.2's 1M positions (allocation-level 1M smoke passes); a max-context measurement is planned, not claimed |
 | Boot to serving | ~83–108 s warm attach; cold arena rebuild ~146 s preload at 3.37 GB/s NVMe | persistent arena holder keeps the 494 GB store across engine restarts |
 
