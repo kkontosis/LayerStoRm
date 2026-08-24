@@ -732,6 +732,18 @@
               "type": "boolean",
               "default": true,
               "description": "Under REPLICATED KV at dcp>=2, keep a single cold copy per demoted page (round-robin cold-owner rank) instead of one per rank: pinned cold host RAM divided by dcp, total capacity unchanged. Demotion D2H and cold-burst H2D DMAs stay NUMA-node-local; only the cold-fetch host memcpy may cross nodes for non-owner ranks (INV-KVT-11). Placement-only, token-identical. Ignored under sharded KV (already single-copy) and at dcp==1. Disable to restore per-rank cold copies (all-local host memcpy, dcp x host RAM)."
+            },
+            "tiered_prefill": {
+              "type": "boolean",
+              "default": false,
+              "description": "TD-KVT-ADMISSION-UPFRONT: tiering-aware chunked prefill + admission. Requires compute.dsa_sparse_prefill. A dispatcher-blessed SPARSE prefill chunk of ONE sequence executes its attention consumption as per-row B==1 sparse sub-dispatches (INV-DSA-ROWMIX shape) — each row a decode-shaped tier step (INV-KVT-13 extended to chunk cohorts AND to sharded KV via the per-row KVS-4-translated consumption), so pages behind the retention window demote DURING prefill and cold selected rows materialize from the pinned pool per row. Also enables windowed admission: seq_create allocates KV pages only for the admission window (see admission_window_tokens), the remainder grows lazily as the chunk frontier advances — peak KV VRAM is bounded by retention + active chunk, never prompt length. ARM CHANGE when enabled: served prefill runs SPARSE per-row (the DSA-trained semantic) — a different valid greedy trajectory vs the dense-chunk arm (TD-SERVE-SC-TRAJECTORY class). Default false: byte-identical legacy behavior.",
+              "x-devDoc": "Gate sites: arch_mla.cpp dispatcher tierable gate + executor per-row tiered chunk branch; dispatch_lifecycle.cpp seq_create window; KvTieringManager cohort seam (materialize_row)."
+            },
+            "admission_window_tokens": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "description": "TD-KVT-ADMISSION-UPFRONT (only with tiered_prefill): seq_create allocates kMain KV pages for at most this many prompt tokens; the rest of the prompt allocates lazily via ensure_pages growth while chunk-boundary demotion frees behind the retention window. 0 = auto: retention window (hot_buffer_slots, or 2x index_topk when 0) + 1024. Must comfortably exceed retention + the prefill chunk stride (the active superchunk must stay hot). Ignored without tiered_prefill (full upfront allocation)."
             }
           },
           "additionalProperties": false
@@ -2355,6 +2367,13 @@
           "maximum": 256,
           "default": 32,
           "description": "Maximum simultaneous requests"
+        },
+        "max_queued_requests": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "default": 16,
+          "description": "Maximum requests WAITING for a generation slot at the HTTP layer (bounded FIFO admission queue over max_concurrent_requests in-flight generations; queued waiters honor client disconnect). Beyond this depth requests fail fast with 503 + Retry-After. Consumed by the Python serving layer; CLI override: --max-queued-requests."
         },
         "max_sequence_length": {
           "type": "integer",

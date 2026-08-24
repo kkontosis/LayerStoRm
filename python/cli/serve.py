@@ -76,6 +76,7 @@ class ServeOptions:
     port: int = 8000
     model_name: str = ""
     max_concurrent: int = 32
+    max_queued_requests: int = 16
     max_sequence_length: int = 32768
     tokenizer_path: str = "auto"
     # vLLM-parity serving parsers ("" = disabled): named tool-call parser
@@ -119,6 +120,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-concurrent", type=int, default=None,
                    help="max simultaneous requests "
                         "(overrides serving.max_concurrent_requests)")
+    p.add_argument("--max-queued-requests", type=int, default=None,
+                   help="max requests WAITING for a generation slot "
+                        "(bounded FIFO queue; beyond it → 503 + "
+                        "Retry-After; overrides "
+                        "serving.max_queued_requests)")
     p.add_argument("--max-sequence-length", type=int, default=None,
                    help="max prompt tokens "
                         "(overrides serving.max_sequence_length)")
@@ -217,6 +223,9 @@ def resolve_options(config: dict, args: argparse.Namespace) -> ServeOptions:
         model_name=model_name,
         max_concurrent=int(pick(args.max_concurrent,
                                 "max_concurrent_requests", 32)),
+        max_queued_requests=int(pick(getattr(args, "max_queued_requests",
+                                             None),
+                                     "max_queued_requests", 16)),
         max_sequence_length=int(pick(args.max_sequence_length,
                                      "max_sequence_length", 32768)),
         tokenizer_path=pick(args.tokenizer_path, "tokenizer_path", "auto"),
@@ -391,8 +400,9 @@ def build_stack(
     # sideband command-input slots are single-owner — MULTIPLE concurrent
     # in-flight generations clobber each other's token/batch-descriptor
     # inputs (TD-ORCH-SIDEBAND-INPUT-MULTI).  Until that lands, the serve
-    # stack admits ONE generation at a time; extra requests get 429 +
-    # Retry-After from the HTTP layer.
+    # stack admits ONE generation at a time; extra requests QUEUE at the
+    # HTTP layer (bounded FIFO, serving.max_queued_requests) and only
+    # queue overflow errors (503 + Retry-After).
     max_concurrent = opts.max_concurrent
     if max_concurrent > 1:
         log.warning(
@@ -438,6 +448,7 @@ def build_stack(
             host=opts.host,
             port=opts.port,
             max_concurrent=max_concurrent,
+            max_queued_requests=opts.max_queued_requests,
             max_sequence_length=opts.max_sequence_length,
             tool_call_parser=opts.tool_call_parser,
             enable_auto_tool_choice=opts.enable_auto_tool_choice,

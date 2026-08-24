@@ -157,9 +157,16 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
         const size_t off_srcp    = align_up(off_stage + static_cast<size_t>(ITK) * row);
         const size_t off_scatp   = align_up(off_srcp + static_cast<size_t>(ITK) * sizeof(void*));
         const size_t off_scati   = align_up(off_scatp + static_cast<size_t>(ITK) * sizeof(void*));
+        // TD-KVT-ADMISSION-UPFRONT: the selection staging holds a whole
+        // chunk cohort's selection (cohort_rows_max x ITK indices +
+        // cohort_rows_max lengths) when the cohort seam is enabled; the
+        // legacy single-row layout is the CRM == 1 special case.
+        const size_t CRM = static_cast<size_t>(
+            std::max(1, opts_.cohort_rows_max));
         const size_t off_idx     = align_up(off_scati + static_cast<size_t>(ITK) * sizeof(int));
-        const size_t off_len     = align_up(off_idx + static_cast<size_t>(ITK) * sizeof(int));
-        const size_t off_pf_stage = align_up(off_len + 64);
+        const size_t off_len     = align_up(off_idx + CRM * static_cast<size_t>(ITK) * sizeof(int));
+        const size_t off_pf_stage = align_up(off_len
+                                             + std::max<size_t>(64, CRM * sizeof(int)));
         const size_t off_pf_scatp = align_up(off_pf_stage + static_cast<size_t>(ITK) * row);
         const size_t off_pf_scati = align_up(off_pf_scatp + static_cast<size_t>(ITK) * sizeof(void*));
         const size_t off_cold    = align_up(off_pf_scati + static_cast<size_t>(ITK) * sizeof(int));
@@ -551,15 +558,55 @@ void KvTieringManager::drain_demotions() {
 
 bool KvTieringManager::begin_layer(int layer, uint64_t seq_id,
                                    uint32_t token_pos,
-                                   const int* const* host_block_tables) {
+                                   const int* const* host_block_tables,
+                                   int rows) {
     poll_demotions();
     if (layer < 0 || layer >= opts_.kv_layers) return false;
+    // TD-KVT-ADMISSION-UPFRONT: a chunk cohort (rows > 1) writes
+    // [token_pos, token_pos + rows) — legality below is checked against the
+    // FIRST write position; the cohort staging must fit the rows.
+    if (rows < 1 || (rows > 1 && rows > opts_.cohort_rows_max)) return false;
     // TD-KVT-BATCH: per-sequence state, created on first sight — any number
     // of sequences may be tiered concurrently (each step is still B==1).
     auto [it, inserted] = seqs_.try_emplace(seq_id);
     SeqState& ss = it->second;
     if (inserted)
         ss.pages.assign(static_cast<size_t>(opts_.kv_layers), {});
+    if (rows > 1) {
+        // TD-KVT-ADMISSION-UPFRONT cohort legality is PER-LAYER: the chunk
+        // k_appends [token_pos, token_pos + rows) into THIS layer's pages,
+        // and a superchunk's layer-wise sweep legitimately REPLAYS earlier
+        // sub-chunks at later layers (max_pos_seen already covers them —
+        // NOT a rewind; the global demoted frontier is too coarse for that
+        // shape).  Fail loud if THIS layer holds a non-hot page at/after
+        // the first write position — its bytes would be rewritten through a
+        // neutralized handle or mid-D2H (INV-KVT-2).  Per-layer demotion
+        // trails each layer's own ascending pass (after_attention), so a
+        // legal sweep never trips this.
+        const auto& lsv = ss.pages[static_cast<size_t>(layer)];
+        const int j0 = static_cast<int>(token_pos) / opts_.page_size;
+        for (int j = j0; j < static_cast<int>(lsv.size()); ++j) {
+            if (lsv[static_cast<size_t>(j)].state != PageState::kHot) {
+                throw std::runtime_error(
+                    "KvTiering: cohort chunk write at pos "
+                    + std::to_string(token_pos) + " (rows "
+                    + std::to_string(rows) + ") over a demoted page of layer "
+                    + std::to_string(layer) + " (logical " + std::to_string(j)
+                    + ") — INV-KVT-2");
+            }
+        }
+        ss.max_pos_seen = std::max(
+            ss.max_pos_seen, token_pos + static_cast<uint32_t>(rows));
+        ctx_seq_ = seq_id;
+        ctx_layer_ = layer;
+        ctx_pos_ = token_pos;
+        ctx_rows_ = rows;
+        ctx_cold_valid_ = false;
+        for (int r = 0; r < static_cast<int>(ranks_.size()); ++r)
+            ctx_host_bt_[static_cast<size_t>(r)] = host_block_tables
+                ? host_block_tables[r] : nullptr;
+        return true;
+    }
     if (token_pos + 1 < ss.max_pos_seen) {
         // Rollback/rewind (speculation truncation).  TD-KVT-SPEC: cold rows
         // are immutable PREFIX content.  This step's k_append REWRITES
@@ -584,10 +631,13 @@ bool KvTieringManager::begin_layer(int layer, uint64_t seq_id,
         }
         ss.max_pos_seen = token_pos + 1;  // demoted prefix intact — safe
     }
-    ss.max_pos_seen = std::max(ss.max_pos_seen, token_pos + 1);
+    ss.max_pos_seen = std::max(
+        ss.max_pos_seen, token_pos + static_cast<uint32_t>(rows));
     ctx_seq_ = seq_id;
     ctx_layer_ = layer;
     ctx_pos_ = token_pos;
+    ctx_rows_ = rows;
+    ctx_cold_valid_ = false;  // per-layer any-cold cache (cohort fast path)
     for (int r = 0; r < static_cast<int>(ranks_.size()); ++r)
         ctx_host_bt_[static_cast<size_t>(r)] = host_block_tables
             ? host_block_tables[r] : nullptr;
@@ -1495,9 +1545,6 @@ bool KvTieringManager::materialize(int rank, int layer_idx,
     auto* be = backend(rank);
     be->set_device();
     auto& rb = ranks_[static_cast<size_t>(rank)];
-    const int ITK = opts_.index_topk;
-    const int PS = opts_.page_size;
-    const size_t row = static_cast<size_t>(opts_.stride_row);
 
     // 1) Selection → host: consume the prepare()-issued overlapped readback,
     //    reuse the IndexShare host copy, or fall back to the synchronous
@@ -1511,6 +1558,38 @@ bool KvTieringManager::materialize(int rank, int layer_idx,
     if (want_pf && n > 0) prefetch_successors(rank, layer_idx, n, stream);
     if (!any_cold) return false;  // successor-only call: this layer untiered
     if (n <= 0) return false;  // degenerate: sparse kernel reads no rows
+
+    // Steps 1c-6 shared with the cohort path (TD-KVT-ADMISSION-UPFRONT).
+    materialize_selection(rank, layer_idx, rb.h_indices, n,
+                          topk_lengths_dev, stream, out);
+
+    ++stats_.materializations;
+    stats_.rows_gathered += static_cast<uint64_t>(n);
+    if (stats_.materializations - last_logged_materializations_ >= 4096) {
+        last_logged_materializations_ = stats_.materializations;
+        log_stats();
+    }
+    return true;
+}
+
+// TD-KVT-ADMISSION-UPFRONT: steps 1c-6 of the original materialize over one
+// row's host-resident selection — the shared placement body for the B==1
+// path and materialize_row (INV-KVT-1: identical machinery either way).
+void KvTieringManager::materialize_selection(
+        int rank, int layer_idx, const int* h_idx, int n,
+        const int* seqlens_dev, void* stream,
+        parallelism::TieredKvView* out) {
+    auto* be = backend(rank);
+    auto& rb = ranks_[static_cast<size_t>(rank)];
+    const int PS = opts_.page_size;
+    const size_t row = static_cast<size_t>(opts_.stride_row);
+    SeqState* ssp = find_seq(ctx_seq_);
+    if (!ssp) {
+        throw std::runtime_error(
+            "KvTiering: materialize_selection without a step sequence");
+    }
+    auto& ls = ssp->pages[static_cast<size_t>(layer_idx)];
+    const int* host_bt = ctx_host_bt_[static_cast<size_t>(rank)];
 
     // 1c) Host staging-reuse guard: the previous materialize's uploads/gather
     //     may still be DMA-reading h_src_ptrs/h_stage/scatter tables and
@@ -1533,7 +1612,7 @@ bool KvTieringManager::materialize(int rank, int layer_idx,
     int k = 0;                       // cache-insert scatter entries
 
     for (int i = 0; i < n; ++i) {
-        const int pos = rb.h_indices[i];
+        const int pos = h_idx[i];
         if (pos < 0) {
             throw std::runtime_error(
                 "KvTiering: negative index inside topk_length");
@@ -1654,13 +1733,125 @@ bool KvTieringManager::materialize(int rank, int layer_idx,
     // 6) Fake paged view: identity indices over the dense scratch.
     out->kv_cache = rb.scratch;
     out->block_tables = static_cast<const int*>(rb.dev_fake_bt);
-    out->seqlens_k = topk_lengths_dev;  // B==1: device int == n
+    out->seqlens_k = seqlens_dev;  // device int holding this row's n
     out->max_blocks_per_seq = n_fake_pages_;
     out->seq_len_kv = n;
     out->sparse_indices = static_cast<const int*>(rb.dev_ident_indices);
+}
+
+// ── Hook: materialize_row (TD-KVT-ADMISSION-UPFRONT cohort seam) ────────────
+
+void KvTieringManager::ensure_cohort_selection(int rank, int layer_idx,
+                                               const int* sparse_indices_dev,
+                                               const int* topk_lengths_dev,
+                                               bool selection_fresh,
+                                               void* stream) {
+    auto* be = backend(rank);
+    auto& rb = ranks_[static_cast<size_t>(rank)];
+    auto& sc = sel_[static_cast<size_t>(rank)];
+    const int ITK = opts_.index_topk;
+
+    const bool identity = sc.valid && sc.seq == ctx_seq_ && sc.pos == ctx_pos_
+        && sc.rows == ctx_rows_;
+    if (identity && sc.prepared_layer == layer_idx)
+        return;  // later row of the same (rank, layer) visit — host-resident
+    if (identity && !selection_fresh) {
+        // IndexShare SHARED layer: the producer reused the preceding full
+        // layer's buffers (byte-identical content) and this manager holds
+        // that step's cohort selection — INV-KVT-6 (certified identity +
+        // matching step identity), no D2H.
+        sc.prepared_layer = layer_idx;
+        ++stats_.sync_reuses;
+        return;
+    }
+
+    // Drain a stale pending single-row prepare() readback targeting
+    // h_indices before overwriting (same buffer, same event).
+    if (sc.pending) {
+        stats_.guard_wait_us += wait_event_us(be, rb.ev_sync);
+        sc.pending = false;
+    }
+    be->memcpy_d2h_async(rb.h_indices, sparse_indices_dev,
+                         static_cast<size_t>(ctx_rows_) * ITK * sizeof(int),
+                         stream);
+    be->memcpy_d2h_async(rb.h_topk_len, topk_lengths_dev,
+                         static_cast<size_t>(ctx_rows_) * sizeof(int),
+                         stream);
+    be->record_event(rb.ev_sync, stream);
+    stats_.sync_wait_us += wait_event_us(be, rb.ev_sync);
+    sc.pending = false;
+    sc.valid = true;
+    sc.reuse_ok = false;
+    sc.fresh = false;  // cohorts never feed the lookahead prefetch
+    sc.prepared_layer = layer_idx;
+    sc.seq = ctx_seq_;
+    sc.pos = ctx_pos_;
+    sc.rows = ctx_rows_;
+    sc.n = 0;
+    ++stats_.cohort_readbacks;
+}
+
+bool KvTieringManager::materialize_row(int rank, int layer_idx, int row,
+                                       int rows,
+                                       const int* sparse_indices_dev,
+                                       const int* topk_lengths_dev,
+                                       bool selection_fresh, void* stream,
+                                       parallelism::TieredKvView* out) {
+    if (opts_.cohort_rows_max <= 0 || rows < 1
+        || rows > opts_.cohort_rows_max || row < 0 || row >= rows) {
+        throw std::runtime_error(
+            "KvTiering: bad materialize_row cohort shape (row "
+            + std::to_string(row) + " of " + std::to_string(rows)
+            + ", staging cap " + std::to_string(opts_.cohort_rows_max) + ")");
+    }
+    if (rank < 0 || rank >= static_cast<int>(ranks_.size())
+        || layer_idx < 0 || layer_idx >= opts_.kv_layers
+        || !sparse_indices_dev || !topk_lengths_dev || !out) {
+        throw std::runtime_error("KvTiering: bad materialize_row arguments");
+    }
+    if (ctx_seq_ == 0 || layer_idx != ctx_layer_ || rows != ctx_rows_) {
+        throw std::runtime_error(
+            "KvTiering: materialize_row without a matching begin_layer "
+            "cohort (layer " + std::to_string(layer_idx) + ")");
+    }
+    // Per-layer any-cold answer, computed once per begin_layer — page
+    // states are per (seq, layer), shared by every rank and row.
+    if (!ctx_cold_valid_) {
+        const SeqState* ssp = find_seq(ctx_seq_);
+        if (!ssp) {
+            throw std::runtime_error(
+                "KvTiering: materialize_row without a step sequence");
+        }
+        ctx_cold_ = state_layer_has_cold(*ssp, layer_idx);
+        ctx_cold_valid_ = true;
+    }
+    if (!ctx_cold_) return false;  // full-residency per-row path valid
+    if (!ctx_host_bt_[static_cast<size_t>(rank)]) {
+        throw std::runtime_error(
+            "KvTiering: materialize_row without begin_layer block tables "
+            "(rank " + std::to_string(rank) + ")");
+    }
+
+    auto* be = backend(rank);
+    be->set_device();
+    ensure_cohort_selection(rank, layer_idx, sparse_indices_dev,
+                            topk_lengths_dev, selection_fresh, stream);
+    auto& rb = ranks_[static_cast<size_t>(rank)];
+    const int n = rb.h_topk_len[row];
+    if (n <= 0) return false;  // empty local selection (INV-KVS-EMPTY class)
+    if (n > opts_.index_topk) {
+        throw std::runtime_error("KvTiering: cohort topk_length "
+                                 + std::to_string(n) + " > index_topk "
+                                 + std::to_string(opts_.index_topk));
+    }
+    materialize_selection(
+        rank, layer_idx,
+        rb.h_indices + static_cast<size_t>(row) * opts_.index_topk, n,
+        topk_lengths_dev + row, stream, out);
 
     ++stats_.materializations;
     stats_.rows_gathered += static_cast<uint64_t>(n);
+    ++stats_.cohort_rows_tiered;
     if (stats_.materializations - last_logged_materializations_ >= 4096) {
         last_logged_materializations_ = stats_.materializations;
         log_stats();
@@ -1703,7 +1894,7 @@ void KvTieringManager::log_stats() const {
         "budget_skips={}, "
         "cache_evictions={} | sync: overlapped={} reuses={} fallbacks={} "
         "wait={} us ({:.2f} us/mat) guard={} us | prefetch: rows={} "
-        "bursts={} {:.2f} MiB hits={}",
+        "bursts={} {:.2f} MiB hits={} | cohort: readbacks={} rows_tiered={}",
         s.materializations, s.rows_gathered, s.pool_hits, s.cache_hits,
         s.cold_misses, hit_rate,
         static_cast<double>(s.cold_fetch_bytes) / (1024.0 * 1024.0),
@@ -1713,7 +1904,7 @@ void KvTieringManager::log_stats() const {
         s.sync_overlapped, s.sync_reuses, s.sync_fallbacks, s.sync_wait_us,
         avg_sync_us, s.guard_wait_us, s.prefetch_rows, s.prefetch_bursts,
         static_cast<double>(s.prefetch_bytes) / (1024.0 * 1024.0),
-        s.prefetch_hits);
+        s.prefetch_hits, s.cohort_readbacks, s.cohort_rows_tiered);
 }
 
 }  // namespace layerstorm::daemon

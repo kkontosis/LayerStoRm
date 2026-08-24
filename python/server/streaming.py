@@ -192,8 +192,77 @@ async def stream_completion_response(
     cancel_fn: Any,
     stop: str | list[str] | None = None,
     prompt_tokens: int = 0,
+    release_fn: Any = None,
 ) -> AsyncGenerator[str, None]:
-    """Async generator yielding SSE strings for ``/v1/completions``."""
+    """Async generator yielding SSE strings for ``/v1/completions``.
+
+    TEARDOWN CONTRACT (INV-SERVE-CANCEL): the wrapper below owns the ONE
+    guaranteed cancellation point — any exit while the orchestrator is
+    still generating (client disconnect, server-side stop-sequence
+    truncation, GeneratorExit/CancelledError thrown by the ASGI stack)
+    calls ``cancel_fn``.  Cancellation must NOT live only behind the
+    ``is_disconnected()`` poll inside the loop: starlette never resumes
+    an SSE generator after the client is gone (ASGI spec>=2.4: ``send``
+    raises into stream_response and the generator is abandoned at its
+    ``yield``; legacy task-group path: the response task is cancelled),
+    so a poll-only cancel leaves the engine decoding to max_tokens (the
+    2026-08-24 zombie-generation bug).  ``release_fn`` (admission-slot
+    release, see http_server._AdmissionQueue) always runs last.
+    """
+    inner = _stream_completion_inner(
+        request_id=request_id,
+        response_id=response_id,
+        model=model,
+        token_queue=token_queue,
+        tokenizer=tokenizer,
+        eos_token_ids=eos_token_ids,
+        raw_request=raw_request,
+        stop=stop,
+        prompt_tokens=prompt_tokens,
+    )
+    # NOTE: the try/finally must live HERE, in the outermost generator —
+    # a further wrapper level would break the contract (an abandoned
+    # async-for does not close its iterator, and starlette only ever
+    # closes the generator it was handed).
+    try:
+        async for line in inner:
+            yield line
+    finally:
+        await _stream_teardown(inner, request_id, token_queue,
+                               cancel_fn, release_fn)
+
+
+async def _stream_teardown(
+    inner: AsyncGenerator[str, None],
+    request_id: int,
+    token_queue: TokenQueue,
+    cancel_fn: Any,
+    release_fn: Any,
+) -> None:
+    """Shared SSE teardown (INV-SERVE-CANCEL): close the inner generator,
+    cancel any generation still running, free the admission slot."""
+    try:
+        await inner.aclose()
+    finally:
+        if not token_queue.done:
+            cancel_fn(request_id)
+        if release_fn is not None:
+            release_fn()
+
+
+async def _stream_completion_inner(
+    *,
+    request_id: int,
+    response_id: str,
+    model: str,
+    token_queue: TokenQueue,
+    tokenizer: Any,
+    eos_token_ids: tuple[int, ...],
+    raw_request: Request,
+    stop: str | list[str] | None = None,
+    prompt_tokens: int = 0,
+) -> AsyncGenerator[str, None]:
+    """/v1/completions SSE event body (teardown handled by the wrapper)."""
     created = int(time.time())
     loop = asyncio.get_event_loop()
     all_tokens: list[int] = []
@@ -315,8 +384,7 @@ async def stream_completion_response(
             return
 
         if await raw_request.is_disconnected():
-            cancel_fn(request_id)
-            return
+            return                   # wrapper's finally cancels + releases
 
         await asyncio.sleep(0.01)
 
@@ -340,6 +408,7 @@ async def stream_chat_completion_response(
     prompt_tokens: int = 0,
     reasoning_stream: Any = None,
     tool_stream: Any = None,
+    release_fn: Any = None,
 ) -> AsyncGenerator[str, None]:
     """Async generator yielding SSE strings for ``/v1/chat/completions``.
 
@@ -350,7 +419,50 @@ async def stream_chat_completion_response(
     tool-call deltas from the content channel.  ``tool_parser`` is the
     LEGACY whole-text parser applied to the final chunk when no named
     streaming parser is configured (pass None to disable).
+
+    Teardown: same INV-SERVE-CANCEL contract as
+    stream_completion_response — the _stream_teardown finally cancels any
+    still-running generation on ANY exit and then calls ``release_fn``.
     """
+    inner = _stream_chat_completion_inner(
+        request_id=request_id,
+        response_id=response_id,
+        model=model,
+        token_queue=token_queue,
+        tokenizer=tokenizer,
+        eos_token_ids=eos_token_ids,
+        tool_parser=tool_parser,
+        raw_request=raw_request,
+        stop=stop,
+        prompt_tokens=prompt_tokens,
+        reasoning_stream=reasoning_stream,
+        tool_stream=tool_stream,
+    )
+    # Outermost-generator teardown — see stream_completion_response.
+    try:
+        async for line in inner:
+            yield line
+    finally:
+        await _stream_teardown(inner, request_id, token_queue,
+                               cancel_fn, release_fn)
+
+
+async def _stream_chat_completion_inner(
+    *,
+    request_id: int,
+    response_id: str,
+    model: str,
+    token_queue: TokenQueue,
+    tokenizer: Any,
+    eos_token_ids: tuple[int, ...],
+    tool_parser: Any,
+    raw_request: Request,
+    stop: str | list[str] | None = None,
+    prompt_tokens: int = 0,
+    reasoning_stream: Any = None,
+    tool_stream: Any = None,
+) -> AsyncGenerator[str, None]:
+    """/v1/chat/completions SSE event body (teardown in the wrapper)."""
     created = int(time.time())
     loop = asyncio.get_event_loop()
     all_tokens: list[int] = []
@@ -557,7 +669,6 @@ async def stream_chat_completion_response(
             return
 
         if await raw_request.is_disconnected():
-            cancel_fn(request_id)
-            return
+            return                   # wrapper's finally cancels + releases
 
         await asyncio.sleep(0.01)

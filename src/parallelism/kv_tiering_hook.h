@@ -76,6 +76,33 @@ public:
                              int batch_size, void* stream,
                              TieredKvView* out) = 0;
 
+    /// TD-KVT-ADMISSION-UPFRONT (cohort seam): per-row materialization for a
+    /// dispatcher-blessed SPARSE prefill CHUNK consumed as per-row B==1
+    /// sub-dispatches (INV-DSA-ROWMIX shape; INV-KVT-13 extended to chunk
+    /// cohorts).  `sparse_indices_dev` / `topk_lengths_dev` are the
+    /// producer's row-0 base buffers for this (rank, layer) — row b's
+    /// selection lives at sparse_indices_dev + b*topk / topk_lengths_dev + b
+    /// (KVS-4-translated rank-LOCAL indices under sharded KV).  The hook
+    /// reads the WHOLE cohort's selection back once per (rank, layer)
+    /// (`selection_fresh` false = producer certified byte-identical reuse of
+    /// the preceding full layer's buffers — the hook may reuse its host
+    /// copy), then serves row-slice materializations.  Returns true and
+    /// fills `out` (a B==1 fake view for THIS row: identity indices,
+    /// seqlens_k aliasing topk_lengths_dev + row) when the layer has cold
+    /// pages; false when the row must use the real block tables (no cold
+    /// pages — full-residency per-row path valid).  Must be called with
+    /// rows ascending within a (rank, layer) visit.  Default: no tiering.
+    virtual bool materialize_row(int rank, int layer_idx, int row, int rows,
+                                 const int* sparse_indices_dev,
+                                 const int* topk_lengths_dev,
+                                 bool selection_fresh, void* stream,
+                                 TieredKvView* out) {
+        (void)rank; (void)layer_idx; (void)row; (void)rows;
+        (void)sparse_indices_dev; (void)topk_lengths_dev;
+        (void)selection_fresh; (void)stream; (void)out;
+        return false;
+    }
+
     /// Called when a DSA-capable decode layer falls back to DENSE attention.
     /// Dense staging reads the FULL prefix through the real block tables, so
     /// it is only legal while every page of the layer is VRAM-resident.

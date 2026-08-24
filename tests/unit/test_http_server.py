@@ -315,27 +315,139 @@ class TestChatCompletionEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# Rate limiting
+# Admission: bounded FIFO queueing (serving contract 2026-08-24 — excess
+# requests QUEUE; only queue overflow errors, with 503 + Retry-After)
 # ---------------------------------------------------------------------------
 
-class TestRateLimiting:
+class TestAdmissionQueueing:
 
-    def test_over_limit_returns_429(self):
+    def test_queue_overflow_returns_503(self):
         server = LayerStoRmServer(
             orchestrator=MagicMock(),
             tokenizer=_mock_tokenizer(),
             chat_template=_mock_chat_template(),
             metadata=_metadata(),
             model_name="test-model",
-            max_concurrent=0,
+            max_concurrent=0,           # nothing ever admitted...
+            max_queued_requests=0,      # ...and nothing may wait → 503
         )
         client = TestClient(server.app)
         resp = client.post("/v1/completions", json={
             "model": "test-model",
             "prompt": "Hello",
         })
-        assert resp.status_code == 429
+        assert resp.status_code == 503
         assert resp.headers.get("retry-after") == "1"
+        assert resp.json()["error"]["code"] == "server_busy"
+
+    def test_second_request_queues_then_serves(self):
+        """Two concurrent requests against a 1-slot server: the second
+        WAITS for the slot (no instant error) and completes."""
+        import threading as _threading
+
+        release_first = _threading.Event()
+
+        def fake_submit(req: InferenceRequest) -> None:
+            def emit():
+                release_first.wait(timeout=5.0)
+                req.on_complete(req.request_id, [100, 101], "stop", None)
+            _threading.Thread(target=emit, daemon=True).start()
+
+        orch = MagicMock()
+        orch.submit_request.side_effect = fake_submit
+        server = LayerStoRmServer(
+            orchestrator=orch,
+            tokenizer=_mock_tokenizer(),
+            chat_template=_mock_chat_template(),
+            metadata=_metadata(),
+            model_name="test-model",
+            max_concurrent=1,
+            max_queued_requests=4,
+        )
+        client = TestClient(server.app)
+        results: dict[int, int] = {}
+
+        def post(i: int) -> None:
+            r = client.post("/v1/completions", json={
+                "model": "test-model", "prompt": "Hello",
+            })
+            results[i] = r.status_code
+
+        t1 = _threading.Thread(target=post, args=(1,))
+        t1.start()
+        # First request must be holding the slot before the second lands.
+        deadline = time.monotonic() + 5.0
+        while server._admission.active < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert server._admission.active == 1
+        t2 = _threading.Thread(target=post, args=(2,))
+        t2.start()
+        deadline = time.monotonic() + 5.0
+        while server._admission.queued < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert server._admission.queued == 1     # queued, NOT bounced
+        release_first.set()                       # both now complete
+        t1.join(timeout=10.0)
+        t2.join(timeout=10.0)
+        assert results == {1: 200, 2: 200}
+        assert server._admission.active == 0
+        assert server._admission.queued == 0
+
+    def test_admission_queue_fifo_and_disconnect(self):
+        """_AdmissionQueue unit semantics: FIFO grant order, overflow
+        fail-fast, and a queued waiter abandoning on client disconnect."""
+        import asyncio as _asyncio
+
+        from server.http_server import _AdmissionQueue
+
+        async def scenario():
+            q = _AdmissionQueue(max_concurrent=1, max_queued=2)
+            alive = _make_disconnect_fn(False)
+            dead = _make_disconnect_fn(True)
+
+            assert await q.acquire(alive) == "acquired"     # slot held
+            # Third-in-line beyond the queue bound fails fast.
+            w1 = _asyncio.ensure_future(q.acquire(alive))
+            await _asyncio.sleep(0.03)                      # w1 queued
+            w2 = _asyncio.ensure_future(q.acquire(alive))
+            await _asyncio.sleep(0.03)                      # w2 queued
+            assert await q.acquire(alive) == "full"
+            # Queue at capacity: even a doomed client is bounced fast.
+            assert await q.acquire(dead) == "full"
+            # Release → FIFO: w1 gets the slot, then w2.
+            q.release()
+            assert await w1 == "acquired"
+            assert not w2.done()
+            q.release()
+            assert await w2 == "acquired"
+            q.release()
+            assert q.active == 0 and q.queued == 0
+
+        _asyncio.run(scenario())
+
+    def test_queued_waiter_disconnect_abandons(self):
+        import asyncio as _asyncio
+
+        from server.http_server import _AdmissionQueue
+
+        async def scenario():
+            q = _AdmissionQueue(max_concurrent=1, max_queued=2)
+            alive = _make_disconnect_fn(False)
+            dead = _make_disconnect_fn(True)
+            assert await q.acquire(alive) == "acquired"
+            res = await q.acquire(dead)          # queued → client gone
+            assert res == "disconnected"
+            assert q.queued == 0                 # ticket removed
+            q.release()
+            assert q.active == 0
+
+        _asyncio.run(scenario())
+
+
+def _make_disconnect_fn(value: bool):
+    async def is_disconnected() -> bool:
+        return value
+    return is_disconnected
 
 
 # ---------------------------------------------------------------------------

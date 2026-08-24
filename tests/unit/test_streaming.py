@@ -811,3 +811,130 @@ class TestStreamingLogprobs:
                 continue
             for choice in json.loads(e)["choices"]:
                 assert "logprobs" not in choice
+
+
+# ---------------------------------------------------------------------------
+# Teardown contract (INV-SERVE-CANCEL, 2026-08-24 zombie-generation fix):
+# ANY generator exit while the orchestrator is still generating must call
+# cancel_fn — including GeneratorExit/aclose (how starlette actually tears
+# down an SSE response after a client disconnect: the generator is never
+# resumed, so a poll-only cancel never fires).  release_fn (admission slot)
+# runs on every exit.
+# ---------------------------------------------------------------------------
+
+class _FakeRequest:
+    def __init__(self, disconnected: bool = False) -> None:
+        self.disconnected = disconnected
+
+    async def is_disconnected(self) -> bool:
+        return self.disconnected
+
+
+def _cancel_recorder():
+    calls: list[int] = []
+    return calls, calls.append
+
+
+class TestStreamTeardownCancels:
+
+    def _gen(self, tq, raw, cancel_fn, release_fn, *, chat=False,
+             stop=None):
+        from server.streaming import (stream_chat_completion_response,
+                                      stream_completion_response)
+        kw = dict(
+            request_id=7,
+            response_id="cmpl-7",
+            model="m",
+            token_queue=tq,
+            tokenizer=_mock_tokenizer(),
+            eos_token_ids=(2,),
+            raw_request=raw,
+            cancel_fn=cancel_fn,
+            stop=stop,
+            prompt_tokens=3,
+            release_fn=release_fn,
+        )
+        if chat:
+            return stream_chat_completion_response(
+                tool_parser=None, **kw)
+        return stream_completion_response(**kw)
+
+    def test_aclose_mid_stream_cancels_and_releases(self):
+        """GeneratorExit (the real starlette disconnect path) cancels the
+        still-running generation and frees the slot."""
+        import asyncio
+
+        async def scenario(chat: bool):
+            tq = TokenQueue()
+            tq.push(7, 100)                      # generation in flight
+            cancels, cancel_fn = _cancel_recorder()
+            releases, release_fn = _cancel_recorder()
+            gen = self._gen(tq, _FakeRequest(), cancel_fn,
+                            lambda: release_fn(0), chat=chat)
+            await gen.__anext__()                # stream one chunk
+            await gen.aclose()                   # ASGI teardown
+            assert cancels == [7]
+            assert len(releases) == 1
+
+        asyncio.run(scenario(chat=False))
+        asyncio.run(scenario(chat=True))
+
+    def test_disconnect_poll_cancels_and_releases(self):
+        """The in-loop disconnect poll still works (idle stream, no chunk
+        in flight when the client vanishes)."""
+        import asyncio
+
+        async def scenario(chat: bool):
+            tq = TokenQueue()                    # no tokens, not done
+            cancels, cancel_fn = _cancel_recorder()
+            releases, release_fn = _cancel_recorder()
+            gen = self._gen(tq, _FakeRequest(disconnected=True), cancel_fn,
+                            lambda: release_fn(0), chat=chat)
+            chunks = [c async for c in gen]      # returns immediately
+            assert chunks == []
+            assert cancels == [7]
+            assert len(releases) == 1
+
+        asyncio.run(scenario(chat=False))
+        asyncio.run(scenario(chat=True))
+
+    def test_normal_completion_releases_without_cancel(self):
+        import asyncio
+
+        async def scenario(chat: bool):
+            tq = TokenQueue()
+            tq.push(7, 100)
+            tq.push(7, 101)
+            tq.mark_done(7, [100, 101], "stop")
+            cancels, cancel_fn = _cancel_recorder()
+            releases, release_fn = _cancel_recorder()
+            gen = self._gen(tq, _FakeRequest(), cancel_fn,
+                            lambda: release_fn(0), chat=chat)
+            chunks = [c async for c in gen]
+            assert chunks[-1] == "data: [DONE]\n\n"
+            assert cancels == []                 # done — nothing to cancel
+            assert len(releases) == 1
+
+        asyncio.run(scenario(chat=False))
+        asyncio.run(scenario(chat=True))
+
+    def test_stop_sequence_truncation_cancels_generation(self):
+        """Server-side stop truncation ends the RESPONSE — the engine
+        generation is still running and must be cancelled too."""
+        import asyncio
+
+        async def scenario(chat: bool):
+            tq = TokenQueue()
+            tq.push(7, 100)
+            tq.push(7, 101)                      # "Hello world" ⊃ "wor"
+            cancels, cancel_fn = _cancel_recorder()
+            releases, release_fn = _cancel_recorder()
+            gen = self._gen(tq, _FakeRequest(), cancel_fn,
+                            lambda: release_fn(0), chat=chat, stop="wor")
+            chunks = [c async for c in gen]
+            assert chunks[-1] == "data: [DONE]\n\n"
+            assert cancels == [7]                # queue not done → cancel
+            assert len(releases) == 1
+
+        asyncio.run(scenario(chat=False))
+        asyncio.run(scenario(chat=True))

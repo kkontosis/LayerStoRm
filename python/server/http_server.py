@@ -15,6 +15,7 @@ Streaming responses are deferred to #68 (SSE).
 from __future__ import annotations
 
 import asyncio
+import collections
 import itertools
 import json
 import logging
@@ -22,7 +23,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -367,6 +368,90 @@ class _RequestTracker:
 
 
 # ---------------------------------------------------------------------------
+# Admission: bounded FIFO queueing over the in-flight generation slot(s)
+# ---------------------------------------------------------------------------
+
+class _AdmissionQueue:
+    """Bounded FIFO admission over ``max_concurrent`` in-flight
+    generations (B=1 today — TD-SERVE-CONCURRENCY clamps to 1).
+
+    Excess requests WAIT in arrival order instead of erroring (README
+    serving contract: "concurrent requests queue" — agent harnesses fire
+    auxiliary title/summary requests during a long generation and must
+    not be bounced).  Only when more than ``max_queued`` requests are
+    already waiting does admission fail fast; the HTTP layer maps that to
+    503 + Retry-After.
+
+    A queued waiter polls its client's liveness (``is_disconnected``)
+    and abandons the queue when the client is gone — a dead client must
+    never consume the slot.  Waiters are also removed on task
+    cancellation (the ``except BaseException`` re-raise path).
+
+    Thread-safety: acquire() runs on the uvicorn event loop; release()
+    may be called from generator teardown or handler ``finally`` on the
+    same loop, but a plain threading.Lock keeps the counters safe from
+    any thread (10 ms polling, not wakeups, drives queued waiters — the
+    same cadence as the SSE token loop)."""
+
+    def __init__(self, max_concurrent: int, max_queued: int) -> None:
+        self._lock = threading.Lock()
+        self._max_active = max(0, int(max_concurrent))
+        self._max_queued = max(0, int(max_queued))
+        self._active = 0
+        self._waiters: collections.deque[object] = collections.deque()
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
+
+    @property
+    def queued(self) -> int:
+        with self._lock:
+            return len(self._waiters)
+
+    async def acquire(self, is_disconnected: Callable[[], Any]) -> str:
+        """Admit one request.  Returns "acquired" (slot held — caller
+        MUST release()), "full" (queue at capacity), or "disconnected"
+        (the waiting client went away)."""
+        ticket = object()
+        with self._lock:
+            if self._active < self._max_active and not self._waiters:
+                self._active += 1
+                return "acquired"
+            if len(self._waiters) >= self._max_queued:
+                return "full"
+            self._waiters.append(ticket)
+        try:
+            while True:
+                with self._lock:
+                    if (self._waiters and self._waiters[0] is ticket
+                            and self._active < self._max_active):
+                        self._waiters.popleft()
+                        self._active += 1
+                        return "acquired"
+                if await is_disconnected():
+                    self._remove(ticket)
+                    return "disconnected"
+                await asyncio.sleep(0.01)
+        except BaseException:            # CancelledError / GeneratorExit
+            self._remove(ticket)
+            raise
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active > 0:
+                self._active -= 1
+
+    def _remove(self, ticket: object) -> None:
+        with self._lock:
+            try:
+                self._waiters.remove(ticket)
+            except ValueError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Main server
 # ---------------------------------------------------------------------------
 
@@ -385,6 +470,7 @@ class LayerStoRmServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         max_concurrent: int = 32,
+        max_queued_requests: int = 16,
         max_sequence_length: int = 32768,
         tool_call_parser: str = "",
         enable_auto_tool_choice: bool = False,
@@ -449,8 +535,14 @@ class LayerStoRmServer:
             self._guided_manager = (
                 GuidedDecodingManager(hf, vocab)
                 if hf is not None and vocab > 0 else None)
-        self._concurrency_lock = threading.Lock()
-        self._active_requests = 0
+        # Admission (serving contract, 2026-08-24): up to max_concurrent
+        # in-flight generations; up to max_queued_requests more WAIT in
+        # FIFO order (queued waiters honor their client's disconnect);
+        # beyond that → 503 + Retry-After.  Streaming requests hold their
+        # slot for the WHOLE stream (released in the SSE generator's
+        # teardown), so the queue tracks real engine occupancy.
+        self._admission = _AdmissionQueue(max_concurrent,
+                                          max_queued_requests)
 
         self._server_thread: threading.Thread | None = None
         self._uvicorn_server: uvicorn.Server | None = None
@@ -517,15 +609,11 @@ class LayerStoRmServer:
         request: CompletionRequest,
         raw_request: Request,
     ) -> Response:
-        acquired = False
+        slot = await self._acquire_slot(raw_request)
+        if isinstance(slot, Response):
+            return slot
+        stream_owns_slot = False
         try:
-            acquired = await self._try_acquire_semaphore()
-            if not acquired:
-                return self._error_response(
-                    429, "Too many requests", code="rate_limit_exceeded",
-                    headers={"Retry-After": "1"},
-                )
-
             if isinstance(request.prompt, str):
                 prompt_ids = self._tokenizer.encode(request.prompt)
             else:
@@ -542,9 +630,11 @@ class LayerStoRmServer:
             max_tokens = request.max_tokens if request.max_tokens is not None else 0
 
             if request.stream:
-                return await self._stream_completions(
+                resp = await self._stream_completions(
                     request, raw_request, request_id, prompt_ids, max_tokens,
                 )
+                stream_owns_slot = True   # released in the SSE teardown
+                return resp
 
             pending = self._tracker.register(request_id)
             inf_req = InferenceRequest(
@@ -595,8 +685,8 @@ class LayerStoRmServer:
             ).model_dump())
 
         finally:
-            if acquired:
-                self._release_semaphore()
+            if not stream_owns_slot:
+                self._admission.release()
 
     def _thinking_enabled(self, request: ChatCompletionRequest) -> bool:
         """Effective thinking switch for this request.
@@ -770,15 +860,11 @@ class LayerStoRmServer:
         request: ChatCompletionRequest,
         raw_request: Request,
     ) -> Response:
-        acquired = False
+        slot = await self._acquire_slot(raw_request)
+        if isinstance(slot, Response):
+            return slot
+        stream_owns_slot = False
         try:
-            acquired = await self._try_acquire_semaphore()
-            if not acquired:
-                return self._error_response(
-                    429, "Too many requests", code="rate_limit_exceeded",
-                    headers={"Retry-After": "1"},
-                )
-
             err = self._tool_choice_error(request)
             if err is not None:
                 return err
@@ -804,10 +890,12 @@ class LayerStoRmServer:
             max_tokens = request.max_tokens if request.max_tokens is not None else 0
 
             if request.stream:
-                return await self._stream_chat_completions(
+                resp = await self._stream_chat_completions(
                     request, raw_request, request_id, prompt_ids, max_tokens,
                     guided_state,
                 )
+                stream_owns_slot = True   # released in the SSE teardown
+                return resp
 
             num_lp = self._chat_num_logprobs(request)
             pending = self._tracker.register(request_id)
@@ -890,8 +978,8 @@ class LayerStoRmServer:
             ).model_dump())
 
         finally:
-            if acquired:
-                self._release_semaphore()
+            if not stream_owns_slot:
+                self._admission.release()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -933,6 +1021,7 @@ class LayerStoRmServer:
             cancel_fn=_cancel,
             stop=request.stop,
             prompt_tokens=len(prompt_ids),
+            release_fn=self._admission.release,
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 
@@ -996,19 +1085,26 @@ class LayerStoRmServer:
             prompt_tokens=len(prompt_ids),
             reasoning_stream=reasoning_stream,
             tool_stream=tool_stream,
+            release_fn=self._admission.release,
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 
-    async def _try_acquire_semaphore(self) -> bool:
-        with self._concurrency_lock:
-            if self._active_requests >= self._max_concurrent:
-                return False
-            self._active_requests += 1
-            return True
-
-    def _release_semaphore(self) -> None:
-        with self._concurrency_lock:
-            self._active_requests -= 1
+    async def _acquire_slot(self, raw_request: Request) -> Response | None:
+        """Admit this request (bounded FIFO wait — see _AdmissionQueue).
+        None = slot held (caller must release, or hand off to the SSE
+        teardown); a Response = terminal answer (503 queue-full with
+        Retry-After, or 499 when the queued client disconnected)."""
+        slot = await self._admission.acquire(raw_request.is_disconnected)
+        if slot == "acquired":
+            return None
+        if slot == "full":
+            return self._error_response(
+                503,
+                "server busy: too many queued requests — retry shortly",
+                type_="server_error", code="server_busy",
+                headers={"Retry-After": "1"},
+            )
+        return Response(status_code=499)     # queued client went away
 
     async def _wait_for_result(
         self,
@@ -1016,19 +1112,27 @@ class LayerStoRmServer:
         pending: _PendingRequest,
         raw_request: Request,
     ) -> tuple[list[int], str] | None:
-        loop = asyncio.get_event_loop()
-        while True:
-            done = await loop.run_in_executor(
-                None, pending.event.wait, 0.1,
-            )
-            if done:
-                if pending.cancelled:
+        try:
+            loop = asyncio.get_event_loop()
+            while True:
+                done = await loop.run_in_executor(
+                    None, pending.event.wait, 0.1,
+                )
+                if done:
+                    if pending.cancelled:
+                        return None
+                    return (pending.token_ids, pending.finish_reason)
+                if await raw_request.is_disconnected():
+                    self._orchestrator.cancel_request(request_id)
+                    self._tracker.cancel(request_id)
                     return None
-                return (pending.token_ids, pending.finish_reason)
-            if await raw_request.is_disconnected():
-                self._orchestrator.cancel_request(request_id)
-                self._tracker.cancel(request_id)
-                return None
+        except asyncio.CancelledError:
+            # Handler task torn down (server shutdown / middleware
+            # timeout) while the engine is still generating — the
+            # generation must die with the request (INV-SERVE-CANCEL).
+            self._orchestrator.cancel_request(request_id)
+            self._tracker.cancel(request_id)
+            raise
 
     def _strip_eos(self, token_ids: list[int]) -> list[int]:
         eos = self._metadata.eos_token_ids

@@ -210,6 +210,13 @@ public:
         /// KV (already single-copy, INV-KVT-9) and at dcp == 1.
         bool replica_cold_dedup = true;
 
+        /// TD-KVT-ADMISSION-UPFRONT (cohort seam): maximum chunk rows a
+        /// blessed sparse prefill chunk may carry through materialize_row.
+        /// Sizes the pinned cohort selection staging (cohort_rows_max x
+        /// index_topk ints + cohort_rows_max lengths).  0 = cohort seam
+        /// disabled (materialize_row fails loud; legacy B==1 staging only).
+        int cohort_rows_max = 0;
+
         /// IndexShare full-layer mask, EXECUTOR semantics (DcpExecutor::
         /// Options::indexer_full_layers): layer l is FULL iff the mask is
         /// empty OR (l < size && mask[l]); layers beyond the mask (MTP) are
@@ -236,8 +243,14 @@ public:
     /// single-sequence).  Returns false when tiering must not engage this
     /// step (bad layer) — the caller then must NOT pass the hook to the
     /// executor.
+    /// `rows` > 1 (TD-KVT-ADMISSION-UPFRONT): the step is a blessed sparse
+    /// prefill CHUNK of `rows` consecutive positions [token_pos,
+    /// token_pos + rows) of ONE sequence, consumed per row through
+    /// materialize_row — token_pos is the FIRST row's write position (the
+    /// demote-legality frontier bound), the high-water mark advances by the
+    /// whole chunk.
     bool begin_layer(int layer, uint64_t seq_id, uint32_t token_pos,
-                     const int* const* host_block_tables);
+                     const int* const* host_block_tables, int rows = 1);
 
     /// Demote this layer's pages that fell fully behind the retention window
     /// (background D2H per rank on the D2H stream; page freed to the
@@ -336,6 +349,19 @@ public:
                      int batch_size, void* stream,
                      parallelism::TieredKvView* out) override;
 
+    /// TD-KVT-ADMISSION-UPFRONT: per-row cohort materialization for a
+    /// blessed sparse prefill chunk (begin_layer with rows > 1).  One
+    /// batched selection readback per (rank, layer) — IndexShare shared
+    /// layers reuse the host copy (selection_fresh == false, INV-KVT-6
+    /// identity: same seq/pos/rows) — then row slices classify/gather
+    /// through the same helper as the B==1 path (INV-KVT-1 placement-only).
+    /// Cohort rows never trigger the IndexShare lookahead prefetch.
+    bool materialize_row(int rank, int layer_idx, int row, int rows,
+                         const int* sparse_indices_dev,
+                         const int* topk_lengths_dev,
+                         bool selection_fresh, void* stream,
+                         parallelism::TieredKvView* out) override;
+
     void on_dense_layer(int layer_idx) override;
 
     // ── Introspection (tests, logging) ────────────────────────────────────
@@ -370,6 +396,10 @@ public:
         // TD-KVT-SPEC-FORK (re-promotion)
         uint64_t repromoted_pages = 0;  ///< cold pages re-promoted to VRAM
         uint64_t repromote_bytes = 0;   ///< H2D bytes across holding ranks
+        // TD-KVT-ADMISSION-UPFRONT (cohort seam)
+        uint64_t cohort_readbacks = 0;      ///< batched cohort selection D2Hs
+        uint64_t cohort_rows_tiered = 0;    ///< chunk rows consumed via a
+                                            ///< materialize_row fake view
     };
     const Stats& stats() const { return stats_; }
 
@@ -536,6 +566,8 @@ private:
         uint64_t seq = 0;
         uint32_t pos = 0;
         int n = 0;
+        int rows = 0;            ///< cohort rows held (0/1 = single-row;
+                                 ///< TD-KVT-ADMISSION-UPFRONT)
     };
 
     compute::DeviceBackend* backend(int rank) const;
@@ -559,6 +591,22 @@ private:
     int ensure_selection(int rank, int layer_idx,
                          const int* sparse_indices_dev,
                          const int* topk_lengths_dev, void* stream);
+    /// Cohort variant (TD-KVT-ADMISSION-UPFRONT): ONE batched D2H of the
+    /// whole chunk's selection (rows x index_topk indices + rows lengths)
+    /// into the cohort staging; IndexShare shared layers reuse the host copy
+    /// (selection_fresh == false + same (seq, pos, rows) — INV-KVT-6).
+    void ensure_cohort_selection(int rank, int layer_idx,
+                                 const int* sparse_indices_dev,
+                                 const int* topk_lengths_dev,
+                                 bool selection_fresh, void* stream);
+    /// Shared classify/burst/gather/view body over one row's host-resident
+    /// selection (h_idx, n rows): steps 1c-6 of the original materialize —
+    /// used by BOTH the B==1 path and materialize_row (INV-KVT-1: identical
+    /// placement machinery).  `seqlens_dev` is the device int the fake view
+    /// exposes as its per-row length (topk_lengths_dev [+ row]).
+    void materialize_selection(int rank, int layer_idx, const int* h_idx,
+                               int n, const int* seqlens_dev, void* stream,
+                               parallelism::TieredKvView* out);
     /// GLOBAL logical page a selection index maps to: idx/page_size under
     /// replicated KV (indices are global positions); under sharded KV the
     /// index is a rank-LOCAL slot — invert the round-robin chunk layout
@@ -621,6 +669,10 @@ private:
     uint64_t ctx_seq_ = 0;        ///< sequence of the current step (0 = none)
     int ctx_layer_ = -1;
     uint32_t ctx_pos_ = 0;        ///< token_pos of the current begin_layer
+    int ctx_rows_ = 1;            ///< chunk rows (1 = decode/B==1 step;
+                                  ///< TD-KVT-ADMISSION-UPFRONT cohorts > 1)
+    bool ctx_cold_valid_ = false; ///< cohort per-layer any-cold cache below
+    bool ctx_cold_ = false;       ///< layer ctx_layer_ has cold pages
     std::vector<const int*> ctx_host_bt_;  ///< per rank, this layer's row
 
     uint64_t tick_ = 0;

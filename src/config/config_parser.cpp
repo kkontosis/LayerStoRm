@@ -963,6 +963,8 @@ static KvTieringConfig parse_kv_tiering(const nlohmann::json& j) {
     r.hot_buffer_slots = get_or(j, "hot_buffer_slots", 0);
     r.host_to_device_ratio = get_or(j, "host_to_device_ratio", 8.0);
     r.replica_cold_dedup = get_or(j, "replica_cold_dedup", true);
+    r.tiered_prefill = get_or(j, "tiered_prefill", false);
+    r.admission_window_tokens = get_or(j, "admission_window_tokens", 0);
     return r;
 }
 
@@ -972,6 +974,8 @@ static nlohmann::json kv_tiering_to_json(const KvTieringConfig& r) {
     j["hot_buffer_slots"] = r.hot_buffer_slots;
     j["host_to_device_ratio"] = r.host_to_device_ratio;
     j["replica_cold_dedup"] = r.replica_cold_dedup;
+    j["tiered_prefill"] = r.tiered_prefill;
+    j["admission_window_tokens"] = r.admission_window_tokens;
     return j;
 }
 
@@ -2010,6 +2014,7 @@ static ServingConfig parse_serving(const nlohmann::json& j) {
     r.host = get_or(j, "host", std::string{"0.0.0.0"});
     r.port = get_or(j, "port", 8000);
     r.max_concurrent_requests = get_or(j, "max_concurrent_requests", 32);
+    r.max_queued_requests = get_or(j, "max_queued_requests", 16);
     r.max_sequence_length = get_or(j, "max_sequence_length", 32768);
     r.tokenizer_path = get_or(j, "tokenizer_path", std::string{"auto"});
     r.tool_call_parser = get_or(j, "tool_call_parser", std::string{""});
@@ -2026,6 +2031,7 @@ static nlohmann::json serving_to_json(const ServingConfig& r) {
     j["host"] = r.host;
     j["port"] = r.port;
     j["max_concurrent_requests"] = r.max_concurrent_requests;
+    j["max_queued_requests"] = r.max_queued_requests;
     j["max_sequence_length"] = r.max_sequence_length;
     j["tokenizer_path"] = r.tokenizer_path;
     j["tool_call_parser"] = r.tool_call_parser;
@@ -2675,6 +2681,8 @@ const char* field_name(FieldId id) {
         case FieldId::kMemoryKvTieringHotBufferSlots: return "memory.kv_tiering.hot_buffer_slots";
         case FieldId::kMemoryKvTieringHostToDeviceRatio: return "memory.kv_tiering.host_to_device_ratio";
         case FieldId::kMemoryKvTieringReplicaColdDedup: return "memory.kv_tiering.replica_cold_dedup";
+        case FieldId::kMemoryKvTieringTieredPrefill: return "memory.kv_tiering.tiered_prefill";
+        case FieldId::kMemoryKvTieringAdmissionWindowTokens: return "memory.kv_tiering.admission_window_tokens";
         case FieldId::kMemoryExpertCacheEvictionPolicy: return "memory.expert_cache.eviction_policy";
         case FieldId::kMemoryExpertCacheEvictionAlphaRecency: return "memory.expert_cache.eviction_alpha_recency";
         case FieldId::kMemoryExpertCacheEvictionBetaFrequency: return "memory.expert_cache.eviction_beta_frequency";
@@ -2875,6 +2883,7 @@ const char* field_name(FieldId id) {
         case FieldId::kServingHost: return "serving.host";
         case FieldId::kServingPort: return "serving.port";
         case FieldId::kServingMaxConcurrentRequests: return "serving.max_concurrent_requests";
+        case FieldId::kServingMaxQueuedRequests: return "serving.max_queued_requests";
         case FieldId::kServingMaxSequenceLength: return "serving.max_sequence_length";
         case FieldId::kServingTokenizerPath: return "serving.tokenizer_path";
         case FieldId::kServingToolCallParser: return "serving.tool_call_parser";

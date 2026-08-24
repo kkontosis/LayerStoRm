@@ -766,11 +766,18 @@ class Orchestrator:
         if req is None:
             return False
         if req.request_id in self._cancelled:
+            print(f"  [orch] request {req.request_id} cancelled while "
+                  f"queued", flush=True)
             self._finish(req, [], "cancelled")
             return True
         try:
             tokens, reason, stats, logprobs = self._generate(req)
         except _Cancelled:
+            # Observability (INV-SERVE-CANCEL e2e evidence): a cancelled
+            # generation must be visible server-side — the [orch-stats]
+            # line only prints for completed requests.
+            print(f"  [orch] request {req.request_id} cancelled "
+                  f"(client gone / response closed)", flush=True)
             self._finish(req, [], "cancelled")
             return True
         except BridgeError as e:
