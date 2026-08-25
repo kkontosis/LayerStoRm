@@ -86,53 +86,59 @@ originated here. The implementations are ours unless
 
 ## The I8 placement model *(ours)*
 
-Every MoE layer asks the same question: the router picked `N` experts, some
-already resident on some GPU, the rest in host RAM on a particular NUMA bank —
-which device should each one be fetched onto and computed on? The devices are
-not identical (5090s beside 5080s), the banks are not equidistant, and the
-answer changes every token.
+Every MoE layer, the router picks `N` experts. Some are already on a GPU, the
+rest are in host RAM on some NUMA bank. Which GPU should each one land on?
 
-I8 answers it by minimizing a hand-derived cost model over the assignment
-`j[·] : {1..N} → {1..M}`, where `G_j = { i : j[i] = j }`, `c_j = |G_j|`, and `P`
-is the set of participating devices:
+The devices aren't identical (5090s next to 5080s), the banks aren't
+equidistant, and the answer changes every token. So it's a solver. It minimizes
+this over the assignment `j[·]`:
 
 ```
-T(j[·]) =  Σ  subprep(i)                                            prep — NVMe→RAM, j-independent
-           i
+T(j) =  Σ subprep(i)                            [NVMe -> RAM staging]
+     +  max( makespan , egress )                [the real bottleneck]
+     +  max recon_overhead[j] + Σ recon_added[j]  [TP collective]
+     +  Σ place_cons[i, j[i]]                   [may be NEGATIVE]
+     +  Σ  Σ  evict_cons[j, u]                  [convex in n_j]
 
-        +  max (   max  [  Σ    subxfer(i) + a_j·c_j + b_j·⌈c_j/P_j⌉ ]      device makespan
-                   j∈P    i∈G_j                                            (ingest link + batched compute)
+where
 
-               ,   max  [    Σ        egress(i) ] · ( c_b + (1−c_b)/g_b )   bank egress floor
-                     b    i: bank(i)=b                                     (shared channel, contention c_b)
-                             uncached
-           )
+  makespan = max over devices j of
+               Σ subxfer(i) + a_j·c_j + b_j·ceil(c_j / P_j)
+               i on j
 
-        +  max  recon_overhead[j]  +  Σ  recon_added[j]              TP reconciliation
-           j∈P                       j∈P
-
-        +      Σ        place_cons[i, j[i]]                          placement consequence — MAY BE < 0
-           i: uncached
-
-        +  Σ     Σ        evict_cons[j, u]                           eviction consequence — convex in n_j
-           j∈P  u=1..n_j
+  egress   = max over banks b of
+               ( Σ egress(i) ) · ( c_b + (1 - c_b) / g_b )
+                 i from b, uncached
 ```
 
-Minimize `T` over `j[·]`. Everything else is either benchmarked per box or
-pushed by the orchestrator each token.
+Three things make it more than a sum of latencies:
 
-Three things make it more than a sum of latencies. Transfers contend on **two
-independent resource classes** — per-device ingest links and per-bank egress
-channels — so the bottleneck is the `max` of the two, never their sum. Compute
-carries a **batch step** `b_j·⌈c_j/P_j⌉`, not a linear `c·const`, so filling a
-device's batch is cheap and the `(P_j+1)`-th expert on it is not. And
-`evict_cons` is **convex** in the number of new experts landed on a device while
-`place_cons` may be **negative** — the one term that rewards an assignment,
-because a hot expert placed where it will be reused pays off on later tokens.
-Concentrate to fill a batch, spread to dodge evictions and share links; the
-optimum is where those balance, and it moves with the hardware.
+- **That `max` is two different resources.** Transfers contend on per-device
+  PCIe ingest *and* on per-bank memory channels. A bank's channel is drawn by
+  every fetch out of it no matter which GPU it targets — so the floor is the
+  busiest bank, not the sum. You take the larger, never both.
 
-Full derivation, term by term, with the solver's exact/DP/greedy tiers:
+- **Compute has a batch step, not a slope.** `a_j·c + b_j·ceil(c/P_j)` — filling
+  a device's batch is nearly free, the `(P_j+1)`-th expert costs a whole new
+  `b_j`. A linear `c·const` has no such structure and systematically
+  over-spreads.
+
+- **One term can be negative.** `place_cons` *rewards* putting a hot expert
+  where it'll be reused next token. Meanwhile evictions are convex — the `u`-th
+  eviction on a device costs more than the `(u−1)`-th. Concentrate to fill a
+  batch, spread to dodge evictions and share links. The optimum is wherever
+  those balance, and it moves with your hardware.
+
+`c_b` is the measured contention factor of each bank: at 1 the channel is
+strictly serial and the term collapses to the plain sum; at 0 it's fully
+parallel and spreading across `g_b` devices divides the floor by `g_b`.
+Calibration sets it per box, so the same code is inert on serial hardware and
+rewards spreading on parallel channels.
+
+Solved exactly where that's affordable — full enumeration under 2²² candidates,
+subset-partition DP at `N ≤ 5` — and LPT greedy beyond, always deterministic.
+
+Full derivation, term by term:
 **[docs/I8_PLACEMENT_MODEL.md](docs/I8_PLACEMENT_MODEL.md)**.
 
 ## Scope and limitations
