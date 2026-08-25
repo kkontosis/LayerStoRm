@@ -343,6 +343,21 @@ class ServeStack:
 
 
 def _import_engine() -> Any:
+    # NCCL SONAME collision: the engine module links the SYSTEM libnccl.so.2,
+    # while torch ships its own under nvidia/nccl/lib. Only one can serve a
+    # process — whichever loads first — so importing the engine first pins the
+    # system copy, and a torch newer than it then fails to resolve a symbol it
+    # needs (observed: `libtorch_cuda.so: undefined symbol: ncclCommResume`,
+    # torch 2.13 + bundled NCCL 2.29.7 against system NCCL 2.29.3). Nothing
+    # here imports torch, but the tokenizer does a few lines later
+    # (transformers pulls it inside from_pretrained), so the collision would
+    # hit at boot. Load torch FIRST when it is installed: its NCCL is the
+    # newer of the two and the engine is backward-compatible with it.
+    # Absent torch (no guided decoding) this is a no-op.
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
     try:
         import layerstorm_engine
     except ImportError as exc:

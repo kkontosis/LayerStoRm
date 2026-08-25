@@ -334,6 +334,25 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 xgrammar-guided `response_format` all work; see `RUN.md` for the serve recipe
 notes and the remaining env knobs.
 
+#### Troubleshooting
+
+**`undefined symbol: ncclCommResume` (or another `libnccl` symbol) at boot.**
+Two NCCLs are in play: the engine module links your *system* `libnccl.so.2`,
+while torch ships its own under `.venv/.../nvidia/nccl/lib`. Only one can serve
+a process — whichever loads first — so a torch newer than the system NCCL ends
+up bound to the older library and cannot find a symbol it needs.
+
+The serving path imports torch before the engine so this cannot happen. If you
+hit it in your own script or a test, do the same, or preload torch's copy:
+
+```sh
+LD_PRELOAD=$(.venv/bin/python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib', 'libnccl.so.2'))") \
+  .venv/bin/python your_script.py
+```
+
+The newer NCCL is backward compatible, so the engine runs fine against it.
+Installing a torch that matches your system NCCL works too, but pins you to it.
+
 ## License and attributions
 
 MIT License — see [LICENSE.md](LICENSE.md). Third-party notices are
