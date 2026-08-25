@@ -57,7 +57,7 @@ Throughput keeps moving: the measured byte-budget model of the B=1 wall puts the
 already-identified proposal stack at 10.7–12.4 tok/s with a ~17 tok/s ceiling on
 this hardware, and pushing toward it is active work.
 
-## Technologies
+## Engine internals
 
 - **SnapMLA** — near-lossless FP8 compressed-latent MLA attention kernels, SM120-native (644 B/token/layer — 44% below BF16).
 - **TurboQuant** — very efficient 4-bit KV-cache compression behind the same attention interface (386 B/token/layer, ~66% below BF16); composes with the other KV codecs per tier.
@@ -146,6 +146,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python=3.12
 uv pip install -r requirements.txt
 ```
+
+No `activate` step: `uv pip` picks up `./.venv` from the working directory, and
+every command below names the interpreter explicitly, so the flow works in a
+plain shell. `source .venv/bin/activate` if you prefer it anyway.
 
 `requirements.txt` covers building and serving. Two more sets are available:
 `requirements-dev.txt` (pytest + the end-to-end HTTP client, plus the optional
