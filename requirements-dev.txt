@@ -1,0 +1,15 @@
+# Tests and optional developer tooling.
+#
+#   uv pip install -r requirements.txt -r requirements-dev.txt
+#
+# Run the Python suites with:  .venv/bin/python -m pytest tests/unit -q
+
+-r requirements.txt
+
+pytest>=9.0.2
+httpx>=0.28.1             # HTTP client used by the serve end-to-end tests
+jsonschema>=4.26.0        # tests/validate_schema.sh (config/schema.json, Draft 2020-12)
+
+# Optional sampling profiler, handy on the serving loop:
+#   py-spy top --pid $(pgrep -f serve.py)
+# py-spy>=0.4.2

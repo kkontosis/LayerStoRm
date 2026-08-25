@@ -1,0 +1,16 @@
+# Offline tooling: hardware calibration, placement-solver training, expert
+# prediction (EPM) training, and reference/golden generation under tools/.
+# NOT needed to build or serve.
+#
+#   uv pip install -r requirements.txt -r requirements-tools.txt
+
+-r requirements.txt
+
+torch>=2.11.0             # tools/golden_ref, tools/elb_train reference math
+lightgbm>=4.7.0           # tools/elb_train stage-B / fusion models
+tokenizers>=0.22.2        # tools/elb_train corpus collection
+gguf>=0.19.0              # tools/mint_v4_hf_tokenizer.py
+
+# Optional: heatmap PNGs in tools/elb_train/metrics.py. The harness skips
+# plotting when it is missing and never requires it.
+# matplotlib>=3.9

@@ -98,9 +98,14 @@ Honest boundaries, as of today:
 
 > **Dependencies note:** release archives don't carry submodule contents — clone the sibling repos / CUTLASS listed in `.gitmodules` into their paths (or use `git clone --recurse-submodules` once published with resolvable URLs) before configuring.
 
-Toolchain: **CMake 3.25+, CUDA 12.8+, GCC with C++20, NCCL 2.20+**, pybind11 for
-the Python module; `libnuma` and `liburing` unlock NUMA pinning and the NVMe tier
+Toolchain: **CMake 3.25+, CUDA 12.8+, GCC with C++20, NCCL 2.20+, Node.js 18+,
+Python 3.10+**; `libnuma` and `liburing` unlock NUMA pinning and the NVMe tier
 (`nlohmann_json`/`spdlog`/CUTLASS are fetched automatically if absent).
+
+Node.js is **required to configure**, not optional: the config parser
+(`src/config/config_parser.{h,cpp}`) is generated from `config/schema.json` by
+`tools/gen_config.mjs`, and CMake looks for `node` at configure time. It needs
+no npm packages — only the interpreter.
 
 The kernel collections live in sibling repositories, wired in as submodules
 (`deps/LayerStoRmKernels`, `deps/LayerStoRmGemmKernels`,
@@ -109,14 +114,74 @@ The kernel collections live in sibling repositories, wired in as submodules
 ```sh
 git clone --recursive https://github.com/kkontosis/LayerStoRm.git
 cd LayerStoRm
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+```
+
+### If CUDA is not your system default
+
+With several CUDA versions installed, point the build at the one you want
+before configuring — CMake picks up `CUDACXX`, and the linker needs the
+matching runtime libraries:
+
+```sh
+export CUDACXX=/usr/local/cuda-13.1/bin/nvcc
+export PATH="/usr/local/cuda-13.1/bin:$PATH"
+export LIBRARY_PATH="/usr/local/cuda-13.1/targets/x86_64-linux/lib:$LIBRARY_PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-13.1/targets/x86_64-linux/lib:$LD_LIBRARY_PATH"
+```
+
+Skip this if `nvcc` on your `PATH` is already the version you intend to build
+with.
+
+### Python environment first
+
+Create the virtualenv **before** configuring CMake — the `layerstorm_engine`
+pybind11 module is built against it, and `find_package(pybind11)` resolves
+through the packages installed here. These examples use
+[uv](https://docs.astral.sh/uv/); `python -m venv` + `pip` works identically.
+
+```sh
+# install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv --python=3.12
+uv pip install -r requirements.txt
+```
+
+`requirements.txt` covers building and serving. Two more sets are available:
+`requirements-dev.txt` (pytest + the end-to-end HTTP client, plus the optional
+Cython hot path) and `requirements-tools.txt` (torch/LightGBM for the offline
+calibration, placement-solver and expert-prediction tooling under `tools/` —
+not needed to serve).
+
+Guided decoding (`--enable-auto-tool-choice`, JSON schema output) pulls
+`xgrammar`, and with it torch and triton — several GB. Drop that one line from
+`requirements.txt` if you only need plain completions; nothing else on the
+serving path imports torch.
+
+### Configure and build
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
+  -Dpybind11_DIR="$(.venv/bin/python -m pybind11 --cmakedir)"
 cmake --build build -j$(nproc)
+
+# command-ring hot path (Cython, built in place next to the bridge)
+.venv/bin/python python/bridge/build_fastbridge.py
+
 ./build/tests/unit/layerstorm_unit_tests     # optional sanity
 ```
 
-For serving you also need a Python 3.10+ venv with `fastapi`, `uvicorn`,
-`pydantic` (and `xgrammar` for guided decoding); the engine module is built by
-CMake (`LAYERSTORM_BUILD_PYTHON=ON`, the default).
+The two `-D` hints point CMake at the venv you just made; drop them if
+pybind11 is installed system-wide, or pass
+`-DLAYERSTORM_BUILD_PYTHON=OFF` to build the C++ engine alone (no serving).
+
+The `build_fastbridge.py` step compiles `bridge._fastbridge`, which removes
+the per-command ctypes overhead on the ~320 ring round-trips every decode step
+makes. Serving works without it — the bridge falls back to pure ctypes, and
+`bridge.ring_bridge.fastbridge_active()` reports which path is live — but the
+fallback is measurably slower, so build it unless you have a reason not to.
+Re-run it after changing the ring protocol.
 
 ## First steps (GLM-5.2 on a 4-GPU box)
 

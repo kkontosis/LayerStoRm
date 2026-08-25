@@ -1,0 +1,30 @@
+# LayerStoRm — Python packages needed to BUILD and SERVE.
+#
+#   uv venv --python=3.12
+#   uv pip install -r requirements.txt
+#
+# Create the venv BEFORE configuring CMake: the engine's pybind11 module is
+# found through this environment (see README "Building").
+#
+# Versions are floors matching the environment this tree is developed and
+# tested against, not upper-bound pins — except xgrammar, whose structural-tag
+# API this codebase targets exactly.
+
+# ── build ────────────────────────────────────────────────────────────────────
+pybind11>=3.0.2           # CMake package for the layerstorm_engine module
+cython>=3.2.9             # command-ring hot path (python/bridge/build_fastbridge.py)
+setuptools>=81.0.0        # ditto (build backend for that extension)
+
+# ── serving ──────────────────────────────────────────────────────────────────
+fastapi>=0.136.1          # OpenAI-compatible HTTP surface
+uvicorn>=0.46.0           # ASGI server
+pydantic>=2.13.3          # request/response models
+transformers>=5.15.0      # tokenizer (AutoTokenizer); pulls tokenizers, safetensors
+jinja2>=3.1.6             # chat templates
+numpy>=2.5.2              # orchestrator state/verifier math
+
+# ── guided decoding (tool calls, JSON schema) ────────────────────────────────
+# Required by --enable-auto-tool-choice / response_format. Pulls torch +
+# triton (multi-GB): drop this line if you only need plain completions —
+# nothing else in the serving path imports torch.
+xgrammar==0.2.3
