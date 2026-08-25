@@ -540,7 +540,7 @@ Each of these shaped a subsystem that ships:
 - [SnapMLA: Efficient Long-Context MLA Decoding via Hardware-Aware FP8 Quantized Pipelining](https://arxiv.org/abs/2602.10718) — Zhang, Su, Hu, Yang et al., 2026 — FP8 compressed-latent decoding with the RoPE slice kept BF16
 - [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) — Zandieh et al., 2025 — the 4-bit KV codec
 - [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) — Kwon et al., 2023 — paged KV with copy-on-write forks
-- [HiSparse: Hierarchical Sparse Attention](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/hisparse_guide.md) — SGLang project documentation (design note, not a paper) — sparse-guided hot-VRAM / pinned-host KV tiering
+- [HiSparse: Scaling Sparse-Attention Decoding with Hierarchical KV Cache Management](https://arxiv.org/abs/2608.07009) — Xie, Huang, Huang, Xu, Ma, Kozyrakis, 2026 — sparse-guided hot-VRAM / pinned-host KV tiering ([SGLang implementation guide](https://docs.sglang.io/docs/advanced_features/hisparse_guide))
 - DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation — Cheng, Yu, Shao, Li, Xiong et al. — the speculative decode arm
 - [PreScope: Unleashing the Power of Prefetching for Resource-Constrained MoE Inference](https://arxiv.org/abs/2509.23638) — Yu, Zhang, Dong et al., 2025 — gating lookahead behind the expert prefetch predictor
 - [MoE-SpeQ: Speculative Quantized Decoding with Proactive Expert Prefetching and Offloading](https://arxiv.org/abs/2511.14102) — 2025 — the expert-prediction model
