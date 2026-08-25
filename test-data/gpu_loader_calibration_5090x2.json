@@ -1,0 +1,277 @@
+{
+  "banks": [
+    {
+      "contention": 0.1952135408306397,
+      "cpu_affinity_node": -1,
+      "egress_us": 577.888011932373,
+      "is_hbm": false,
+      "node": 0
+    },
+    {
+      "contention": 0.2391809909611038,
+      "cpu_affinity_node": -1,
+      "egress_us": 596.9600081443787,
+      "is_hbm": false,
+      "node": 1
+    },
+    {
+      "contention": 0.6150774234561638,
+      "cpu_affinity_node": -1,
+      "egress_us": 440.95999002456665,
+      "is_hbm": false,
+      "node": 2
+    },
+    {
+      "contention": 0.6070092169862187,
+      "cpu_affinity_node": -1,
+      "egress_us": 441.0560131072998,
+      "is_hbm": false,
+      "node": 3
+    },
+    {
+      "contention": 0.03897922741639692,
+      "cpu_affinity_node": 0,
+      "egress_us": 591.6479825973511,
+      "is_hbm": true,
+      "node": 4
+    },
+    {
+      "contention": 0.048680435270424205,
+      "cpu_affinity_node": 1,
+      "egress_us": 587.552011013031,
+      "is_hbm": true,
+      "node": 5
+    },
+    {
+      "contention": 0.015383124204605192,
+      "cpu_affinity_node": 2,
+      "egress_us": 440.8000111579895,
+      "is_hbm": true,
+      "node": 6
+    },
+    {
+      "contention": 0.011646381805979322,
+      "cpu_affinity_node": 3,
+      "egress_us": 441.0560131072998,
+      "is_hbm": true,
+      "node": 7
+    }
+  ],
+  "compute_K": 6144,
+  "compute_N": 4096,
+  "compute_tokens": 1,
+  "contention": [
+    {
+      "bank": 0,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 750.4074732462565,
+      "factor": 1.1952135408306397,
+      "solo_us": 721.2479710578918
+    },
+    {
+      "bank": 1,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 741.377067565918,
+      "factor": 1.2391809909611038,
+      "solo_us": 708.5760235786438
+    },
+    {
+      "bank": 2,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 734.9205017089844,
+      "factor": 1.6150774234561638,
+      "solo_us": 498.4639883041382
+    },
+    {
+      "bank": 3,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 732.8831990559896,
+      "factor": 1.6070092169862187,
+      "solo_us": 483.0079972743988
+    },
+    {
+      "bank": 4,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 739.0687942504883,
+      "factor": 1.038979227416397,
+      "solo_us": 726.1760234832764
+    },
+    {
+      "bank": 5,
+      "config": 2,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 743.4911727905273,
+      "factor": 1.0486804352704242,
+      "solo_us": 733.1839799880981
+    },
+    {
+      "bank": 6,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 527.4143854777018,
+      "factor": 1.0153831242046052,
+      "solo_us": 519.4240212440491
+    },
+    {
+      "bank": 7,
+      "config": 1,
+      "device_a": 0,
+      "device_b": 1,
+      "dual_us": 506.7296028137207,
+      "factor": 1.0116463818059793,
+      "solo_us": 500.8959770202637
+    }
+  ],
+  "devices": [
+    {
+      "compute": {
+        "P": 64,
+        "a_us": 13.843628983397496,
+        "b_us": 61.5318041301234
+      },
+      "name": "NVIDIA GeForce RTX 5090",
+      "numa_node": 3,
+      "position": 0,
+      "recon_added_us": 2.0319996401667595,
+      "recon_overhead_us": 11.42400037497282,
+      "uuid": "GPU-11ce54c2-ef9f-197f-a5da-179a27928d4",
+      "xfer_lat_us": 1.4720000326633453
+    },
+    {
+      "compute": {
+        "P": 64,
+        "a_us": 13.883039850201756,
+        "b_us": 62.45481276559903
+      },
+      "name": "NVIDIA GeForce RTX 5090",
+      "numa_node": 2,
+      "position": 1,
+      "recon_added_us": 2.0319996401667595,
+      "recon_overhead_us": 11.42400037497282,
+      "uuid": "GPU-0bb7512a-f3dc-fb8d-ad30-84fc27f76f3",
+      "xfer_lat_us": 1.5040000434964895
+    }
+  ],
+  "expert_bytes": 24772992.0,
+  "fixed_overhead_us": 0.0,
+  "matrix": [
+    [
+      {
+        "lat_us": 1.567999948747456,
+        "rate_us": 702.6879787445068,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.5040000434964895,
+        "rate_us": 577.888011932373,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.567999948747456,
+        "rate_us": 596.9600081443787,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.5040000434964895,
+        "rate_us": 710.1759910583496,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.567999948747456,
+        "rate_us": 498.30400943756104,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.5360000543296337,
+        "rate_us": 440.95999002456665,
+        "tier": 1
+      }
+    ],
+    [
+      {
+        "lat_us": 1.5360000543296337,
+        "rate_us": 441.0560131072998,
+        "tier": 1
+      },
+      {
+        "lat_us": 1.567999948747456,
+        "rate_us": 494.3999946117401,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.6319999704137444,
+        "rate_us": 724.9919772148132,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.6639999812468886,
+        "rate_us": 591.6479825973511,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 2.655999967828393,
+        "rate_us": 587.552011013031,
+        "tier": 2
+      },
+      {
+        "lat_us": 2.655999967828393,
+        "rate_us": 735.1999878883362,
+        "tier": 2
+      }
+    ],
+    [
+      {
+        "lat_us": 1.4720000326633453,
+        "rate_us": 518.7199711799622,
+        "tier": 2
+      },
+      {
+        "lat_us": 1.5040000434964895,
+        "rate_us": 440.8000111579895,
+        "tier": 1
+      }
+    ],
+    [
+      {
+        "lat_us": 1.567999948747456,
+        "rate_us": 441.0560131072998,
+        "tier": 1
+      },
+      {
+        "lat_us": 1.5360000543296337,
+        "rate_us": 500.86402893066406,
+        "tier": 2
+      }
+    ]
+  ],
+  "ncf": [
+    0.0,
+    1.0,
+    1.3680871477272682
+  ],
+  "num_banks": 8,
+  "num_devices": 2,
+  "recon_payload_bytes": 12288.0,
+  "source": "calibrated",
+  "version": 2
+}

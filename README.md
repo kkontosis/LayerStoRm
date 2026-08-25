@@ -314,6 +314,35 @@ exact config behind the headline numbers. Adapt these to your box:
 
 ### 5. Serve
 
+The champion recipe reads three things out of `test-data/`. If you jumped
+straight here, this is what it needs:
+
+**The GGUF weights**, in `test-data/GLM-5.2-GGUF-Q4_K_XL/` (step 1):
+
+```sh
+hf download unsloth/GLM-5.2-GGUF --include "UD-Q4_K_XL/*" \
+    --local-dir test-data/GLM-5.2-GGUF
+ln -s GLM-5.2-GGUF/UD-Q4_K_XL test-data/GLM-5.2-GGUF-Q4_K_XL
+```
+
+**The prepacked experts**, in `test-data/GLM-5.2-prepacked/` (step 1) — the
+recipe streams experts from there, not from the GGUF.
+
+**A loader calibration**, which must sit **inside the weights directory**:
+`gpu_loader.calibration_path` is resolved relative to the weights dir, so the
+recipe's `gpu_loader_calibration_ep4x4.json` means
+`test-data/GLM-5.2-GGUF-Q4_K_XL/gpu_loader_calibration_ep4x4.json`. Steps 2-3
+fit one for your box. To try the recipe immediately without that detour, copy
+the ones shipped in `test-data/`:
+
+```sh
+cp test-data/gpu_loader_calibration*.json test-data/GLM-5.2-GGUF-Q4_K_XL/
+```
+
+They were fit on the reference box (2×RTX 5090 + 2×RTX 5080, HBM NUMA banks);
+they will boot anywhere but the placement decisions only reflect that hardware,
+so regenerate them for real deployments.
+
 ```sh
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1,2,3 \
 LAYERSTORM_DETERMINISTIC_EP_COMBINE=1 LAYERSTORM_DETERMINISTIC_EP_COMBINE_PRECISION=bf16 \
