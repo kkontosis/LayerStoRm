@@ -479,6 +479,7 @@ Each of these shaped a subsystem that ships:
 - DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation — Cheng, Yu, Shao, Li, Xiong et al. — the speculative decode arm
 - [PreScope: Unleashing the Power of Prefetching for Resource-Constrained MoE Inference](https://arxiv.org/abs/2509.23638) — Yu, Zhang, Dong et al., 2025 — gating lookahead behind the expert prefetch predictor
 - [MoE-SpeQ: Speculative Quantized Decoding with Proactive Expert Prefetching and Offloading](https://arxiv.org/abs/2511.14102) — 2025 — the expert-prediction model
+- [SP-MoE: Speculative Decoding and Prefetching for Accelerating MoE-based Model Inference](https://arxiv.org/abs/2510.10302) — 2025 — planning verification's expert transfers from the draft's gating weights
 - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) — DeepSeek-AI, 2024 — the MLA + MoE architecture served here
 - [GLM-5: from Vibe Coding to Agentic Engineering](https://arxiv.org/abs/2602.15763) — GLM-5 Team, 2026 — the primary target model
 
@@ -500,7 +501,6 @@ Read while designing the above; not implemented here.
 - [fMoE: Fine-Grained Expert Offloading for Large Mixture-of-Experts Serving](https://arxiv.org/abs/2502.05370) — Yu et al., 2025
 - [DALI: A Workload-Aware Offloading Framework for Efficient MoE Inference on Local PCs](https://arxiv.org/abs/2602.03495) — 2026
 - [PROBE: Co-Balancing Computation and Communication in MoE Inference via Real-Time Predictive Prefetching](https://arxiv.org/abs/2602.00509) — 2026
-- [SP-MoE: Speculative Decoding and Prefetching for Accelerating MoE-based Model Inference](https://arxiv.org/abs/2510.10302) — 2025
 - [KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models](https://doi.org/10.1145/3731569.3764843) — Chen, Xie, Zhang et al., 2025
 
 **Speculative decoding, early exit and layer skipping**
