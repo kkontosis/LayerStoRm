@@ -2330,16 +2330,30 @@ private:
     /// Pool::kIndexerK per computing layer (IndexShare full ∪ layer 0); the
     /// HOST table of device page base pointers is handed to DcpExecutor via
     /// AttentionExecParams ([batch * batch_stride + layer * page_stride +
-    /// logical_page]). Freed with the sequence. Returns false on pool
-    /// exhaustion (producer falls back: B==1 arena, B>1 dense — never an
-    /// error).
+    /// logical_page]). Freed with the sequence.
+    ///
+    /// TD-INDEXER-POOL-EVICT: the failure REASON is part of the contract.
+    /// kUnavailable (beyond the serving window, bad slot, dcp mismatch) is
+    /// permanent for this shape — the producer downgrades (B==1 arena, B>1
+    /// dense) exactly as before. kExhausted is TRANSIENT CAPACITY: the pool
+    /// is merely full of OTHER live sequences (prefix-cache holders pin a
+    /// CoW frontier page group each), so the caller may surface it as a
+    /// RETRYABLE pool-exhaustion error and let the orchestrator evict a
+    /// holder and re-issue, instead of silently pinning the sequence dense.
     // Debug/test-only checkpoint (CMD_SEQ_SNAPSHOT/RESTORE) — see
     // dispatch_lifecycle.cpp for the file format.
     void handle_seq_snapshot(const ipc::Command& cmd);
     void handle_seq_restore(const ipc::Command& cmd);
 
-    bool ensure_indexer_pages(uint64_t seq_id, uint32_t token_pos,
-                              int batch_slot, int dcp_size);
+    enum class IndexerPageResult : uint8_t {
+        kOk = 0,          ///< every requested (page, layer, rank) provisioned
+        kExhausted,       ///< Pool::kIndexerK had no free page — RETRYABLE
+        kUnavailable,     ///< beyond serving window / bad slot / no allocator
+    };
+
+    IndexerPageResult ensure_indexer_pages(uint64_t seq_id,
+                                           uint32_t token_pos,
+                                           int batch_slot, int dcp_size);
 
     /// ── V4-7b (ticket H): per-seq V4 side-tier pages ─────────────────────
     /// kSwa: ONE ring page per layer (window == page_tokens ⇒ decode-exact);

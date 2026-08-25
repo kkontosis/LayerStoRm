@@ -412,6 +412,62 @@ def test_prefix_cache_disabled_parity():
             _finish(daemon)
 
 
+def test_prefill_evicts_holder_on_indexer_pool_exhaustion():
+    """TD-INDEXER-POOL-EVICT: kIndexerK exhaustion DURING PREFILL is pool
+    pressure, not a request failure. The engine fail-closes the step (a
+    dense downgrade would punch a permanent hole in the sequence's indexer
+    coverage and, on a KV-demoted sequence, force a full cold-page
+    re-promotion — the 2026-08-24 serving incident); the orchestrator
+    answers by freeing a prefix holder, whose indexer pages die with its
+    sequence, and re-issuing the identical step."""
+    orch, daemon = _orch_pc()
+    try:
+        s1, s2 = _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=chain(11, 130), max_tokens=8,
+            on_token=s1.on_token, on_complete=s1.on_complete))
+        assert len(orch.prefix_cache._entries) == 1      # holder retained
+
+        # The pool stays exhausted until ONE more sequence is freed — i.e.
+        # until a holder is evicted (the working sequence is still alive).
+        daemon.indexer_exhaust_until_frees = daemon.seq_frees + 1
+
+        prompt_b = chain(500, 130)                       # different prefix
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=prompt_b, max_tokens=8,
+            on_token=s2.on_token, on_complete=s2.on_complete))
+
+        # Rejected, then served — token-identical to an uncached run.
+        assert daemon.indexer_exhaust_rejects >= 1
+        assert orch.prefix_cache.evictions >= 1
+        assert orch._pool_evict_retries >= 1
+        assert s2.done[2] == "length"
+        assert s2.done[1] == chain(prompt_b[-1], 8)
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_prefill_pool_exhaustion_reraises_when_nothing_evictable():
+    """The retry is bounded by what is actually reclaimable: with no holder
+    left to free, the exhaustion surfaces as the request error it is —
+    never an infinite evict/retry spin."""
+    orch, daemon = _orch_pc()
+    try:
+        s = _Sink()
+        daemon.indexer_exhaust_until_frees = 10**6      # never satisfiable
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=chain(11, 130), max_tokens=8,
+            on_token=s.on_token, on_complete=s.on_complete))
+        assert s.done[2] == "error", s.done
+        assert daemon.indexer_exhaust_rejects >= 1
+        # No holder existed yet (registration happens mid-prefill, after the
+        # first chunk), so nothing was evictable and the retry did not spin.
+        assert orch._pool_evict_retries == 0
+    finally:
+        _finish(daemon)
+
+
 def test_seq_create_evicts_holder_at_admission():
     """Evict-at-admission (regression-hunt 2026-08-23 finding (b)): a
     retained prefix holder pins its pages; a NEW (different-prompt)
@@ -1090,5 +1146,200 @@ def test_guided_logprobs_report_raw_distribution():
         assert lp.top_logprobs[0].token_id == ref[2]
         assert lp.top_logprobs[0].logprob == pytest.approx(1.0 - lse)
         assert len(sink.done_lp) == 8
+    finally:
+        _finish(daemon)
+
+
+# ── spec→plain fallback (INV-SERVE-SPEC-FALLBACK): a DRAFT-side dspark
+# failure mid-request (drafting-context invalidation, TD-DSPARK-CTX-CAP
+# class) must never fail the request — the orchestrator switches the live
+# request onto the plain arm at the round boundary and the stream
+# continues, token-lossless.  The FakeDaemon scripts the engine's sticky
+# invalidation via dspark_fail_from. ───────────────────────────────────────
+
+
+def test_spec_fallback_mid_request_lossless_stream():
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 2              # rounds 1-2 draft, round 3 dies
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=41, prompt_token_ids=[4321], max_tokens=24,
+            on_token=sink.on_token, on_complete=sink.on_complete))
+        rid, tokens, reason = sink.done
+        assert reason == "length", "fallback must not error the request"
+        assert tokens == chain(4321, 24), "fallback lost token identity"
+        assert sink.tokens == tokens, "on_token stream != final tokens"
+        st = orch.last_stats
+        assert st.spec_fallback_round == 3
+        assert st.proposed > 0                    # rounds 1-2 speculated
+        # The failing send is the LAST dspark ever issued for the request:
+        # the remainder decodes plain (sticky, no per-round retry storm).
+        assert daemon.dspark_calls == 3
+        assert not orch._draft_ctx_valid          # mirror pessimised
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_spec_fallback_from_first_round():
+    """Context already invalid at request start (unmirrored — e.g. a
+    stale adoption mirror): round 1's draft dies, the whole request
+    decodes plain, lossless."""
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 0
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=42, prompt_token_ids=[4321], max_tokens=16,
+            on_token=sink.on_token, on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "length"
+        assert tokens == chain(4321, 16)
+        st = orch.last_stats
+        assert st.spec_fallback_round == 1 and st.proposed == 0
+        assert daemon.dspark_calls == 1
+    finally:
+        _finish(daemon)
+
+
+def test_spec_fallback_honors_eos_stop():
+    ref = chain(4321, 24)
+    eos_tok = ref[9]
+    orch, daemon = _orch(eos=(eos_tok,))
+    daemon.dspark_fail_from = 0              # fall back at round 1
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=43, prompt_token_ids=[4321], max_tokens=0,
+            on_token=sink.on_token, on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "stop"
+        assert tokens == ref[:10], "must stop AT the EOS token"
+        assert sink.tokens == tokens
+        assert orch.last_stats.spec_fallback_round == 1
+    finally:
+        _finish(daemon)
+
+
+def test_spec_fallback_never_surfaces_error_to_caller():
+    """The TD-SERVE-ERROR-MASKING error channel stays SILENT on a
+    draft-side failure: error == '' and finish_reason is normal."""
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 1
+    try:
+        sink = _ErrSink()
+        _serve(orch, InferenceRequest(
+            request_id=44, prompt_token_ids=[4321], max_tokens=12,
+            on_complete=sink.on_complete))
+        assert sink.done[2] == "length"
+        assert sink.error == ""
+        assert sink.done[1] == chain(4321, 12)
+    finally:
+        _finish(daemon)
+
+
+def test_spec_fallback_pessimises_mirror_then_full_prefill_rearms():
+    """Cross-request semantics: after a fallback, a prefix-FORKED
+    successor must route plain upfront (the engine context is dead and a
+    fork never feeds position 0), while a later FULL-prefill request
+    re-arms drafting (position-0 capture) and speculates again."""
+    prompt = chain(11, 130)                  # holder registers at 128
+    orch, daemon = _orch_pc()
+    daemon.dspark_fail_from = 0
+    try:
+        s1, s2, s3 = _Sink(), _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=8,
+            on_complete=s1.on_complete))
+        assert orch.last_stats.spec_fallback_round == 1
+        assert daemon.dspark_calls == 1
+        assert s1.done[1] == chain(prompt[-1], 8)
+        # Forked successor: prefix hit at 128, mirror invalid → plain
+        # upfront, ZERO dspark sends (no round-1 error round).
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=prompt, max_tokens=8,
+            on_complete=s2.on_complete))
+        assert orch.last_stats.prefix_hit_tokens == 128
+        assert orch.last_stats.proposed == 0
+        assert orch.last_stats.spec_fallback_round == 0
+        assert daemon.dspark_calls == 1              # unchanged
+        assert s2.done[1] == s1.done[1]
+        # Full-prefill request: position-0 capture re-arms the engine
+        # context (scripted: the daemon accepts drafts again) and the
+        # mirror re-validates — speculation is BACK.
+        daemon.dspark_fail_from = None
+        _serve(orch, InferenceRequest(
+            request_id=3, prompt_token_ids=chain(500, 10), max_tokens=8,
+            on_complete=s3.on_complete))
+        assert daemon.dspark_calls > 1
+        assert orch.last_stats.proposed > 0
+        assert orch._draft_ctx_valid
+        assert s3.done[1] == chain(chain(500, 10)[-1], 8)
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_ctx_cap_guard_routes_long_prompt_plain():
+    """TD-DSPARK-CTX-CAP start-time mirror (landed 8aa4c39b, kept as a
+    contract): a prompt whose context (+ one drafting round) overflows
+    the draft arena cap routes to the PLAIN arm upfront — zero dspark
+    sends, token-identical output."""
+    bridge, daemon, _ = _make(gamma=5, use_far=True)
+    orch = Orchestrator(
+        bridge, metadata=_meta(),
+        speculation=SpeculationConfig(enabled=True, gamma=5,
+                                      conf_thresh=0.0, ctx_cap_tokens=64))
+    try:
+        sink = _Sink()
+        prompt = chain(11, 130)              # 130 + 5 + 1 > 64
+        _serve(orch, InferenceRequest(
+            request_id=45, prompt_token_ids=prompt, max_tokens=8,
+            on_token=sink.on_token, on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "length"
+        assert tokens == chain(prompt[-1], 8)
+        assert daemon.dspark_calls == 0          # plain from the start
+        assert orch.last_stats.proposed == 0
+        assert orch.last_stats.spec_fallback_round == 0
+    finally:
+        _finish(daemon)
+
+
+def test_guided_spec_fallback_matches_guided_plain():
+    """Guided arm: a mid-request draft death continues the constrained
+    decode (matcher state carries over) — output identical to the guided
+    PLAIN arm, including grammar repairs past the cut."""
+    ref = chain(4321, 40)
+    banned = {ref[5], ref[17], ref[29]}
+    results = []
+    for fail_from in (None, 1):
+        orch, daemon = _orch()
+        daemon.dspark_fail_from = fail_from
+        try:
+            sink = _serve_guided(orch, FakeGuided(banned=banned),
+                                 max_tokens=40,
+                                 force_plain=(fail_from is None))
+            results.append(sink.done[1])
+            if fail_from is not None:
+                assert orch.last_stats.spec_fallback_round >= 1
+                assert daemon.dspark_calls == fail_from + 1
+            assert not daemon.errors, daemon.errors
+        finally:
+            _finish(daemon)
+    assert results[0] == results[1] == guided_chain(4321, 40, banned)
+
+
+def test_guided_spec_fallback_completion_stops_with_tool_calls():
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 0
+    try:
+        sink = _serve_guided(orch, FakeGuided(complete_after=7),
+                             max_tokens=100)
+        _, tokens, reason = sink.done
+        assert reason == "tool_calls"
+        assert tokens == chain(4321, 7)
+        assert orch.last_stats.spec_fallback_round == 1
     finally:
         _finish(daemon)

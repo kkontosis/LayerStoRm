@@ -85,6 +85,15 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
     const size_t row = static_cast<size_t>(opts_.stride_row);
     const size_t blk = static_cast<size_t>(opts_.stride_block);
 
+    // TD-KVT-COHORT-BATCHED-MATERIALIZE: union-arm gates, read BEFORE the
+    // per-rank allocation (the kill-switch skips the union staging).
+    if (const char* rw = std::getenv("LS_KVT_COHORT_ROWWISE"))
+        cohort_rowwise_ = (*rw == '1');
+    union_cap_ = (!cohort_rowwise_ && opts_.cohort_rows_max > 1
+                  && opts_.union_rows_max > 0)
+        ? opts_.union_rows_max : 0;
+    u_pages_cap_ = union_cap_ > 0 ? (union_cap_ + PS - 1) / PS : 0;
+
     ranks_.resize(R);
     cache_.assign(R, {});
     ctx_host_bt_.assign(R, nullptr);
@@ -124,13 +133,21 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
         auto& rb = ranks_[r];
 
         // ── Device buffers ──
-        rb.scratch       = be->device_alloc(static_cast<size_t>(n_fake_pages_) * blk);
         rb.row_cache     = be->device_alloc(static_cast<size_t>(opts_.kv_layers)
                                             * hot_slots_ * row);
-        rb.cold_incoming = be->device_alloc(static_cast<size_t>(ITK) * row);
-        rb.dev_src_ptrs  = be->device_alloc(static_cast<size_t>(ITK) * sizeof(void*));
-        rb.dev_scatter_ptrs = be->device_alloc(static_cast<size_t>(ITK) * sizeof(void*));
-        rb.dev_scatter_idx  = be->device_alloc(static_cast<size_t>(ITK) * sizeof(int));
+        for (auto& ms : rb.mat) {
+            ms.scratch       = be->device_alloc(static_cast<size_t>(n_fake_pages_) * blk);
+            ms.cold_incoming = be->device_alloc(static_cast<size_t>(ITK) * row);
+            ms.dev_src_ptrs  = be->device_alloc(static_cast<size_t>(ITK) * sizeof(void*));
+            ms.dev_scatter_ptrs = be->device_alloc(static_cast<size_t>(ITK) * sizeof(void*));
+            ms.dev_scatter_idx  = be->device_alloc(static_cast<size_t>(ITK) * sizeof(int));
+            if (!ms.scratch || !ms.cold_incoming || !ms.dev_src_ptrs
+                || !ms.dev_scatter_ptrs || !ms.dev_scatter_idx) {
+                throw std::runtime_error(
+                    "KvTieringManager: device_alloc failed (rank "
+                    + std::to_string(r) + ")");
+            }
+        }
         rb.dev_ident_indices = be->device_alloc(static_cast<size_t>(ITK) * sizeof(int));
         rb.dev_fake_bt = be->device_alloc(
             static_cast<size_t>(n_fake_pages_) * sizeof(int));
@@ -139,8 +156,7 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
             be->device_alloc(static_cast<size_t>(ITK) * sizeof(void*));
         rb.dev_pf_scatter_idx =
             be->device_alloc(static_cast<size_t>(ITK) * sizeof(int));
-        if (!rb.scratch || !rb.row_cache || !rb.cold_incoming
-            || !rb.dev_src_ptrs || !rb.dev_scatter_ptrs || !rb.dev_scatter_idx
+        if (!rb.row_cache
             || !rb.dev_ident_indices || !rb.dev_fake_bt || !rb.pf_incoming
             || !rb.dev_pf_scatter_ptrs || !rb.dev_pf_scatter_idx) {
             throw std::runtime_error(
@@ -152,26 +168,78 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
         be->memcpy_h2d(rb.dev_fake_bt, iota_pages.data(),
                        static_cast<size_t>(n_fake_pages_) * sizeof(int));
 
+        // TD-KVT-COHORT-BATCHED-MATERIALIZE: union staging (single set) +
+        // rewritten-index / seqlens / replicated-iota-block-table buffers.
+        if (union_cap_ > 0) {
+            const size_t CRMu =
+                static_cast<size_t>(std::max(1, opts_.cohort_rows_max));
+            auto& us = rb.umat;
+            us.scratch = be->device_alloc(
+                static_cast<size_t>(u_pages_cap_) * blk);
+            us.cold_incoming = be->device_alloc(
+                static_cast<size_t>(union_cap_) * row);
+            us.dev_src_ptrs = be->device_alloc(
+                static_cast<size_t>(union_cap_) * sizeof(void*));
+            rb.dev_uidx = be->device_alloc(
+                CRMu * static_cast<size_t>(ITK) * sizeof(int));
+            rb.dev_useq = be->device_alloc(CRMu * sizeof(int));
+            rb.dev_union_bt = be->device_alloc(
+                CRMu * static_cast<size_t>(u_pages_cap_) * sizeof(int));
+            if (!us.scratch || !us.cold_incoming || !us.dev_src_ptrs
+                || !rb.dev_uidx || !rb.dev_useq || !rb.dev_union_bt) {
+                throw std::runtime_error(
+                    "KvTieringManager: union staging device_alloc failed "
+                    "(rank " + std::to_string(r) + ")");
+            }
+            // Every cohort row shares the same identity fake pages: the
+            // block table is CRMu replicated iota rows (row stride =
+            // u_pages_cap_ = the view's max_blocks_per_seq).
+            std::vector<int> ubt(CRMu * static_cast<size_t>(u_pages_cap_));
+            for (size_t b = 0; b < CRMu; ++b)
+                for (int p = 0; p < u_pages_cap_; ++p)
+                    ubt[b * static_cast<size_t>(u_pages_cap_)
+                        + static_cast<size_t>(p)] = p;
+            be->memcpy_h2d(rb.dev_union_bt, ubt.data(),
+                           ubt.size() * sizeof(int));
+        }
+
         // ── Pinned host arena on the rank GPU's NUMA home node (P-22) ──
-        const size_t off_stage   = 0;
-        const size_t off_srcp    = align_up(off_stage + static_cast<size_t>(ITK) * row);
-        const size_t off_scatp   = align_up(off_srcp + static_cast<size_t>(ITK) * sizeof(void*));
-        const size_t off_scati   = align_up(off_scatp + static_cast<size_t>(ITK) * sizeof(void*));
+        // The materialize staging (stage + ptr/idx tables) exists TWICE —
+        // ping-pong MatSets (see the header note): set s occupies
+        // [s * set_span, (s+1) * set_span).
+        const size_t set_stage_b = align_up(static_cast<size_t>(ITK) * row);
+        const size_t set_ptrs_b  = align_up(static_cast<size_t>(ITK) * sizeof(void*));
+        const size_t set_idx_b   = align_up(static_cast<size_t>(ITK) * sizeof(int));
+        const size_t set_span    = set_stage_b + 2 * set_ptrs_b + set_idx_b;
         // TD-KVT-ADMISSION-UPFRONT: the selection staging holds a whole
         // chunk cohort's selection (cohort_rows_max x ITK indices +
         // cohort_rows_max lengths) when the cohort seam is enabled; the
         // legacy single-row layout is the CRM == 1 special case.
         const size_t CRM = static_cast<size_t>(
             std::max(1, opts_.cohort_rows_max));
-        const size_t off_idx     = align_up(off_scati + static_cast<size_t>(ITK) * sizeof(int));
+        const size_t off_idx     = align_up(2 * set_span);
         const size_t off_len     = align_up(off_idx + CRM * static_cast<size_t>(ITK) * sizeof(int));
         const size_t off_pf_stage = align_up(off_len
                                              + std::max<size_t>(64, CRM * sizeof(int)));
         const size_t off_pf_scatp = align_up(off_pf_stage + static_cast<size_t>(ITK) * row);
         const size_t off_pf_scati = align_up(off_pf_scatp + static_cast<size_t>(ITK) * sizeof(void*));
         const size_t off_cold    = align_up(off_pf_scati + static_cast<size_t>(ITK) * sizeof(int));
-        const size_t total       = off_cold
+        size_t total             = off_cold
                                  + static_cast<size_t>(cold_pool_pages_) * blk;
+        // TD-KVT-COHORT-BATCHED-MATERIALIZE: union staging tail (stage +
+        // src-ptr table + rewritten indices + per-row seqlens).  Zero-cost
+        // when the arm is disabled (legacy layout unchanged).
+        size_t off_u_stage = 0, off_u_ptrs = 0, off_u_idx = 0, off_u_len = 0;
+        if (union_cap_ > 0) {
+            const size_t u_cap = static_cast<size_t>(union_cap_);
+            off_u_stage = align_up(total);
+            off_u_ptrs  = align_up(off_u_stage + u_cap * row);
+            off_u_idx   = align_up(off_u_ptrs + u_cap * sizeof(void*));
+            off_u_len   = align_up(off_u_idx
+                                   + CRM * static_cast<size_t>(ITK)
+                                         * sizeof(int));
+            total       = off_u_len + std::max<size_t>(64, CRM * sizeof(int));
+        }
 
         char* base = nullptr;
         const int gpu_pos = opts_.gpus[r].position;
@@ -195,16 +263,30 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
             rb.host_registered = false;  // cudaHostAlloc'd — freed via backend
             rb.numa_node = -1;
         }
-        rb.h_stage        = base + off_stage;
-        rb.h_src_ptrs     = reinterpret_cast<const void**>(base + off_srcp);
-        rb.h_scatter_ptrs = reinterpret_cast<const void**>(base + off_scatp);
-        rb.h_scatter_idx  = reinterpret_cast<int*>(base + off_scati);
+        for (int s = 0; s < 2; ++s) {
+            char* sb = base + static_cast<size_t>(s) * set_span;
+            auto& ms = rb.mat[s];
+            ms.h_stage        = sb;
+            ms.h_src_ptrs     = reinterpret_cast<const void**>(sb + set_stage_b);
+            ms.h_scatter_ptrs = reinterpret_cast<const void**>(
+                sb + set_stage_b + set_ptrs_b);
+            ms.h_scatter_idx  = reinterpret_cast<int*>(
+                sb + set_stage_b + 2 * set_ptrs_b);
+        }
         rb.h_indices      = reinterpret_cast<int*>(base + off_idx);
         rb.h_topk_len     = reinterpret_cast<int*>(base + off_len);
         rb.h_pf_stage     = base + off_pf_stage;
         rb.h_pf_scatter_ptrs = reinterpret_cast<const void**>(base + off_pf_scatp);
         rb.h_pf_scatter_idx  = reinterpret_cast<int*>(base + off_pf_scati);
         rb.cold_base      = base + off_cold;
+        if (union_cap_ > 0) {
+            rb.umat.h_stage    = base + off_u_stage;
+            rb.umat.h_src_ptrs =
+                reinterpret_cast<const void**>(base + off_u_ptrs);
+            // umat.h_scatter_* stay null: union gathers never cache-insert.
+            rb.h_uidx = reinterpret_cast<int*>(base + off_u_idx);
+            rb.h_useq = reinterpret_cast<int*>(base + off_u_len);
+        }
 
         rb.cold_free.reserve(cold_pool_pages_);
         for (int s = cold_pool_pages_ - 1; s >= 0; --s) rb.cold_free.push_back(s);
@@ -229,11 +311,18 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
             rb.owns_d2h_stream = true;
         }
         rb.ev_sync       = be->create_event();
-        rb.ev_h2d        = be->create_event();
         rb.ev_attn_order = be->create_event();
         rb.ev_pf         = be->create_event();
         rb.ev_pf_order   = be->create_event();
-        rb.ev_mat_done   = be->create_event();
+        for (auto& ms : rb.mat) {
+            ms.ev_h2d      = be->create_event();
+            ms.ev_mat_done = be->create_event();
+        }
+        if (union_cap_ > 0) {
+            rb.umat.ev_h2d      = be->create_event();
+            rb.umat.ev_mat_done = be->create_event();
+            rb.ev_uidx          = be->create_event();
+        }
 
         // ── Per-layer row caches ──
         cache_[r].resize(opts_.kv_layers);
@@ -245,6 +334,14 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
         }
     }
     layer_dense_.assign(static_cast<size_t>(opts_.kv_layers), 0);
+    // TD-KVT-ADMISSION-UPFRONT hybrid gate override (strict identity runs).
+    if (const char* ca = std::getenv("LS_KVT_COHORT_ALWAYS"))
+        cohort_always_ = (*ca == '1');
+    // Debug oracle: after every materialize gather, byte-verify the scratch
+    // against its sources and every cold-classified row against the pinned
+    // cold-pool authority.  Massive sync overhead — diagnostics only.
+    if (const char* vf = std::getenv("LS_KVT_VERIFY"))
+        verify_ = (*vf == '1');
 
     spdlog::info("KvTiering: enabled — hot_buffer_slots={} (retention {} tok), "
                  "cold pool {} pages/rank ({:.1f} MiB pinned/rank, node[s] {}),"
@@ -256,6 +353,14 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
                  sharded_ ? "sharded (per-rank shard tiering)"
                  : dedup_ ? "replicated (cold-dedup: one copy/page)"
                           : "replicated");
+    if (opts_.cohort_rows_max > 1) {
+        spdlog::info("KvTiering: cohort consumer = {} (union staging {} rows"
+                     " / {} fake pages per rank{})",
+                     union_cap_ > 0 ? "BATCHED-UNION (per-row fallback)"
+                                    : "PER-ROW",
+                     union_cap_, u_pages_cap_,
+                     cohort_rowwise_ ? "; LS_KVT_COHORT_ROWWISE=1" : "");
+    }
 }
 
 KvTieringManager::~KvTieringManager() {
@@ -278,25 +383,41 @@ KvTieringManager::~KvTieringManager() {
         if (r < static_cast<int>(sel_.size()) && sel_[r].pending)
             wait_event(be, rb.ev_sync);
         if (rb.pf_inflight) wait_event(be, rb.ev_pf);
-        if (rb.mat_inflight) wait_event(be, rb.ev_mat_done);
-        if (rb.ev_h2d) wait_event(be, rb.ev_h2d);  // cold burst (h_stage)
-        be->device_free(rb.scratch);
+        for (auto& ms : rb.mat) {
+            if (ms.mat_inflight) wait_event(be, ms.ev_mat_done);
+            if (ms.ev_h2d) wait_event(be, ms.ev_h2d);  // cold burst (h_stage)
+        }
+        if (rb.umat.mat_inflight) wait_event(be, rb.umat.ev_mat_done);
+        if (rb.umat.ev_h2d) wait_event(be, rb.umat.ev_h2d);
+        if (rb.uidx_inflight) wait_event(be, rb.ev_uidx);
         be->device_free(rb.row_cache);
-        be->device_free(rb.cold_incoming);
-        be->device_free(rb.dev_src_ptrs);
-        be->device_free(rb.dev_scatter_ptrs);
-        be->device_free(rb.dev_scatter_idx);
+        for (auto& ms : rb.mat) {
+            be->device_free(ms.scratch);
+            be->device_free(ms.cold_incoming);
+            be->device_free(ms.dev_src_ptrs);
+            be->device_free(ms.dev_scatter_ptrs);
+            be->device_free(ms.dev_scatter_idx);
+            if (ms.ev_h2d) be->destroy_event(ms.ev_h2d);
+            if (ms.ev_mat_done) be->destroy_event(ms.ev_mat_done);
+        }
+        be->device_free(rb.umat.scratch);
+        be->device_free(rb.umat.cold_incoming);
+        be->device_free(rb.umat.dev_src_ptrs);
+        be->device_free(rb.dev_uidx);
+        be->device_free(rb.dev_useq);
+        be->device_free(rb.dev_union_bt);
+        if (rb.umat.ev_h2d) be->destroy_event(rb.umat.ev_h2d);
+        if (rb.umat.ev_mat_done) be->destroy_event(rb.umat.ev_mat_done);
+        if (rb.ev_uidx) be->destroy_event(rb.ev_uidx);
         be->device_free(rb.dev_ident_indices);
         be->device_free(rb.dev_fake_bt);
         be->device_free(rb.pf_incoming);
         be->device_free(rb.dev_pf_scatter_ptrs);
         be->device_free(rb.dev_pf_scatter_idx);
         if (rb.ev_sync) be->destroy_event(rb.ev_sync);
-        if (rb.ev_h2d) be->destroy_event(rb.ev_h2d);
         if (rb.ev_attn_order) be->destroy_event(rb.ev_attn_order);
         if (rb.ev_pf) be->destroy_event(rb.ev_pf);
         if (rb.ev_pf_order) be->destroy_event(rb.ev_pf_order);
-        if (rb.ev_mat_done) be->destroy_event(rb.ev_mat_done);
         if (rb.h2d_stream) be->destroy_stream(rb.h2d_stream);
         if (rb.owns_d2h_stream && rb.d2h_stream)
             be->destroy_stream(rb.d2h_stream);
@@ -1079,9 +1200,11 @@ bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
     for (int r = 0; r < R; ++r) {
         auto* be = backend(r);
         auto& rb = ranks_[static_cast<size_t>(r)];
-        if (rb.mat_inflight) {
-            stats_.guard_wait_us += wait_event_us(be, rb.ev_mat_done);
-            rb.mat_inflight = false;
+        for (auto& ms : rb.mat) {
+            if (ms.mat_inflight) {
+                stats_.guard_wait_us += wait_event_us(be, ms.ev_mat_done);
+                ms.mat_inflight = false;
+            }
         }
         if (rb.pf_inflight) {
             stats_.guard_wait_us += wait_event_us(be, rb.ev_pf);
@@ -1149,22 +1272,22 @@ bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
             size_t off = 0;
             while (off < blk) {
                 const size_t piece = std::min(blk - off, stage_cap);
-                std::memcpy(rb.h_stage, csrc + off, piece);
-                be->memcpy_h2d_async(dst + off, rb.h_stage, piece,
+                std::memcpy(rb.mat[0].h_stage, csrc + off, piece);
+                be->memcpy_h2d_async(dst + off, rb.mat[0].h_stage, piece,
                                      rb.h2d_stream);
                 // Staging-reuse fence (INV-KVT-7): h_stage is rewritten by
                 // the next piece — host-wait the burst (also drains any
                 // direct copies enqueued above; stream order).
-                be->record_event(rb.ev_h2d, rb.h2d_stream);
-                wait_event(be, rb.ev_h2d);
+                be->record_event(rb.mat[0].ev_h2d, rb.h2d_stream);
+                wait_event(be, rb.mat[0].ev_h2d);
                 pending = false;
                 off += piece;
                 h2d_bytes += piece;
             }
         }
         if (pending) {
-            be->record_event(rb.ev_h2d, rb.h2d_stream);
-            wait_event(be, rb.ev_h2d);
+            be->record_event(rb.mat[0].ev_h2d, rb.h2d_stream);
+            wait_event(be, rb.mat[0].ev_h2d);
         }
     }
 
@@ -1579,6 +1702,37 @@ void KvTieringManager::materialize_selection(
         int rank, int layer_idx, const int* h_idx, int n,
         const int* seqlens_dev, void* stream,
         parallelism::TieredKvView* out) {
+    auto& rb = ranks_[static_cast<size_t>(rank)];
+    // Ping-pong staging set (see MatSet): alternating sets keep the host
+    // from serializing behind the PREVIOUS materialize's device-side
+    // gather — critical for per-row cohort consumption (one materialize
+    // per chunk row; the single-set guard measured ~37% of the tiered
+    // prefill wall at rung-0).
+    auto& ms = rb.mat[static_cast<size_t>(rb.mat_parity)];
+    rb.mat_parity ^= 1;
+    gather_selection(rank, layer_idx, ms, opts_.index_topk, h_idx, n,
+                     /*cache_insert=*/true, stream);
+
+    // 6) Fake paged view: identity indices over the dense scratch.
+    out->kv_cache = ms.scratch;
+    out->block_tables = static_cast<const int*>(rb.dev_fake_bt);
+    out->seqlens_k = seqlens_dev;  // device int holding this row's n
+    out->max_blocks_per_seq = n_fake_pages_;
+    out->seq_len_kv = n;
+    out->sparse_indices = static_cast<const int*>(rb.dev_ident_indices);
+}
+
+// Steps 1c-5 (classify / cold burst / cache scatter / gather / fence) over a
+// host-resident selection into staging set `ms` (capacity `cap` rows).  The
+// ONE placement body shared by the B==1 path, materialize_row, AND the
+// batched union arm (TD-KVT-COHORT-BATCHED-MATERIALIZE) — INV-KVT-1:
+// identical machinery regardless of the consuming kernel shape.
+// `cache_insert` = false (union gathers): cold misses skip row-cache INSERTS
+// (the union dedups intra-step; mass inserts would thrash the LRU) while
+// cache hits still serve as sources.
+void KvTieringManager::gather_selection(int rank, int layer_idx, MatSet& ms,
+                                        int cap, const int* h_idx, int n,
+                                        bool cache_insert, void* stream) {
     auto* be = backend(rank);
     auto& rb = ranks_[static_cast<size_t>(rank)];
     const int PS = opts_.page_size;
@@ -1588,15 +1742,21 @@ void KvTieringManager::materialize_selection(
         throw std::runtime_error(
             "KvTiering: materialize_selection without a step sequence");
     }
+    if (n > cap) {
+        throw std::runtime_error(
+            "KvTiering: selection (" + std::to_string(n)
+            + " rows) exceeds the staging capacity ("
+            + std::to_string(cap) + ")");
+    }
     auto& ls = ssp->pages[static_cast<size_t>(layer_idx)];
     const int* host_bt = ctx_host_bt_[static_cast<size_t>(rank)];
 
-    // 1c) Host staging-reuse guard: the previous materialize's uploads/gather
-    //     may still be DMA-reading h_src_ptrs/h_stage/scatter tables and
-    //     cold_incoming (normally long done — a whole layer has passed).
-    if (rb.mat_inflight) {
-        stats_.guard_wait_us += wait_event_us(be, rb.ev_mat_done);
-        rb.mat_inflight = false;
+    // 1c) Host staging-reuse guard: THIS set's previous uploads/gather may
+    //     still be DMA-reading h_src_ptrs/h_stage/scatter tables and
+    //     cold_incoming (two materializes back — normally long done).
+    if (ms.mat_inflight) {
+        stats_.guard_wait_us += wait_event_us(be, ms.ev_mat_done);
+        ms.mat_inflight = false;
     }
 
     // 2) Classify each selected row: paged pool (hot) / row cache / cold miss.
@@ -1606,10 +1766,14 @@ void KvTieringManager::materialize_selection(
     const char* kv_base =
         static_cast<const char*>(opts_.kv_main_bases[static_cast<size_t>(rank)]);
     const char* incoming =
-        static_cast<const char*>(rb.cold_incoming);
+        static_cast<const char*>(ms.cold_incoming);
 
     int m = 0;                       // cold misses (packed staging rows)
     int k = 0;                       // cache-insert scatter entries
+    // LS_KVT_VERIFY: authoritative pinned cold-pool pointer per cold-
+    // classified row (nullptr = hot/pool row, no independent authority).
+    std::vector<const char*> vf_auth;
+    if (verify_) vf_auth.assign(static_cast<size_t>(n), nullptr);
 
     for (int i = 0; i < n; ++i) {
         const int pos = h_idx[i];
@@ -1629,7 +1793,7 @@ void KvTieringManager::materialize_selection(
             && ls[static_cast<size_t>(j)].state == PageState::kCold;
         if (!cold) {
             // Paged pool (hot or D2H-inflight — content resident + immutable).
-            rb.h_src_ptrs[i] = kv_base
+            ms.h_src_ptrs[i] = kv_base
                 + static_cast<int64_t>(host_bt[jl]) * opts_.stride_block
                 + static_cast<int64_t>(rw) * opts_.stride_row;
             ++stats_.pool_hits;
@@ -1637,8 +1801,19 @@ void KvTieringManager::materialize_selection(
         }
         if (auto it = seq_map.find(pos); it != seq_map.end()) {
             const int s = it->second;
-            rb.h_src_ptrs[i] = cache_slot_addr(rank, layer_idx, s);
+            ms.h_src_ptrs[i] = cache_slot_addr(rank, layer_idx, s);
             lc.slot_use[s] = tick_;
+            if (verify_) {
+                const int vcr = cold_src_rank(rank, j);
+                const int vslot =
+                    ls[static_cast<size_t>(j)].cold_slot[
+                        static_cast<size_t>(vcr)];
+                if (vslot >= 0)
+                    vf_auth[static_cast<size_t>(i)] =
+                        ranks_[static_cast<size_t>(vcr)].cold_base
+                        + static_cast<int64_t>(vslot) * opts_.stride_block
+                        + static_cast<int64_t>(rw) * opts_.stride_row;
+            }
             ++stats_.cache_hits;
             if (lc.slot_prefetched[static_cast<size_t>(s)]) {
                 lc.slot_prefetched[static_cast<size_t>(s)] = 0;
@@ -1667,17 +1842,23 @@ void KvTieringManager::materialize_selection(
         const char* csrc = ranks_[static_cast<size_t>(cr)].cold_base
             + static_cast<int64_t>(cslot) * opts_.stride_block
             + static_cast<int64_t>(rw) * opts_.stride_row;
-        std::memcpy(rb.h_stage + static_cast<size_t>(m) * row, csrc, row);
-        rb.h_src_ptrs[i] = incoming + static_cast<size_t>(m) * row;
+        std::memcpy(ms.h_stage + static_cast<size_t>(m) * row, csrc, row);
+        ms.h_src_ptrs[i] = incoming + static_cast<size_t>(m) * row;
+        if (verify_) vf_auth[static_cast<size_t>(i)] = csrc;
         // Insert into the row cache for future steps (LRU, fair-share).
-        if (const int s = acquire_cache_slot(lc, tick_, ctx_seq_); s >= 0) {
-            seq_map[pos] = s;
-            lc.slot_pos[s] = pos;
-            lc.slot_seq[static_cast<size_t>(s)] = ctx_seq_;
-            lc.slot_use[s] = tick_;
-            rb.h_scatter_ptrs[k] = cache_slot_addr(rank, layer_idx, s);
-            rb.h_scatter_idx[k] = m;
-            ++k;
+        // Union gathers skip inserts (cache_insert=false): the union dedups
+        // repeats intra-step and a >hot_slots union would churn the LRU.
+        if (cache_insert) {
+            if (const int s = acquire_cache_slot(lc, tick_, ctx_seq_);
+                s >= 0) {
+                seq_map[pos] = s;
+                lc.slot_pos[s] = pos;
+                lc.slot_seq[static_cast<size_t>(s)] = ctx_seq_;
+                lc.slot_use[s] = tick_;
+                ms.h_scatter_ptrs[k] = cache_slot_addr(rank, layer_idx, s);
+                ms.h_scatter_idx[k] = m;
+                ++k;
+            }
         }
         ++m;
         ++stats_.cold_misses;
@@ -1696,47 +1877,90 @@ void KvTieringManager::materialize_selection(
     // 3) Cold burst: ONE packed H2D on the dedicated tiering H2D stream
     //    (TD-KVT-H2D-CONTENTION); attention stream waits.
     if (m > 0) {
-        be->memcpy_h2d_async(rb.cold_incoming, rb.h_stage,
+        be->memcpy_h2d_async(ms.cold_incoming, ms.h_stage,
                              static_cast<size_t>(m) * row, rb.h2d_stream);
-        be->record_event(rb.ev_h2d, rb.h2d_stream);
-        be->stream_wait_event(stream, rb.ev_h2d);
+        be->record_event(ms.ev_h2d, rb.h2d_stream);
+        be->stream_wait_event(stream, ms.ev_h2d);
         stats_.cold_fetch_bytes += static_cast<uint64_t>(m) * row;
         ++stats_.h2d_bursts;
     }
 
     // 4) Upload the per-row source table + optional cache-insert scatter.
-    be->memcpy_h2d_async(rb.dev_src_ptrs, rb.h_src_ptrs,
+    be->memcpy_h2d_async(ms.dev_src_ptrs, ms.h_src_ptrs,
                          static_cast<size_t>(n) * sizeof(void*), stream);
     if (k > 0) {
-        be->memcpy_h2d_async(rb.dev_scatter_ptrs, rb.h_scatter_ptrs,
+        be->memcpy_h2d_async(ms.dev_scatter_ptrs, ms.h_scatter_ptrs,
                              static_cast<size_t>(k) * sizeof(void*), stream);
-        be->memcpy_h2d_async(rb.dev_scatter_idx, rb.h_scatter_idx,
+        be->memcpy_h2d_async(ms.dev_scatter_idx, ms.h_scatter_idx,
                              static_cast<size_t>(k) * sizeof(int), stream);
         compute::launch_kv_row_scatter(
-            reinterpret_cast<void* const*>(rb.dev_scatter_ptrs),
-            rb.cold_incoming, opts_.stride_row,
-            static_cast<const int*>(rb.dev_scatter_idx), k,
+            reinterpret_cast<void* const*>(ms.dev_scatter_ptrs),
+            ms.cold_incoming, opts_.stride_row,
+            static_cast<const int*>(ms.dev_scatter_idx), k,
             opts_.stride_row, stream);
     }
 
     // 5) Gather all n rows into the dense fake-paged scratch.
     compute::launch_kv_row_gather(
-        rb.scratch, opts_.stride_block, opts_.stride_row, PS,
-        reinterpret_cast<const void* const*>(rb.dev_src_ptrs), n,
+        ms.scratch, opts_.stride_block, opts_.stride_row, PS,
+        reinterpret_cast<const void* const*>(ms.dev_src_ptrs), n,
         opts_.stride_row, stream);
     // Staging-reuse fence: the next materialize host-waits this before
     // touching h_stage/h_src_ptrs/scatter tables or re-bursting into
     // cold_incoming (gather done ⇒ its ev_h2d wait passed ⇒ burst done).
-    be->record_event(rb.ev_mat_done, stream);
-    rb.mat_inflight = true;
+    be->record_event(ms.ev_mat_done, stream);
+    ms.mat_inflight = true;
 
-    // 6) Fake paged view: identity indices over the dense scratch.
-    out->kv_cache = rb.scratch;
-    out->block_tables = static_cast<const int*>(rb.dev_fake_bt);
-    out->seqlens_k = seqlens_dev;  // device int holding this row's n
-    out->max_blocks_per_seq = n_fake_pages_;
-    out->seq_len_kv = n;
-    out->sparse_indices = static_cast<const int*>(rb.dev_ident_indices);
+    // LS_KVT_VERIFY byte oracle (debug): scratch row i must equal its
+    // source row, and every cold-classified row must equal the pinned
+    // cold-pool authority (catches gather races, stale cache slots, wrong
+    // staging).  Fail loud on the first mismatch.
+    if (verify_) {
+        // One D2H of the used scratch extent + per-row source D2H for every
+        // COLD-classified row (cold-pool authority) and a 1/16 sample of
+        // hot rows (gather integrity).
+        be->synchronize_device();
+        const int used_pages = (n + PS - 1) / PS;
+        std::vector<char> sc_all(static_cast<size_t>(used_pages)
+                                 * opts_.stride_block);
+        be->memcpy_d2h_async(sc_all.data(), ms.scratch, sc_all.size(),
+                             stream);
+        be->synchronize_device();
+        // Sampled source rows (cold rows always; 1/16 of hot rows): batch
+        // the D2Hs, one sync, then host-compare.
+        std::vector<int> vf_pick;
+        for (int i = 0; i < n; ++i)
+            if (vf_auth[static_cast<size_t>(i)] || (i & 15) == 0)
+                vf_pick.push_back(i);
+        std::vector<char> src_all(vf_pick.size() * row);
+        for (size_t q = 0; q < vf_pick.size(); ++q)
+            be->memcpy_d2h_async(src_all.data() + q * row,
+                                 ms.h_src_ptrs[vf_pick[q]], row, stream);
+        be->synchronize_device();
+        for (size_t q = 0; q < vf_pick.size(); ++q) {
+            const int i = vf_pick[q];
+            const char* got = sc_all.data()
+                + static_cast<int64_t>(i / PS) * opts_.stride_block
+                + static_cast<int64_t>(i % PS) * opts_.stride_row;
+            const char* src = src_all.data() + q * row;
+            if (std::memcmp(got, src, row) != 0) {
+                throw std::runtime_error(
+                    "KvTiering VERIFY: gather mismatch (layer "
+                    + std::to_string(layer_idx) + ", sel " + std::to_string(i)
+                    + ", pos " + std::to_string(h_idx[i]) + ", rank "
+                    + std::to_string(rank) + ")");
+            }
+            if (vf_auth[static_cast<size_t>(i)]
+                && std::memcmp(src, vf_auth[static_cast<size_t>(i)],
+                               row) != 0) {
+                throw std::runtime_error(
+                    "KvTiering VERIFY: cold source != cold-pool authority "
+                    "(layer " + std::to_string(layer_idx) + ", sel "
+                    + std::to_string(i) + ", pos " + std::to_string(h_idx[i])
+                    + ", rank " + std::to_string(rank) + ")");
+            }
+        }
+    }
 }
 
 // ── Hook: materialize_row (TD-KVT-ADMISSION-UPFRONT cohort seam) ────────────
@@ -1789,6 +2013,21 @@ void KvTieringManager::ensure_cohort_selection(int rank, int layer_idx,
     sc.rows = ctx_rows_;
     sc.n = 0;
     ++stats_.cohort_readbacks;
+}
+
+bool KvTieringManager::cohort_layer_tiered(int layer_idx) {
+    if (ctx_seq_ == 0 || ctx_rows_ <= 1 || layer_idx != ctx_layer_)
+        return false;
+    if (layer_idx < 0 || layer_idx >= opts_.kv_layers) return false;
+    if (layer_dense_[static_cast<size_t>(layer_idx)]) return false;
+    if (cohort_always_) return true;  // strict per-row arm (identity runs)
+    if (!ctx_cold_valid_) {
+        const SeqState* ssp = find_seq(ctx_seq_);
+        if (!ssp) return false;
+        ctx_cold_ = state_layer_has_cold(*ssp, layer_idx);
+        ctx_cold_valid_ = true;
+    }
+    return ctx_cold_;
 }
 
 bool KvTieringManager::materialize_row(int rank, int layer_idx, int row,
@@ -1859,6 +2098,182 @@ bool KvTieringManager::materialize_row(int rank, int layer_idx, int row,
     return true;
 }
 
+// ── Hook: materialize_cohort (TD-KVT-COHORT-BATCHED-MATERIALIZE) ────────────
+//
+// The batched cold-layer consumer: ONE union gather + ONE batched sparse
+// chunk kernel per (rank, layer) instead of `rows` per-row B==1
+// sub-dispatches (measured ~745 us/(row·layer) — the RIPTIDE cohort tax).
+// The union of the cohort's per-row selections is materialized through the
+// SAME classify/burst/gather placement body as the per-row arm
+// (gather_selection — INV-KVT-1), each row's indices are rewritten to union
+// slots host-side in an ORDER-PRESERVING map (ascending unique positions ⇒
+// deterministic slots; per-row accumulation order unchanged), per-row
+// topk_lengths stay the producer's device buffer, and every row's seqlen is
+// the union extent (the producer's selection is already causal —
+// INV-SPARSE-CHUNK-CAUSAL — so the batched kernel's per-row causal bound
+// never bites).  IndexShare shared layers reuse the union build + rewrite
+// under the (seq, pos, rows) identity; the GATHER always reruns per layer
+// (per-layer KV bytes and cold sets).  False (caller falls back to the
+// per-row loop, always correct) when: the arm is disabled
+// (LS_KVT_COHORT_ROWWISE=1 / union_rows_max 0), the layer has no cold
+// pages, every row's selection is empty, or the union exceeds the staging
+// capacity (fail-safe).
+bool KvTieringManager::materialize_cohort(int rank, int layer_idx, int rows,
+                                          const int* sparse_indices_dev,
+                                          const int* topk_lengths_dev,
+                                          bool selection_fresh, void* stream,
+                                          parallelism::TieredKvView* out) {
+    if (union_cap_ <= 0) return false;  // arm disabled (or LS_KVT_COHORT_ROWWISE)
+    if (opts_.cohort_rows_max <= 0 || rows < 2
+        || rows > opts_.cohort_rows_max) {
+        throw std::runtime_error(
+            "KvTiering: bad materialize_cohort shape (rows "
+            + std::to_string(rows) + ", staging cap "
+            + std::to_string(opts_.cohort_rows_max) + ")");
+    }
+    if (rank < 0 || rank >= static_cast<int>(ranks_.size())
+        || layer_idx < 0 || layer_idx >= opts_.kv_layers
+        || !sparse_indices_dev || !topk_lengths_dev || !out) {
+        throw std::runtime_error("KvTiering: bad materialize_cohort arguments");
+    }
+    if (ctx_seq_ == 0 || layer_idx != ctx_layer_ || rows != ctx_rows_) {
+        throw std::runtime_error(
+            "KvTiering: materialize_cohort without a matching begin_layer "
+            "cohort (layer " + std::to_string(layer_idx) + ")");
+    }
+    if (!ctx_cold_valid_) {
+        const SeqState* ssp = find_seq(ctx_seq_);
+        if (!ssp) {
+            throw std::runtime_error(
+                "KvTiering: materialize_cohort without a step sequence");
+        }
+        ctx_cold_ = state_layer_has_cold(*ssp, layer_idx);
+        ctx_cold_valid_ = true;
+    }
+    if (!ctx_cold_) return false;  // batched real-block-table path valid
+    if (!ctx_host_bt_[static_cast<size_t>(rank)]) {
+        throw std::runtime_error(
+            "KvTiering: materialize_cohort without begin_layer block tables "
+            "(rank " + std::to_string(rank) + ")");
+    }
+
+    auto* be = backend(rank);
+    be->set_device();
+    ensure_cohort_selection(rank, layer_idx, sparse_indices_dev,
+                            topk_lengths_dev, selection_fresh, stream);
+    auto& rb = ranks_[static_cast<size_t>(rank)];
+    const int ITK = opts_.index_topk;
+
+    // Union build + order-preserving rewrite (selection-only — reused across
+    // IndexShare shared layers under the step identity, INV-KVT-6 extended).
+    if (!(rb.u_valid && rb.u_seq == ctx_seq_ && rb.u_pos == ctx_pos_
+          && rb.u_rows == rows)) {
+        rb.u_valid = false;
+        int max_pos = -1;
+        for (int b = 0; b < rows; ++b) {
+            const int len = rb.h_topk_len[b];
+            if (len > ITK) {
+                throw std::runtime_error(
+                    "KvTiering: cohort topk_length " + std::to_string(len)
+                    + " > index_topk " + std::to_string(ITK));
+            }
+            const int* src = rb.h_indices + static_cast<size_t>(b) * ITK;
+            for (int i = 0; i < len; ++i) {
+                const int p = src[i];
+                if (p < 0) {
+                    throw std::runtime_error(
+                        "KvTiering: negative index inside topk_length");
+                }
+                if (p > max_pos) max_pos = p;
+            }
+        }
+        if (max_pos < 0) return false;  // all rows empty (INV-KVS-EMPTY class)
+        auto& slot_of = rb.u_slot_of;
+        if (static_cast<int>(slot_of.size()) < max_pos + 1)
+            slot_of.resize(static_cast<size_t>(max_pos) + 1);
+        std::fill(slot_of.begin(),
+                  slot_of.begin() + static_cast<size_t>(max_pos) + 1, -1);
+        for (int b = 0; b < rows; ++b) {
+            const int len = rb.h_topk_len[b];
+            const int* src = rb.h_indices + static_cast<size_t>(b) * ITK;
+            for (int i = 0; i < len; ++i)
+                slot_of[static_cast<size_t>(src[i])] = 0;
+        }
+        auto& up = rb.u_pos_list;
+        up.clear();
+        for (int p = 0; p <= max_pos; ++p) {
+            if (slot_of[static_cast<size_t>(p)] == 0) {
+                slot_of[static_cast<size_t>(p)] =
+                    static_cast<int>(up.size());
+                up.push_back(p);
+            }
+        }
+        const int u_n = static_cast<int>(up.size());
+        if (u_n > union_cap_) return false;  // fail-safe: per-row fallback
+        // Single-writer fence for the pinned rewrite buffers (INV-KVT-7):
+        // the previous step's async uploads may still read h_uidx/h_useq.
+        if (rb.uidx_inflight) {
+            stats_.guard_wait_us += wait_event_us(be, rb.ev_uidx);
+            rb.uidx_inflight = false;
+        }
+        for (int b = 0; b < rows; ++b) {
+            const int len = rb.h_topk_len[b];
+            const int* src = rb.h_indices + static_cast<size_t>(b) * ITK;
+            int* dst = rb.h_uidx + static_cast<size_t>(b) * ITK;
+            for (int i = 0; i < len; ++i)
+                dst[i] = slot_of[static_cast<size_t>(src[i])];
+            // Deterministic padding: the kernel reads only [0, len) per row,
+            // but the whole [rows x ITK] buffer uploads — uninitialized
+            // pinned padding would be geometry/boot-dependent garbage (the
+            // per-row arm's analogue, the identity iota, is CONSTANT).
+            // Zero-fill so masked lanes always see slot 0 (valid scratch).
+            std::fill(dst + len, dst + ITK, 0);
+            rb.h_useq[b] = u_n;
+        }
+        be->memcpy_h2d_async(rb.dev_uidx, rb.h_uidx,
+                             static_cast<size_t>(rows) * ITK * sizeof(int),
+                             stream);
+        be->memcpy_h2d_async(rb.dev_useq, rb.h_useq,
+                             static_cast<size_t>(rows) * sizeof(int), stream);
+        be->record_event(rb.ev_uidx, stream);
+        rb.uidx_inflight = true;
+        rb.u_n = u_n;
+        rb.u_seq = ctx_seq_;
+        rb.u_pos = ctx_pos_;
+        rb.u_rows = rows;
+        rb.u_valid = true;
+        ++stats_.cohort_union_rewrites;
+    }
+    if (rb.u_n <= 0) return false;
+
+    // Per-layer union gather (classification against THIS layer's page
+    // states; hot rows device-gathered, cold rows staged from the pinned
+    // pool — placement-only, INV-KVT-1).
+    gather_selection(rank, layer_idx, rb.umat, union_cap_,
+                     rb.u_pos_list.data(), rb.u_n, /*cache_insert=*/false,
+                     stream);
+
+    // Union fake view: every row shares the identity fake pages; per-row
+    // indices are the rewritten union slots; per-row seqlens all = u_n.
+    out->kv_cache = rb.umat.scratch;
+    out->block_tables = static_cast<const int*>(rb.dev_union_bt);
+    out->seqlens_k = static_cast<const int*>(rb.dev_useq);
+    out->max_blocks_per_seq = u_pages_cap_;
+    out->seq_len_kv = rb.u_n;
+    out->sparse_indices = static_cast<const int*>(rb.dev_uidx);
+
+    ++stats_.materializations;
+    ++stats_.cohort_unions;
+    stats_.cohort_union_rows += static_cast<uint64_t>(rb.u_n);
+    stats_.rows_gathered += static_cast<uint64_t>(rb.u_n);
+    stats_.cohort_rows_tiered += static_cast<uint64_t>(rows);
+    if (stats_.materializations - last_logged_materializations_ >= 4096) {
+        last_logged_materializations_ = stats_.materializations;
+        log_stats();
+    }
+    return true;
+}
+
 void KvTieringManager::on_dense_layer(int layer_idx) {
     if (ctx_seq_ == 0) return;
     // Dense attention reads the step sequence's FULL prefix through its
@@ -1894,7 +2309,8 @@ void KvTieringManager::log_stats() const {
         "budget_skips={}, "
         "cache_evictions={} | sync: overlapped={} reuses={} fallbacks={} "
         "wait={} us ({:.2f} us/mat) guard={} us | prefetch: rows={} "
-        "bursts={} {:.2f} MiB hits={} | cohort: readbacks={} rows_tiered={}",
+        "bursts={} {:.2f} MiB hits={} | cohort: readbacks={} rows_tiered={} "
+        "unions={} union_rows={} rewrites={}",
         s.materializations, s.rows_gathered, s.pool_hits, s.cache_hits,
         s.cold_misses, hit_rate,
         static_cast<double>(s.cold_fetch_bytes) / (1024.0 * 1024.0),
@@ -1904,7 +2320,8 @@ void KvTieringManager::log_stats() const {
         s.sync_overlapped, s.sync_reuses, s.sync_fallbacks, s.sync_wait_us,
         avg_sync_us, s.guard_wait_us, s.prefetch_rows, s.prefetch_bursts,
         static_cast<double>(s.prefetch_bytes) / (1024.0 * 1024.0),
-        s.prefetch_hits, s.cohort_readbacks, s.cohort_rows_tiered);
+        s.prefetch_hits, s.cohort_readbacks, s.cohort_rows_tiered,
+        s.cohort_unions, s.cohort_union_rows, s.cohort_union_rewrites);
 }
 
 }  // namespace layerstorm::daemon

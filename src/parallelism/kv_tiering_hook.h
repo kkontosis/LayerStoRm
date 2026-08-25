@@ -76,6 +76,20 @@ public:
                              int batch_size, void* stream,
                              TieredKvView* out) = 0;
 
+    /// TD-KVT-ADMISSION-UPFRONT: does the CURRENT tier-step chunk's layer
+    /// need per-row cohort consumption?  True when the layer holds cold
+    /// pages (per-row B==1 sub-dispatches + materialize_row fake views) —
+    /// the executor must then NOT run the batched chunk kernel (its
+    /// linearize reads the full local prefix through the real block
+    /// tables).  False = fully resident: the batched sparse chunk kernel
+    /// is valid and ~decode-vs-batched faster (measured ~745 us per
+    /// (row, layer) for per-row consumption).  Implementations may force
+    /// TRUE for every tier-step chunk (strict same-arm identity runs).
+    virtual bool cohort_layer_tiered(int layer_idx) {
+        (void)layer_idx;
+        return false;
+    }
+
     /// TD-KVT-ADMISSION-UPFRONT (cohort seam): per-row materialization for a
     /// dispatcher-blessed SPARSE prefill CHUNK consumed as per-row B==1
     /// sub-dispatches (INV-DSA-ROWMIX shape; INV-KVT-13 extended to chunk
@@ -98,6 +112,36 @@ public:
                                  bool selection_fresh, void* stream,
                                  TieredKvView* out) {
         (void)rank; (void)layer_idx; (void)row; (void)rows;
+        (void)sparse_indices_dev; (void)topk_lengths_dev;
+        (void)selection_fresh; (void)stream; (void)out;
+        return false;
+    }
+
+    /// TD-KVT-COHORT-BATCHED-MATERIALIZE: batched UNION materialization for
+    /// a whole tier-step chunk cohort on (rank, layer) — the perf lift over
+    /// per-row materialize_row.  The hook materializes the UNION of the
+    /// cohort's per-row selections ONCE into a contiguous fake view (hot
+    /// rows device-gathered, cold rows staged from the pinned pool — the
+    /// same placement machinery as materialize_row, INV-KVT-1) and rewrites
+    /// each row's indices to union slots (order-preserving ⇒ identical
+    /// per-row accumulation order).  On true the executor runs ONE batched
+    /// sparse chunk call over the view: `out->sparse_indices` = device
+    /// [rows × topk] rewritten indices, `out->seqlens_k` = device [rows]
+    /// ints all equal to the union extent (satisfies the chunk_causal
+    /// ascending contract; the per-row causal bound never bites because the
+    /// producer's selection is already causal, INV-SPARSE-CHUNK-CAUSAL),
+    /// per-row topk_lengths UNCHANGED (producer's buffer).  Returns false
+    /// when the layer holds no cold pages, when the union exceeds the
+    /// hook's staging capacity, or when the per-row arm is forced
+    /// (LS_KVT_COHORT_ROWWISE=1) — the executor then falls back to the
+    /// materialize_row per-row loop (always correct).  Default: no cohort
+    /// batching.
+    virtual bool materialize_cohort(int rank, int layer_idx, int rows,
+                                    const int* sparse_indices_dev,
+                                    const int* topk_lengths_dev,
+                                    bool selection_fresh, void* stream,
+                                    TieredKvView* out) {
+        (void)rank; (void)layer_idx; (void)rows;
         (void)sparse_indices_dev; (void)topk_lengths_dev;
         (void)selection_fresh; (void)stream; (void)out;
         return false;

@@ -163,6 +163,22 @@ class FakeDaemon(threading.Thread):
         # regression-hunt 2026-08-23 finding (b) shape).
         self.seq_capacity: int | None = None
         self.seq_admission_rejects = 0
+        # Scripted kIndexerK exhaustion (TD-INDEXER-POOL-EVICT): every
+        # RUN_ATTENTION is declined with the engine's RETRYABLE
+        # pool-exhaustion CMP_ERROR until `seq_frees` reaches this mark —
+        # i.e. until the orchestrator has freed a prefix holder, whose
+        # indexer-K pages die with its sequence. Models the real seam: the
+        # engine fail-closes the step rather than downgrading a KV-demoted
+        # sequence to dense. None = never fail.
+        self.indexer_exhaust_until_frees: int | None = None
+        self.indexer_exhaust_rejects = 0
+        # Scripted draft-context invalidation (TD-DSPARK-CTX-CAP /
+        # INV-SERVE-SPEC-FALLBACK): from dspark call index N on, every
+        # D_CMD_RUN_DSPARK_STEP is declined with the engine's real
+        # run_step CMP_ERROR (sticky, like the runtime — an invalidated
+        # context never recovers within a request; positions only grow).
+        # None = never fail; 0 = invalid from the first draft.
+        self.dspark_fail_from: int | None = None
         self.embed_calls: list[int] = []     # n per EMBEDDING_LOOKUP
         self.fetch_moes = 0                  # E_CMD_FETCH_AND_RUN_MOE
         self.fetch_moe_bigs = 0              # E_CMD_FETCH_AND_RUN_MOE_BIG
@@ -276,6 +292,12 @@ class FakeDaemon(threading.Thread):
             self.embed_calls.append(n)
             self._done(cmd)
         elif t == D_B_CMD_RUN_ATTENTION:
+            if (self.indexer_exhaust_until_frees is not None
+                    and self.seq_frees < self.indexer_exhaust_until_frees):
+                self.indexer_exhaust_rejects += 1
+                self._error(cmd, "indexer-K pool exhausted (demoted seq) "
+                                 "— retryable, evict a prefix holder")
+                return
             p = cmd.payload.run_attention
             ro = int(p.row_offset)     # SC sub-launch reads staged rows
             if p.emit_gating:
@@ -335,6 +357,15 @@ class FakeDaemon(threading.Thread):
             self.reef_routes += 1
             self._done(cmd, layer_idx=p.layer_idx)
         elif t == E_CMD_FAR_FORWARD_LAYER:
+            # The fused layer RUNS ATTENTION engine-side, so this is where a
+            # kIndexerK exhaustion surfaces on the FAR path (same guard as
+            # D_B_CMD_RUN_ATTENTION above).
+            if (self.indexer_exhaust_until_frees is not None
+                    and self.seq_frees < self.indexer_exhaust_until_frees):
+                self.indexer_exhaust_rejects += 1
+                self._error(cmd, "indexer-K pool exhausted (demoted seq) "
+                                 "— retryable, evict a prefix holder")
+                return
             # Emulate the fused layer: routing union from the embedded rows
             # (the same formula the attention emit_gating path uses here),
             # count via data_bytes; dense layers report 0.
@@ -399,6 +430,13 @@ class FakeDaemon(threading.Thread):
         elif t == D_CMD_RUN_DSPARK_STEP:
             p = cmd.payload.run_dspark_step
             g = p.num_query
+            if (self.dspark_fail_from is not None
+                    and self.dspark_calls >= self.dspark_fail_from):
+                self.dspark_calls += 1
+                self._error(cmd, f"dspark run_step: no valid ingested "
+                                 f"context for seq {int(p.seq_id)} "
+                                 f"(tracked seq {int(p.seq_id)}, valid 0)")
+                return
             # Draft = the true chain with an error injected at a slot
             # cycling per call (g+1 → some rounds are fully correct).
             wrong_at = self.dspark_calls % (g + 1)
@@ -550,5 +588,96 @@ def test_pure_ctypes_fallback_parity(monkeypatch):
         out = run_speculative_loop(bridge, 1, 30, 999, None, st,
                                    gamma=5, vb="batched", overlap=True)
         assert out[:30] == chain(999, 30)
+    finally:
+        _finish(daemon)
+
+
+# ── DsparkDraftError classification (INV-SERVE-SPEC-FALLBACK bridge seam):
+# an async draft's CMP_ERROR must never abort a TARGET command's wait — it
+# is stashed and surfaces at dspark_collect_async as DsparkDraftError, with
+# every target completion consumed normally before and after. ──────────────
+
+
+def _drive_dspark_error_stash(bridge, daemon) -> None:
+    from bridge.ring_bridge import DsparkDraftError
+
+    bridge.create_sequence(1, 1)
+    try:
+        # Overlap shape: draft async UNDER a plain step.  The daemon
+        # declines the draft (cmd-ring FIFO puts its CMP_ERROR ahead of
+        # the plain step's completions), so the plain step's waits consume
+        # + STASH it — the step must return its result intact.
+        seed = 4321
+        bridge.dspark_send_async(1, seed, 1, 5)
+        r = bridge.decode_step_fetch_and_run(seed, 1, 0, None)
+        assert r.sampled_token == f(seed), "plain step lost under stash"
+        with pytest.raises(DsparkDraftError, match="no valid ingested"):
+            bridge.dspark_collect_async(5, False)
+        assert bridge._dspark_err is None          # stash consumed
+        assert bridge._dspark_pending_seq == 0
+        # The bridge stays fully usable: next plain step is clean.
+        r2 = bridge.decode_step_fetch_and_run(r.sampled_token, 1, 1, None)
+        assert r2.sampled_token == f(r.sampled_token)
+    finally:
+        bridge.free_sequence(1)
+
+
+def test_async_dspark_error_stashed_not_raised_in_target_wait():
+    bridge, daemon, _ = _make(gamma=5)
+    daemon.dspark_fail_from = 0
+    try:
+        _drive_dspark_error_stash(bridge, daemon)
+    finally:
+        _finish(daemon)
+
+
+@pytest.mark.skipif(not ring_bridge.fastbridge_active(),
+                    reason="_fastbridge not built")
+def test_async_dspark_error_stash_pure_ctypes(monkeypatch):
+    monkeypatch.setattr(ring_bridge, "_fb", None)
+    bridge, daemon, _ = _make(gamma=5)
+    daemon.dspark_fail_from = 0
+    try:
+        _drive_dspark_error_stash(bridge, daemon)
+    finally:
+        _finish(daemon)
+
+
+def test_dspark_error_at_collect_classified():
+    """Error consumed by collect's own poll (no intervening target wait)
+    → same DsparkDraftError classification."""
+    from bridge.ring_bridge import DsparkDraftError
+
+    bridge, daemon, _ = _make(gamma=5)
+    daemon.dspark_fail_from = 0
+    try:
+        bridge.create_sequence(1, 1)
+        try:
+            bridge.dspark_send_async(1, 4321, 1, 5)
+            with pytest.raises(DsparkDraftError, match="no valid ingested"):
+                bridge.dspark_collect_async(5, False)
+            assert bridge._dspark_pending_seq == 0
+        finally:
+            bridge.free_sequence(1)
+    finally:
+        _finish(daemon)
+
+
+def test_drain_pending_dspark_clears_error_stash():
+    """A stashed draft error must never leak into a later request's
+    collect: drain_pending_dspark (every spec arm's finally) clears it."""
+    bridge, daemon, _ = _make(gamma=5)
+    daemon.dspark_fail_from = 0
+    try:
+        bridge.create_sequence(1, 1)
+        try:
+            bridge.dspark_send_async(1, 4321, 1, 5)
+            r = bridge.decode_step_fetch_and_run(4321, 1, 0, None)
+            assert r.sampled_token == f(4321)
+            assert bridge._dspark_err is not None  # stashed, uncollected
+            bridge.drain_pending_dspark(5)
+            assert bridge._dspark_err is None
+        finally:
+            bridge.free_sequence(1)
     finally:
         _finish(daemon)

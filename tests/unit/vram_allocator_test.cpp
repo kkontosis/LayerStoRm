@@ -1086,6 +1086,7 @@ TEST(VramAllocatorIndexerK, IndexShareAwareSizing) {
     // Baseline: V3.2, no IndexShare (freq<=0) — every hidden layer computes,
     // MTP layer never does. pages_per_seq = ceil(32768 / 8192) = 4.
     auto base = v32_config();
+    base.serving.max_concurrent_requests = 1;   // per-seq shape only
     lmod::ModelConfig mcfg_all(base);
     lmod::LayerRegistry reg_all(mcfg_all, base, nvfp4);
     auto layout_all = lmem::compute_vram_layout(base, reg_all, mcfg_all);
@@ -1098,6 +1099,7 @@ TEST(VramAllocatorIndexerK, IndexShareAwareSizing) {
     // {0,1,2} ∪ {6,10,...,58} = 17 of 61 hidden; the MTP layer (61) is
     // shared by construction.
     auto shared = v32_config();
+    shared.serving.max_concurrent_requests = 1;  // per-seq shape only
     shared.model.index_topk_freq = 4;
     shared.model.index_skip_topk_offset = 3;
     lmod::ModelConfig mcfg_sh(shared);
@@ -1113,6 +1115,103 @@ TEST(VramAllocatorIndexerK, IndexShareAwareSizing) {
     EXPECT_EQ(layout_sh.gpus[0].indexer_k_pages, pages_per_seq * computing);
     EXPECT_LT(layout_sh.gpus[0].indexer_k_bytes,
               layout_all.gpus[0].indexer_k_bytes);
+}
+
+// INV-KVT-14b / TD-INDEXER-POOL-EVICT: the kIndexerK pool must cover
+// serving.max_concurrent_requests CONCURRENT sequences, not one. Sizing it
+// for a single sequence made it a hard per-sequence wall — serving always
+// has more than one live sequence (every prefix-cache holder is one, pinning
+// a CoW frontier page group of num_dsa_layers pages), so the second live
+// sequence exhausted the pool, silently downgraded a forked long prefix to
+// dense, and fail-closed the request through the tiering re-promotion lift
+// (2026-08-24 serving incident).
+TEST(VramAllocatorIndexerK, PoolScalesWithMaxConcurrentRequests) {
+    lmod::Nvfp4 nvfp4;
+
+    auto one = v32_config();
+    one.serving.max_concurrent_requests = 1;
+    lmod::ModelConfig mcfg1(one);
+    lmod::LayerRegistry reg1(mcfg1, one, nvfp4);
+    auto layout1 = lmem::compute_vram_layout(one, reg1, mcfg1);
+    const int64_t pages1 = layout1.gpus[0].indexer_k_pages;
+    ASSERT_GT(pages1, 0);
+
+    for (int max_req : {2, 4, 8}) {   // all below this config's VRAM cap
+        auto cfg = v32_config();
+        cfg.serving.max_concurrent_requests = max_req;
+        lmod::ModelConfig mcfg(cfg);
+        lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
+        auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
+        EXPECT_EQ(layout.gpus[0].indexer_k_pages, pages1 * max_req)
+            << "max_concurrent_requests=" << max_req;
+        // Bytes track pages (region alignment only rounds UP).
+        EXPECT_GE(layout.gpus[0].indexer_k_bytes,
+                  layout1.gpus[0].indexer_k_bytes * max_req)
+            << "max_concurrent_requests=" << max_req;
+    }
+
+    // The per-sequence shape is unchanged: pages/seq × computing layers.
+    auto cfg2 = v32_config();
+    cfg2.serving.max_concurrent_requests = 2;
+    lmod::ModelConfig mcfg2(cfg2);
+    lmod::LayerRegistry reg2(mcfg2, cfg2, nvfp4);
+    auto layout2 = lmem::compute_vram_layout(cfg2, reg2, mcfg2);
+    const int pages_per_seq =
+        (cfg2.serving.max_sequence_length
+         + cfg2.memory.kv_cache.indexer_k_page_size_tokens - 1)
+        / cfg2.memory.kv_cache.indexer_k_page_size_tokens;
+    int computing = 0;
+    const int n_idx = cfg2.model.num_hidden_layers
+                    + cfg2.model.num_nextn_predict_layers;
+    for (int l = 0; l < n_idx; ++l)
+        if (mcfg2.is_full_index_layer(l) || l == 0) ++computing;
+    EXPECT_EQ(layout2.gpus[0].indexer_k_pages,
+              static_cast<int64_t>(pages_per_seq) * computing * 2);
+}
+
+// The concurrency multiple is BOUNDED by what the KV pool can spare: the
+// indexer pool is carved BEFORE KV, so every indexer byte is taken 1:1 from
+// the residual. An aspirational max_concurrent_requests must never drive that
+// residual to zero (measured 2026-08-25 on the champion box: an unbounded
+// `* max_concurrent_requests` took all 86 MiB that GPU 2 had left and gave
+// kv_main ZERO pages). At most a quarter of the one-sequence residual, whole
+// sequences only, one sequence as the hard floor.
+TEST(VramAllocatorIndexerK, PoolConcurrencyCappedByVramHeadroom) {
+    lmod::Nvfp4 nvfp4;
+    auto cfg = v32_config();
+    cfg.serving.max_concurrent_requests = 4096;   // absurd on purpose
+    lmod::ModelConfig mcfg(cfg);
+    lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
+    auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
+
+    const auto& gpu = layout.gpus[0];
+    ASSERT_GT(gpu.indexer_k_pages, 0);
+    // THE regression guard: KV still gets pages. This is what an unbounded
+    // multiple destroyed.
+    EXPECT_GT(gpu.max_kv_pages, 0)
+        << "indexer pool starved the KV residual it is carved out of";
+    EXPECT_GT(gpu.kv_main_bytes, 0);
+
+    // Floor: never below one sequence, and always a WHOLE number of them.
+    auto one = v32_config();
+    one.serving.max_concurrent_requests = 1;
+    lmod::ModelConfig mcfg1(one);
+    lmod::LayerRegistry reg1(mcfg1, one, nvfp4);
+    auto layout1 = lmem::compute_vram_layout(one, reg1, mcfg1);
+    ASSERT_GT(layout1.gpus[0].indexer_k_pages, 0);
+    EXPECT_GE(gpu.indexer_k_pages, layout1.gpus[0].indexer_k_pages);
+    EXPECT_EQ(gpu.indexer_k_pages % layout1.gpus[0].indexer_k_pages, 0);
+    // ... and the one-sequence carve is what KV was measured against, so the
+    // capped pool must not have cost KV more than the quarter it may spend.
+    EXPECT_GE(gpu.max_kv_pages, layout1.gpus[0].max_kv_pages * 3 / 4);
+
+    // TP ranks stay SYMMETRIC: replicated indexer pages are claimed in
+    // lockstep, so a richer rank must not be given pages the tightest rank
+    // cannot match (they would be unusable).
+    for (const auto& g : layout.gpus)
+        if (g.indexer_k_pages > 0)
+            EXPECT_EQ(g.indexer_k_pages, gpu.indexer_k_pages)
+                << "GPU " << g.gpu_id;
 }
 
 // ── DCP sharding ────────────────────────────────────────────────────────────
@@ -1313,6 +1412,11 @@ TEST(VramAllocatorDcp, DcpIndexerModeReplicated) {
 TEST(VramAllocatorDcp, DcpIndexerModeLocal) {
     // Local mode with DCP enabled halves indexer K pages (dcp_shard_factor=2)
     auto cfg = v32_config();
+    // Per-SEQUENCE shape only: pin the concurrency multiple (INV-KVT-14b) to
+    // one so the VRAM cap on the pool cannot bind differently between the two
+    // arms (local pages/seq are half, so an equal cap would buy local MORE
+    // sequences and break the 2:1 comparison).
+    cfg.serving.max_concurrent_requests = 1;
     lmod::ModelConfig mcfg(cfg);
     lmod::Nvfp4 nvfp4;
     lmod::LayerRegistry reg(mcfg, cfg, nvfp4);

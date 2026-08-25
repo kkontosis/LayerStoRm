@@ -1471,6 +1471,33 @@ CommandDispatcher::CommandDispatcher(Deps deps)
             // TD-KVT-DCP-SHARDED: per-rank shard tiering under sharded KV.
             topts.kv_sharded = kv_sharded_;
             topts.dcp_chunk_tokens = kv_dcp_chunk_tokens_;
+            // TD-KVT-ADMISSION-UPFRONT: size the cohort selection staging
+            // for the largest blessable chunk (the dispatcher's tier gate
+            // caps chunk rows at max_batch_size — the executor's KVS-4
+            // translation buffers share that bound).
+            if (cfg.memory.kv_tiering.tiered_prefill
+                && cfg.compute.dsa_sparse_prefill) {
+                topts.cohort_rows_max = std::max(1, deps_.max_batch_size);
+                // TD-KVT-COHORT-BATCHED-MATERIALIZE: union staging capacity
+                // = the tight upper bound on a cohort union — no row selects
+                // more than index_topk rows AND no selection can exceed the
+                // rank-LOCAL prefix (sharded KV: ~max_seq / dcp, plus one
+                // ownership chunk of slack for the round-robin remainder).
+                {
+                    const int64_t max_seq =
+                        cfg.serving.max_sequence_length;
+                    int64_t local_rows = max_seq;
+                    if (kv_sharded_ && dcp_size >= 2) {
+                        local_rows = max_seq / dcp_size
+                            + std::max(1, kv_dcp_chunk_tokens_);
+                    }
+                    const int64_t by_topk =
+                        static_cast<int64_t>(topts.cohort_rows_max)
+                        * std::max(1, cfg.model.index_topk);
+                    topts.union_rows_max = static_cast<int>(
+                        std::min(by_topk, local_rows));
+                }
+            }
             // IndexShare full-layer mask (TD-KVT-SYNC/TD-KVT-PREFETCH):
             // mirrors ModelConfig::is_full_index_layer exactly (the same
             // rule engine.cpp feeds DcpExecutor::Options::indexer_full_

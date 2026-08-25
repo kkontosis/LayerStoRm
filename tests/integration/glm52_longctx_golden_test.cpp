@@ -284,6 +284,22 @@ protected:
         if (const char* sp = std::getenv("GLM52_SPARSE_PREFILL");
             sp && *sp == '1')
             j["compute"]["dsa_sparse_prefill"] = true;
+        // TD-KVT-ADMISSION-UPFRONT: GLM52_TIERED_PREFILL=1 → per-row tiered
+        // sparse chunk prefill (chunk cohorts are tier steps — demote at
+        // sub-chunk boundaries DURING prefill; sharded KV rides the KVS-4
+        // per-row translation) + windowed admission (seq_create allocates
+        // only the admission window).  Requires GLM52_KV_TIERING and
+        // GLM52_SPARSE_PREFILL.  GLM52_ADMISSION_WINDOW=<tokens> overrides
+        // memory.kv_tiering.admission_window_tokens (default 0 = auto:
+        // retention + 1024).
+        if (const char* tp = std::getenv("GLM52_TIERED_PREFILL");
+            tp && *tp == '1') {
+            j["memory"]["kv_tiering"]["tiered_prefill"] = true;
+            if (const char* aw = std::getenv("GLM52_ADMISSION_WINDOW");
+                aw && *aw)
+                j["memory"]["kv_tiering"]["admission_window_tokens"] =
+                    std::atoi(aw);
+        }
         // GLM52_MAX_BATCH=<n>: overrides orchestrator.max_batch_size
         // (preset 64). The KV-metadata device scratch scales L × max_batch ×
         // (max_seq / page_size) ints — 1.3 GiB/rank at the 1M cap with

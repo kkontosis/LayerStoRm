@@ -57,7 +57,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from bridge.ring_bridge import BridgeError, EngineBridge
+from bridge.ring_bridge import BridgeError, DsparkDraftError, EngineBridge
 from orchestrator.types import EngineMetadata, StepLogprobs, TokenLogprob
 
 __all__ = [
@@ -193,6 +193,14 @@ class SpeculationConfig:
     enabled: bool = False
     gamma: int = 0                           # speculative_tokens
     conf_thresh: float = 0.0                 # 0 = truncation off
+    # TD-DSPARK-CTX-CAP mirror (TD-PREFIX-DSPARK-FORK-CTX residual): the
+    # draft's context-KV arena capacity in tokens.  A request whose context
+    # would overflow it (prompt + generation budget) is routed to the PLAIN
+    # arm upfront — the engine invalidates the drafting context on arena
+    # overflow and a later RUN_DSPARK_STEP against the invalid context
+    # CMP_ERRORs the whole request (surfaced by long-prompt serving once
+    # TD-KVT-ADMISSION-UPFRONT made >8k-token prompts admissible).
+    ctx_cap_tokens: int = 8192
 
 
 @dataclass
@@ -225,6 +233,10 @@ class RequestStats:
     # Guided decoding observability (constrained requests only):
     grammar_trunc_slots: int = 0             # draft slots cut by the grammar
     grammar_refeeds: int = 0                 # violation re-feed masked steps
+    # Spec→plain fallback (INV-SERVE-SPEC-FALLBACK): the 1-based round at
+    # which a draft-side dspark failure switched this request onto the
+    # plain arm for its remainder; 0 = never fell back.
+    spec_fallback_round: int = 0
 
     @property
     def tok_per_s(self) -> float:
@@ -503,6 +515,9 @@ class Orchestrator:
         self._cancelled: set[int] = set()
         self._shutdown = False
         self._next_seq_id = 1
+        # TD-INDEXER-POOL-EVICT: prefill steps answered by evicting a
+        # prefix holder and re-issuing (pool pressure, not an error).
+        self._pool_evict_retries = 0
         # DSpark drafting-context mirror (TD-PREFIX-DSPARK-FORK-CTX): the
         # engine's DsparkRuntime tracks ONE ingested drafting context; a
         # full prefill re-arms it at position 0, and a prefix-cache-forked
@@ -641,7 +656,9 @@ class Orchestrator:
                 spec = SpeculationConfig(
                     enabled=gamma >= 1, gamma=gamma,
                     conf_thresh=(conf_thresh
-                                 if ds.get("confidence_enabled") else 0.0))
+                                 if ds.get("confidence_enabled") else 0.0),
+                    ctx_cap_tokens=int(
+                        ds.get("draft_context_capacity_tokens", 8192)))
 
             meta = EngineMetadata(
                 num_gpus=info.num_gpus,
@@ -825,6 +842,37 @@ class Orchestrator:
 
     # ── generation ───────────────────────────────────────────────────────
 
+    def _with_pool_evict_retry(self, fn):
+        """Run one engine step, answering POOL EXHAUSTION with a prefix-holder
+        eviction + retry (TD-INDEXER-POOL-EVICT).
+
+        Retained holders are live sequences: they pin KV pages AND a CoW
+        indexer-K frontier page group each.  A step that exhausts a pool is
+        therefore usually blocked by CACHE, not by work — the same reading
+        that already drives the seq_create (`evict_for_admission`) and
+        seq_fork (`_fork_with_evict_retry`) retries, now extended to the
+        PREFILL step itself.  This is what keeps a KV-demoted sequence
+        SPARSE: the engine fail-closes such a step instead of downgrading it
+        to dense (a dense step would punch a permanent hole in the indexer
+        coverage and force a full cold-page re-promotion), so the only way
+        forward is to free capacity and re-issue the identical step.  The
+        failing step mutated no engine state (the guard runs before any
+        attention work), so the retry is exact.  Re-raises when the error is
+        not exhaustion or nothing is left to evict.
+        """
+        while True:
+            try:
+                return fn()
+            except BridgeError as err:
+                if ("exhausted" not in str(err)
+                        or self.prefix_cache is None
+                        or not self.prefix_cache.evict_for_admission()):
+                    raise
+                self._pool_evict_retries += 1
+                print(f"  [orch] pool exhausted mid-prefill — evicted a "
+                      f"prefix holder, retrying ({self._pool_evict_retries} "
+                      f"total)", flush=True)
+
     def _generate(self, req: InferenceRequest
                   ) -> tuple[list[int], str, RequestStats,
                              list[StepLogprobs | None] | None]:
@@ -954,8 +1002,9 @@ class Orchestrator:
                 # sampled token is discarded (teacher forcing).
                 while pos < pre:
                     check_cancel()
-                    r = self.bridge.decode_step_fetch_and_run(
-                        prompt[pos], seq_id, pos, None)
+                    r = self._with_pool_evict_retry(
+                        lambda: self.bridge.decode_step_fetch_and_run(
+                            prompt[pos], seq_id, pos, None))
                     self._guard(r)
                     pos += 1
             elif sc_path:
@@ -978,9 +1027,10 @@ class Orchestrator:
                             self._next_seq_id += 1
                     check_cancel()
                     n = min(sc_stride, pre - pos)
-                    self.bridge.prefill_superchunk_fetch_and_run(
-                        prompt[pos:pos + n], seq_id, pos,
-                        self._prefill_chunk)
+                    self._with_pool_evict_retry(
+                        lambda: self.bridge.prefill_superchunk_fetch_and_run(
+                            prompt[pos:pos + n], seq_id, pos,
+                            self._prefill_chunk))
                     pos += n
                 if (self.prefix_cache is not None and pos == grid_len
                         and grid_len > 0):
@@ -1010,8 +1060,9 @@ class Orchestrator:
                             self._next_seq_id += 1
                     check_cancel()
                     n = min(self._prefill_chunk, pre - pos)
-                    self.bridge.prefill_chunk_fetch_and_run(
-                        prompt[pos:pos + n], seq_id, pos, None)
+                    self._with_pool_evict_retry(
+                        lambda: self.bridge.prefill_chunk_fetch_and_run(
+                            prompt[pos:pos + n], seq_id, pos, None))
                     pos += n
                 if (self.prefix_cache is not None and pos == grid_len
                         and grid_len > 0):
@@ -1050,6 +1101,24 @@ class Orchestrator:
             # (token-lossless, just slower).  Guided sampled speculation
             # is deferred (TD-GUIDED-SAMPLED-SPEC): guided non-greedy
             # requests take the guided plain arm.
+            # TD-DSPARK-CTX-CAP mirror: a PROMPT that overflows the draft's
+            # context-KV arena (plus one drafting round of headroom)
+            # invalidates the drafting context engine-side during prefill
+            # ingest — route it to the PLAIN arm upfront instead of
+            # CMP_ERRORing the request at the first RUN_DSPARK_STEP
+            # (TD-PREFIX-DSPARK-FORK-CTX; surfaced by long-prompt serving
+            # once TD-KVT-ADMISSION-UPFRONT made >8k-token prompts
+            # admissible).  Lossless: plain decode is token-identical, just
+            # undrafted.  Requests whose GENERATION later crosses the cap
+            # keep today's behavior (the residual TD).
+            if (self.spec.enabled and draft_adoptable
+                    and len(prompt) + self.spec.gamma + 1
+                        > self.spec.ctx_cap_tokens):
+                draft_adoptable = False
+                print(f"  [orch] request {req.request_id}: prompt "
+                      f"{len(prompt)} tokens overflows the draft context-KV "
+                      f"arena cap {self.spec.ctx_cap_tokens} — plain decode "
+                      f"arm (TD-DSPARK-CTX-CAP)", flush=True)
             spec_ok = (self.spec.enabled and draft_adoptable
                        and not req.force_plain)
             speculate = spec_ok and req.sampling.greedy and not want_lp
@@ -1109,10 +1178,19 @@ class Orchestrator:
         step (perfectly correlated sampling — the same CDF quantile
         forever).  Each step therefore derives an independent,
         reproducible key from (request seed, position) — _step_seed."""
+        self._decode_plain_from(req, seq_id, prompt[-1], len(prompt) - 1,
+                                emit, check_cancel, stats)
+
+    def _decode_plain_from(self, req: InferenceRequest, seq_id: int,
+                           token: int, pos: int, emit, check_cancel,
+                           stats: RequestStats) -> None:
+        """The plain AR loop body from an arbitrary (token, pos) resume
+        point — feeds ``token`` at ``pos`` first.  ``_decode_plain`` is
+        the whole-request entry; the spec→plain FALLBACK
+        (INV-SERVE-SPEC-FALLBACK) resumes here mid-request with
+        (last committed token, next feed position)."""
         base = None if req.sampling.greedy else req.sampling.as_tuple()
         want_lp = req.logprobs is not None
-        token = prompt[-1]
-        pos = len(prompt) - 1
         while True:
             check_cancel()
             sampling = None
@@ -1191,7 +1269,18 @@ class Orchestrator:
                 fed += 1
                 cont = emit(t)
                 tw = time.monotonic() if round_csv is not None else 0.0
-                draft, confs = b.dspark_collect_async(gamma, with_conf)
+                try:
+                    draft, confs = b.dspark_collect_async(gamma, with_conf)
+                except DsparkDraftError as e:
+                    # Draft-side failure only — target state (and the
+                    # committed token t) intact.  Fall back to the plain
+                    # arm for the remainder (INV-SERVE-SPEC-FALLBACK).
+                    self._note_spec_fallback(req, stats, fed, e)
+                    if not cont:
+                        return
+                    self._decode_plain_from(req, seq_id, t, fed, emit,
+                                            check_cancel, stats)
+                    return
                 draft_exposed = ((time.monotonic() - tw) * 1e3
                                  if round_csv is not None else 0.0)
                 if not cont:
@@ -1417,7 +1506,28 @@ class Orchestrator:
                 t, lp_t = pick(self._read_logits())
                 fed += 1
                 cont = emit(t, lp_t)
-                draft, confs = b.dspark_collect_async(gamma, with_conf)
+                try:
+                    draft, confs = b.dspark_collect_async(gamma, with_conf)
+                except DsparkDraftError as e:
+                    # Draft-side failure — continue HOST-SAMPLED plain AR
+                    # with the SAME RNG stream: by INV-SAMPLED-SPEC the
+                    # remainder is trajectory-identical to what the
+                    # speculative arm would have committed (one draw per
+                    # committed token, in order).
+                    self._note_spec_fallback(req, stats, fed, e)
+                    if not cont:
+                        return
+                    token = t
+                    while True:
+                        check_cancel()
+                        r = b.decode_step_fetch_and_run(
+                            token, seq_id, fed, None, logits_readback=True)
+                        self._guard(r)
+                        stats.rounds += 1
+                        fed += 1
+                        token, lp = pick(self._read_logits())
+                        if not emit(token, lp):
+                            return
                 if not cont:
                     return
                 # DSP-9 truncation over the REMAINING slots (slot 0 is
@@ -1536,9 +1646,18 @@ class Orchestrator:
         picks greedy (temperature 0) or sampled per SamplingParams —
         every emitted token is grammar-valid by construction.  Logprobs
         ride the SAME readback row for free (raw pre-mask distribution)."""
+        self._decode_guided_plain_from(req, seq_id, prompt[-1],
+                                       len(prompt) - 1, emit, check_cancel,
+                                       stats, guided)
+
+    def _decode_guided_plain_from(self, req: InferenceRequest, seq_id: int,
+                                  token: int, pos: int, emit, check_cancel,
+                                  stats: RequestStats, guided) -> None:
+        """The guided plain loop body from an arbitrary (token, pos)
+        resume point (spec→plain fallback entry — the grammar matcher
+        state already reflects every emitted token, so it carries over
+        unchanged; INV-SERVE-SPEC-FALLBACK)."""
         want_lp = req.logprobs is not None
-        token = prompt[-1]
-        pos = len(prompt) - 1
         while True:
             check_cancel()
             token, logits = self._masked_step(guided, token, pos, seq_id,
@@ -1598,7 +1717,19 @@ class Orchestrator:
                 t, _ = self._masked_step(guided, anchor, fed, seq_id, smp)
                 fed += 1
                 cont = emit(t)
-                draft, confs = b.dspark_collect_async(gamma, with_conf)
+                try:
+                    draft, confs = b.dspark_collect_async(gamma, with_conf)
+                except DsparkDraftError as e:
+                    # Draft-side failure — continue grammar-constrained
+                    # plain decode; the matcher state already reflects
+                    # every emitted token (INV-SERVE-SPEC-FALLBACK).
+                    self._note_spec_fallback(req, stats, fed, e)
+                    if not cont:
+                        return
+                    self._decode_guided_plain_from(req, seq_id, t, fed,
+                                                   emit, check_cancel,
+                                                   stats, guided)
+                    return
                 if not cont:
                     return
                 # DSP-9 truncation over the REMAINING slots.
@@ -1666,6 +1797,22 @@ class Orchestrator:
                 stats.accepted += j
         finally:
             b.drain_pending_dspark(gamma)
+
+    def _note_spec_fallback(self, req: InferenceRequest,
+                            stats: RequestStats, fed: int,
+                            err: Exception) -> None:
+        """Bookkeeping for a draft-side dspark failure mid-request
+        (INV-SERVE-SPEC-FALLBACK): the engine's drafting context is dead
+        for this request (it re-arms only on the next position-0 capture,
+        i.e. a later request's full prefill) — pessimise the adoption
+        mirror so forked successors route plain, record the cut round,
+        and log the event server-side (the request itself CONTINUES on
+        the plain arm, so no error ever reaches the client)."""
+        self._draft_ctx_valid = False
+        stats.spec_fallback_round = stats.rounds + 1
+        print(f"  [orch] request {req.request_id}: draft failed ({err}) — "
+              f"speculative→plain fallback at round {stats.rounds + 1} "
+              f"(position {fed}); remainder decodes plain", flush=True)
 
     @staticmethod
     def _guard(r) -> None:

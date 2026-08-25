@@ -228,10 +228,41 @@ void CommandDispatcher::handle_seq_create(const ipc::Command& cmd) {
     const uint32_t base_pages = (prompt_len + page_size - 1) / page_size;
     const uint32_t with_headroom = base_pages
         + static_cast<uint32_t>(chunk_size_pages_);
-    const uint32_t num_pages = (max_blocks_per_seq_ > 0)
+    uint32_t num_pages = (max_blocks_per_seq_ > 0)
         ? std::min(with_headroom,
                    static_cast<uint32_t>(max_blocks_per_seq_))
         : with_headroom;
+
+    // TD-KVT-ADMISSION-UPFRONT (memory.kv_tiering.tiered_prefill): windowed
+    // admission — allocate only the admission window upfront; the remainder
+    // grows lazily (ensure_pages at kv-meta build) as the chunk frontier
+    // advances while chunk-boundary demotion frees behind the retention
+    // window, so peak KV VRAM is bounded by the window, never prompt
+    // length.  kMain only (draft pools stay upfront), non-V4 (three-bucket
+    // layout keeps full allocation — TD note), and only with the tiering
+    // manager LIVE (without demotion a window would just move the
+    // exhaustion mid-prefill).
+    if (pool == memory::Pool::kMain && kv_tiering_ && !is_v4_arch
+        && deps_.live_config
+        && deps_.live_config->memory.kv_tiering.tiered_prefill
+        && deps_.live_config->compute.dsa_sparse_prefill) {
+        const int cfg_w =
+            deps_.live_config->memory.kv_tiering.admission_window_tokens;
+        const uint32_t w_tokens = cfg_w > 0
+            ? static_cast<uint32_t>(cfg_w)
+            : static_cast<uint32_t>(kv_tiering_->hot_buffer_slots()) + 1024u;
+        const uint32_t w_pages = (w_tokens + page_size - 1) / page_size
+            + static_cast<uint32_t>(chunk_size_pages_);
+        if (w_pages < num_pages) {
+            spdlog::info(
+                "seq_create: windowed admission for seq {} — prompt_len {} "
+                "({} logical pages) admitted with a {}-token window ({} "
+                "pages upfront); remainder grows lazily, demotion bounds "
+                "the hot set (TD-KVT-ADMISSION-UPFRONT)",
+                seq_id, prompt_len, num_pages, w_tokens, w_pages);
+            num_pages = w_pages;
+        }
+    }
 
     // TD-GOLDEN: one physical page per (logical page, layer), layer-major —
     // every attention layer needs its own KV rows for a token.
@@ -1200,7 +1231,8 @@ void CommandDispatcher::handle_seq_restore(const ipc::Command& cmd) {
         ? deps_.live_config->memory.kv_cache.indexer_k_page_size_tokens : 0;
     if (h.ik_groups > 0
         && (h.ik_page_tokens != static_cast<uint32_t>(PT_now)
-            || !ensure_indexer_pages(seq_id, h.token_count - 1, 0, dcp))) {
+            || ensure_indexer_pages(seq_id, h.token_count - 1, 0, dcp)
+                   != IndexerPageResult::kOk)) {
         seq_it->second.indexer_cov = {h.token_count, IndexerSeqMode::kDead};
         spdlog::warn("seq_restore: indexer pages unavailable or page-size "
                      "mismatch (ckpt {} vs config {}) — restored KV only; "

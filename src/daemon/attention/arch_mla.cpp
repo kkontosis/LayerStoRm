@@ -1695,7 +1695,108 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                 r, params.layer_idx, params.sparse_indices[r],
                 params.topk_lengths[r], B, stream, &tv);
         }
-        if (mixed_rows) {
+        // TD-KVT-ADMISSION-UPFRONT: a blessed SPARSE prefill chunk on a tier
+        // step (the dispatcher stages kv_tiering only when the tiered-
+        // prefill mode blessed this chunk) consumes PER ROW as B==1 sparse
+        // sub-dispatches — the INV-DSA-ROWMIX shape: row b attends exactly
+        // its own causal top-k (INV-SPARSE-CHUNK-CAUSAL), through the real
+        // block tables while the layer is fully resident, or through the
+        // manager's B==1 fake view when it has cold pages (INV-KVT-13
+        // extended to chunk cohorts; placement-only, INV-KVT-1 — bit-
+        // identical to the same per-row consumption with everything hot).
+        // Row outputs land in their batch row slices, so the downstream
+        // DCP combine / o_proj are untouched (mixed-rows precedent).
+        // HYBRID gate: per-row consumption only when the layer actually
+        // holds cold pages (or LS_KVT_COHORT_ALWAYS=1 forces the strict
+        // per-row arm) — an all-hot layer keeps the batched sparse chunk
+        // kernel below (its full-local-prefix linearize is legal, and the
+        // per-row shape costs ~decode-class attention per row).
+        const bool tiered_chunk = chunk_rows && params.kv_tiering
+            && params.is_sparse
+            && params.sparse_indices && params.topk_lengths
+            && params.kv_tiering->cohort_layer_tiered(params.layer_idx);
+        // TD-KVT-COHORT-BATCHED-MATERIALIZE: batched union consumer — the
+        // manager materializes the UNION of the cohort's selections once
+        // and rewrites each row's indices to union slots (order-preserving),
+        // so the ONE batched sparse chunk-causal kernel runs over the fake
+        // union view exactly like the resident-layer batched call below:
+        // per-row topk_lengths unchanged, per-row seqlens all = the union
+        // extent (constant satisfies the chunk_causal ascending contract;
+        // the causal bound never bites — the producer's selection is already
+        // causal, INV-SPARSE-CHUNK-CAUSAL).  False (no cold pages / arm
+        // disabled via LS_KVT_COHORT_ROWWISE=1 / empty or over-capacity
+        // union) falls back to the per-row loop below — always correct.
+        bool tiered_union = false;
+        parallelism::TieredKvView utv{};
+        if (tiered_chunk) {
+            tiered_union = params.kv_tiering->materialize_cohort(
+                r, params.layer_idx, B, params.sparse_indices[r],
+                params.topk_lengths[r], indexer_step_fresh_, stream, &utv);
+        }
+        if (tiered_union) {
+            attn->prefill_attention(
+                q_attn[r], B, utv.seq_len_kv,
+                utv.seqlens_k, utv.block_tables, utv.max_blocks_per_seq,
+                utv.kv_cache,
+                params.cache_stride_block, params.cache_stride_row,
+                params.page_size,
+                /*is_sparse=*/true, /*chunk_causal=*/true,
+                utv.sparse_indices, params.topk_lengths[r],
+                opts_.index_topk,
+                prefill_out_[r], prefill_lse_[r],
+                params.layer_idx, stream);
+        } else if (tiered_chunk) {
+            const int KV = opts_.kv_lora_rank + opts_.qk_rope_head_dim;
+            const size_t q_row_b   =
+                static_cast<size_t>(attn_num_heads_) * KV * 2;   // BF16
+            const size_t out_row_b =
+                static_cast<size_t>(attn_num_heads_) * opts_.kv_lora_rank * 2;
+            for (int b = 0; b < B; ++b) {
+                // Per-row KV bound: the row's own (rank-local under sharded
+                // KV, KVS-3) cached length — what a stand-alone B==1 step
+                // of this position would use.
+                int skv_b = seq_len_kv;
+                if (params.host_local_seqlens_k
+                    && params.host_local_seqlens_k[r])
+                    skv_b = params.host_local_seqlens_k[r][b];
+                else if (params.host_seqlens_k)
+                    skv_b = params.host_seqlens_k[b];
+                parallelism::TieredKvView rtv{};
+                const bool rt = params.kv_tiering->materialize_row(
+                    r, params.layer_idx, b, B, params.sparse_indices[r],
+                    params.topk_lengths[r], indexer_step_fresh_, stream,
+                    &rtv);
+                attn->prefill_attention(
+                    static_cast<const char*>(q_attn[r]) + b * q_row_b,
+                    /*batch_size=*/1,
+                    rt ? rtv.seq_len_kv : skv_b,
+                    rt ? rtv.seqlens_k
+                       : (params.seqlens_k ? params.seqlens_k[r] + b
+                                           : nullptr),
+                    rt ? rtv.block_tables
+                       : (params.block_tables
+                              ? params.block_tables[r]
+                                    + static_cast<size_t>(b)
+                                          * params.max_blocks_per_seq
+                              : nullptr),
+                    rt ? rtv.max_blocks_per_seq : params.max_blocks_per_seq,
+                    rt ? rtv.kv_cache
+                       : (params.kv_cache_ptrs ? params.kv_cache_ptrs[r]
+                                               : nullptr),
+                    params.cache_stride_block, params.cache_stride_row,
+                    params.page_size,
+                    /*is_sparse=*/true, /*chunk_causal=*/false,
+                    rt ? rtv.sparse_indices
+                       : params.sparse_indices[r]
+                             + static_cast<size_t>(b) * opts_.index_topk,
+                    params.topk_lengths[r] + b,
+                    opts_.index_topk,
+                    static_cast<char*>(prefill_out_[r]) + b * out_row_b,
+                    prefill_lse_[r]
+                        + static_cast<size_t>(b) * attn_num_heads_,
+                    params.layer_idx, stream);
+            }
+        } else if (mixed_rows) {
             const int KV = opts_.kv_lora_rank + opts_.qk_rope_head_dim;
             const size_t q_row_b   =
                 static_cast<size_t>(attn_num_heads_) * KV * 2;   // BF16
@@ -1877,8 +1978,19 @@ void DcpExecutor::execute_attention(const AttentionExecParams& params) {
         // sharded KV would need per-row GLOBAL→LOCAL translation + local
         // per-row bounds (TD-SPARSE-PREFILL-KVS) and keeps the dense chunk
         // path.
+        // TD-KVT-ADMISSION-UPFRONT (Options::tiered_prefill): sharded KV no
+        // longer forces dense chunks — the per-row global top-k is KVS-4-
+        // translated below (indexer_shard_translate is batched per row; the
+        // per-row causal bound survives translation because local ordering
+        // is global-ascending) and the consumer runs per-row sub-dispatches
+        // on tier steps.  Without the flag, sharded keeps the dense chunk
+        // path (TD-SPARSE-PREFILL-KVS legacy behavior, byte-identical).
         const bool sharded_kv = opts_.dcp_kv_sharded && dcp_size_ >= 2;
-        if (all_appended && opts_.sparse_prefill && !sharded_kv) {
+        const bool sharded_pf_ok = !sharded_kv
+            || (opts_.tiered_prefill
+                && params.batch_size <= opts_.max_batch_size
+                && opts_.dcp_chunk_tokens > 0 && sparse_local_indices_dev_[0]);
+        if (all_appended && opts_.sparse_prefill && sharded_pf_ok) {
             // TD-PREFILL-SUPERCHUNK: this sub-chunk's persistent selection
             // rows live at its global row range — the consumer indexes rows
             // [0, B) off the OFFSET base (0 for legacy prefill).
@@ -1907,6 +2019,31 @@ void DcpExecutor::execute_attention(const AttentionExecParams& params) {
             // the buffers already hold this step's merged result).
             if (all && indexer_local_ && indexer_step_fresh_)
                 merge_local_indexer_candidates(params);
+            // TD-KVT-ADMISSION-UPFRONT: sharded KV — translate the chunk's
+            // per-row GLOBAL selection to each rank's LOCAL slot indices
+            // (KVS-4; same kernel as decode, batched over the chunk rows).
+            // Local ordering is global-ascending, so each row's causal
+            // global selection lands strictly below its rank-local bound
+            // (seqlens_k[r], KVS-3) — the sparse consumer stays exact.
+            // Runs every layer (IndexShare shared layers reuse the global
+            // buffers; the translation is recomputed, exactly like decode).
+            if (all && sharded_kv) {
+                for (int r = 0; r < dcp_size_; ++r) {
+                    auto* attn = opts_.attention_devices[r];
+                    attn->set_device();
+                    attn->indexer_shard_translate(
+                        sparse_indices_ptrs_[r], topk_lengths_ptrs_[r],
+                        sparse_local_indices_dev_[r],
+                        topk_local_lengths_dev_[r],
+                        params.batch_size, opts_.index_topk,
+                        opts_.dcp_chunk_tokens, dcp_size_, r,
+                        attn_streams_[r]);
+                    sparse_indices_ptrs_[r] =
+                        static_cast<const int*>(sparse_local_indices_dev_[r]);
+                    topk_lengths_ptrs_[r] =
+                        static_cast<const int*>(topk_local_lengths_dev_[r]);
+                }
+            }
             if (all) {
                 p.is_sparse = true;
                 p.sparse_indices = sparse_indices_ptrs_.data();
@@ -2102,6 +2239,37 @@ bool ArchMla::stage_step(
         parallelism::AttentionExecParams& params,
         int batch_size, int layer, int dcp_size, bool kv_meta_ok) {
     using IndexerSeqMode = CommandDispatcher::IndexerSeqMode;
+    using IndexerPageResult = CommandDispatcher::IndexerPageResult;
+
+    // TD-INDEXER-POOL-EVICT: a Pool::kIndexerK exhaustion that would
+    // downgrade a KV-DEMOTED sequence to dense is FATAL, not merely lossy.
+    // Two reasons compound: (a) a dense step skips the indexer append, so
+    // the sequence's contiguous coverage gets a permanent hole (kDead — it
+    // can never return to sparse); (b) dense reads the whole prefix through
+    // the REAL block tables, so under tiering the TD-KVT-PREFILL-REPROMOTE
+    // lift must pull the ENTIRE cold prefix back into VRAM — exactly the
+    // capacity that forced the demotion — and fail-closes (the 2026-08-24
+    // serving incident: kIndexerK exhausted at a forked 25k prefix ⇒
+    // repromote_seq stalled at 5018/29952 pages ⇒ CMP_ERROR).
+    // The pool is sized for serving.max_concurrent_requests sequences, so
+    // exhaustion means it is full of OTHER live sequences — prefix-cache
+    // holders pin a CoW frontier page group each. That is RECLAIMABLE
+    // capacity, so surface a RETRYABLE pool-exhaustion error instead: the
+    // orchestrator frees one holder (its indexer pages die with its
+    // sequence) and re-issues the identical step, which provisions and
+    // stays SPARSE. Sequences with no demotions keep the old lossy dense
+    // downgrade — legal there, and no behavior change off tiering.
+    auto indexer_exhaustion_fatal = [&](uint64_t sid) {
+        return d_.kv_tiering_ && d_.kv_tiering_->seq_has_demotions(sid);
+    };
+    auto raise_indexer_exhausted = [&]() {
+        d_.last_internal_error_cat_ = ipc::CmpErrorCategory::kKvPoolExhausted;
+        // Keep "exhausted" inside the 80-byte CMP_ERROR message field — the
+        // orchestrator's evict-retry matches on it.
+        d_.last_internal_error_msg_ =
+            "indexer-K pool exhausted (demoted seq) — retryable, evict a "
+            "prefix holder";
+    };
     // TD-GLM-INDEXER-PAGED/-BATCH/-DCP/-COV: provision paged indexer-K per
     // batch entry (each entry is its own sequence; at dcp>=2 every rank gets
     // its own GPU's replica pages) and hand the producer the per-rank host
@@ -2218,8 +2386,14 @@ bool ArchMla::stage_step(
                 // Local indexer mode never blesses the arena (the executor
                 // arena is replicated-shape) — provisioning failure is a
                 // permanent dense downgrade instead.
-                if (d_.ensure_indexer_pages(be[b].seq_id, pos, b, dcp_size)) {
+                const auto ipr =
+                    d_.ensure_indexer_pages(be[b].seq_id, pos, b, dcp_size);
+                if (ipr == IndexerPageResult::kOk) {
                     cov.mode = IndexerSeqMode::kPaged;
+                } else if (ipr == IndexerPageResult::kExhausted
+                           && indexer_exhaustion_fatal(be[b].seq_id)) {
+                    raise_indexer_exhausted();  // leave cov.mode intact
+                    return false;
                 } else if (cov.mode == IndexerSeqMode::kUnset
                            && batch_size == 1 && advancing
                            && !indexer_local_mode) {
@@ -2327,13 +2501,21 @@ bool ArchMla::stage_step(
                         // grow the pool allocation cumulatively AND fill each
                         // batch row's table slice (the appender reads row b's
                         // slice for position b). Idempotent for repeats.
-                        bool ok = true;
-                        for (int b = 0; b < batch_size && ok; ++b)
-                            ok = d_.ensure_indexer_pages(be[0].seq_id,
+                        auto ipr = IndexerPageResult::kOk;
+                        for (int b = 0;
+                             b < batch_size && ipr == IndexerPageResult::kOk;
+                             ++b)
+                            ipr = d_.ensure_indexer_pages(be[0].seq_id,
                                                       be[b].token_pos, b,
                                                       dcp_size);
+                        const bool ok = ipr == IndexerPageResult::kOk;
                         if (ok) {
                             cov.mode = IndexerSeqMode::kPaged;
+                        } else if (ipr == IndexerPageResult::kExhausted
+                                   && indexer_exhaustion_fatal(
+                                          be[0].seq_id)) {
+                            raise_indexer_exhausted();  // cov.mode intact
+                            return false;
                         } else if (cov.mode == IndexerSeqMode::kUnset
                                    && advancing && !indexer_local_mode) {
                             // Fresh sequence (next_pos == pos0 == 0): the
@@ -2418,6 +2600,7 @@ bool ArchMla::stage_step(
     tier_seq_ = 0;
     tier_pos_ = 0;
     tier_step_ = false;
+    tier_rows_ = 1;
     if (d_.kv_tiering_ && kv_meta_ok && d_.deps_.sideband_base) {
         d_.kv_tiering_->poll_demotions();
         const auto* tbe = reinterpret_cast<const ipc::BatchDescriptorEntry*>(
@@ -2430,11 +2613,27 @@ bool ArchMla::stage_step(
         // replicated KV; replicated indexer is guaranteed by the tiering
         // construction gate).  A dense chunk under tiering would stage the
         // full prefix through the real block tables (INV-KVT-2).
+        // TD-KVT-ADMISSION-UPFRONT (memory.kv_tiering.tiered_prefill): a
+        // blessed sparse prefill CHUNK COHORT (B>1 rows of ONE sequence —
+        // the indexer_prefill_append blessing already validated same-seq
+        // ascending shape) is ALSO a tier step, under BOTH KV modes: the
+        // executor consumes it per row (B==1 sub-dispatches; sharded KV
+        // rides the KVS-4 per-row translation).  Rows must fit the
+        // executor's translation buffers (max_batch_size) AND the
+        // manager's cohort staging (begin_layer re-checks its cap).
+        const auto* lc = d_.deps_.live_config;
+        const bool tiered_prefill_mode = lc
+            && lc->memory.kv_tiering.tiered_prefill
+            && lc->compute.dsa_sparse_prefill
+            && batch_size <= std::max(1, d_.deps_.max_batch_size);
         const bool prefill_sparse_tierable = params.indexer_prefill_append
-            && d_.deps_.live_config
-            && d_.deps_.live_config->compute.dsa_sparse_prefill
-            && !(d_.kv_sharded_ && dcp_size >= 2);
-        const bool tierable = batch_size == 1 && p.is_draft == 0
+            && lc && lc->compute.dsa_sparse_prefill
+            && (!(d_.kv_sharded_ && dcp_size >= 2) || tiered_prefill_mode)
+            && (batch_size == 1 || tiered_prefill_mode);
+        const bool tierable
+            = (batch_size == 1
+               || (params.indexer_prefill_append && batch_size > 1))
+            && p.is_draft == 0
             && !params.use_graph
             && params.indexer_step_key != 0
             && !params.indexer_sparse_suppress
@@ -2450,9 +2649,11 @@ bool ArchMla::stage_step(
                 d_.tier_bt_scratch_[r] =
                     d_.kv_meta_scratch_[r].host_block_tables.data() + bt_off;
             if (d_.kv_tiering_->begin_layer(layer, tier_seq_, tier_pos_,
-                                         d_.tier_bt_scratch_.data())) {
+                                         d_.tier_bt_scratch_.data(),
+                                         batch_size)) {
                 params.kv_tiering = d_.kv_tiering_.get();
                 tier_step_ = true;
+                tier_rows_ = batch_size;
             }
         }
         if (!tier_step_ && d_.kv_tiering_->has_demotions()) {
@@ -2543,6 +2744,10 @@ bool ArchMla::execute(
     // GLM-25k: demote this layer's pages that fell fully behind the retention
     // window (background D2H ordered after this layer's attention-stream
     // work; the device page returns to the allocator when the copy lands).
+    // TD-KVT-ADMISSION-UPFRONT: a chunk cohort demotes behind its LAST row's
+    // position — long served prefill demotes at every sub-chunk boundary,
+    // bounding the hot set by retention + active chunk (the retention window
+    // itself keeps the active superchunk hot, INV-KVT-4 unchanged).
     if (tier_step_ && params.kv_tiering) {
         auto tit = d_.sequences_.find(tier_seq_);
         if (tit != d_.sequences_.end()) {
@@ -2550,8 +2755,10 @@ bool ArchMla::execute(
             const int lyr = (layer >= 0 && layer < L) ? layer : 0;
             const auto& pgs = tit->second.kv_pages;
             const int num_logical = static_cast<int>(pgs.size()) / L;
+            const uint32_t demote_pos = tier_pos_
+                + static_cast<uint32_t>(tier_rows_ > 0 ? tier_rows_ - 1 : 0);
             if (num_logical > 0)
-                d_.kv_tiering_->after_attention(layer, tier_seq_, tier_pos_,
+                d_.kv_tiering_->after_attention(layer, tier_seq_, demote_pos,
                                              pgs.data() + lyr, num_logical, L);
         }
     }

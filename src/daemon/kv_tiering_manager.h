@@ -217,6 +217,15 @@ public:
         /// disabled (materialize_row fails loud; legacy B==1 staging only).
         int cohort_rows_max = 0;
 
+        /// TD-KVT-COHORT-BATCHED-MATERIALIZE: capacity (rows) of the cohort
+        /// UNION staging — the batched consumer materializes the union of a
+        /// chunk's per-row selections once instead of per-row fake views.
+        /// Caller sizes it min(cohort_rows_max × index_topk, the rank-local
+        /// max prefix rows) — a union can never exceed either bound.  0 =
+        /// batched cohort arm disabled (materialize_cohort returns false;
+        /// per-row consumption only).  Ignored when cohort_rows_max <= 1.
+        int union_rows_max = 0;
+
         /// IndexShare full-layer mask, EXECUTOR semantics (DcpExecutor::
         /// Options::indexer_full_layers): layer l is FULL iff the mask is
         /// empty OR (l < size && mask[l]); layers beyond the mask (MTP) are
@@ -362,6 +371,30 @@ public:
                          bool selection_fresh, void* stream,
                          parallelism::TieredKvView* out) override;
 
+    /// TD-KVT-COHORT-BATCHED-MATERIALIZE: batched union cohort consumption.
+    /// ONE gather of the union of the chunk's per-row selections into the
+    /// union staging set + host-side order-preserving index rewrite to union
+    /// slots ([rows x index_topk] upload; IndexShare shared layers reuse the
+    /// union + rewrite under the (seq, pos, rows) identity — the gather still
+    /// runs per layer, per-layer KV bytes/cold sets).  Same classify/burst/
+    /// gather placement body as the per-row path (INV-KVT-1); union cold
+    /// misses skip row-cache INSERTS (the union dedups intra-step; mass
+    /// inserts would thrash the LRU) while cache hits still serve as sources.
+    /// False when the layer has no cold pages, union_rows_max is 0/exceeded,
+    /// or LS_KVT_COHORT_ROWWISE=1 — caller falls back to materialize_row.
+    bool materialize_cohort(int rank, int layer_idx, int rows,
+                            const int* sparse_indices_dev,
+                            const int* topk_lengths_dev,
+                            bool selection_fresh, void* stream,
+                            parallelism::TieredKvView* out) override;
+
+    /// Hybrid cohort gate: true iff the current begin_layer cohort's layer
+    /// has cold pages (per-row consumption required) — all-hot layers keep
+    /// the batched sparse chunk kernel.  Env LS_KVT_COHORT_ALWAYS=1 forces
+    /// true for every tier-step chunk (strict same-arm identity runs: the
+    /// per-row shape then never depends on placement state).
+    bool cohort_layer_tiered(int layer_idx) override;
+
     void on_dense_layer(int layer_idx) override;
 
     // ── Introspection (tests, logging) ────────────────────────────────────
@@ -400,6 +433,12 @@ public:
         uint64_t cohort_readbacks = 0;      ///< batched cohort selection D2Hs
         uint64_t cohort_rows_tiered = 0;    ///< chunk rows consumed via a
                                             ///< materialize_row fake view
+        // TD-KVT-COHORT-BATCHED-MATERIALIZE (union arm)
+        uint64_t cohort_unions = 0;         ///< batched union materializations
+                                            ///< (one per (rank, layer))
+        uint64_t cohort_union_rows = 0;     ///< union rows gathered
+        uint64_t cohort_union_rewrites = 0; ///< union builds + index rewrites
+                                            ///< (IndexShare reuse skips these)
     };
     const Stats& stats() const { return stats_; }
 
@@ -500,16 +539,67 @@ private:
                                     ///< on non-storing ranks under dedup)
     };
 
-    struct RankBufs {
+    /// One materialize staging set.  TWO exist per rank (ping-pong,
+    /// TD-KVT-ADMISSION-UPFRONT): per-row cohort consumption materializes
+    /// once per chunk ROW, and a single set host-serializes every
+    /// materialize behind the PREVIOUS row's device-side gather (the
+    /// mat_inflight guard measured ~37% of the tiered prefill wall).
+    /// Alternating sets lets the host run ahead; device-side ordering is
+    /// unchanged (all cache reads/writes and the gather stay on the
+    /// attention stream).
+    struct MatSet {
         // Device
         void* scratch = nullptr;        ///< fake pages: n_fake_pages × stride_block
-        void* row_cache = nullptr;      ///< kv_layers × hot_slots × stride_row
         void* cold_incoming = nullptr;  ///< index_topk × stride_row (packed misses)
         void* dev_src_ptrs = nullptr;   ///< index_topk × void*
         void* dev_scatter_ptrs = nullptr;   ///< index_topk × void*
         void* dev_scatter_idx = nullptr;    ///< index_topk × int
+        // Pinned host (inside the rank arena)
+        char* h_stage = nullptr;            ///< index_topk × stride_row
+        const void** h_src_ptrs = nullptr;  ///< index_topk
+        const void** h_scatter_ptrs = nullptr;
+        int* h_scatter_idx = nullptr;
+        // Events / state
+        void* ev_h2d = nullptr;      ///< cold burst completion
+        void* ev_mat_done = nullptr; ///< recorded after the step-5 gather
+                                     ///< (host staging-reuse guard)
+        bool mat_inflight = false;   ///< ev_mat_done recorded, staging in use
+    };
+
+    struct RankBufs {
+        // Device
+        void* row_cache = nullptr;      ///< kv_layers × hot_slots × stride_row
         void* dev_ident_indices = nullptr;  ///< index_topk × int iota
         void* dev_fake_bt = nullptr;        ///< n_fake_pages × int iota
+        MatSet mat[2];                  ///< ping-pong materialize staging
+        int mat_parity = 0;             ///< next set to use
+        // TD-KVT-COHORT-BATCHED-MATERIALIZE: union staging (single set —
+        // one union materialize per (rank, layer), the inter-layer attention
+        // + MoE work drains the previous gather).  Allocated only when the
+        // union arm is enabled (union_rows_max > 0, cohort seam on, not
+        // LS_KVT_COHORT_ROWWISE).  umat capacity = union_rows_max rows;
+        // umat.h_scatter_* stay null (union gathers never cache-insert).
+        MatSet umat;
+        void* dev_uidx = nullptr;       ///< cohort_rows_max × index_topk int
+                                        ///< (per-row indices rewritten to
+                                        ///< union slots, order-preserving)
+        void* dev_useq = nullptr;       ///< cohort_rows_max × int (= union_n)
+        void* dev_union_bt = nullptr;   ///< cohort_rows_max × u_pages_cap int
+                                        ///< (replicated iota rows)
+        int* h_uidx = nullptr;          ///< pinned mirror of dev_uidx
+        int* h_useq = nullptr;          ///< pinned mirror of dev_useq
+        void* ev_uidx = nullptr;        ///< h_uidx/h_useq upload fence
+                                        ///< (INV-KVT-7 single-writer)
+        bool uidx_inflight = false;
+        // Union identity (IndexShare reuse of the union build + rewrite;
+        // the GATHER always reruns per layer — per-layer bytes/cold sets).
+        bool u_valid = false;
+        uint64_t u_seq = 0;
+        uint32_t u_pos = 0;
+        int u_rows = 0;
+        int u_n = 0;                    ///< union rows (host)
+        std::vector<int> u_pos_list;    ///< ascending unique union positions
+        std::vector<int> u_slot_of;     ///< position → union slot (-1 = none)
         // Device — IndexShare lookahead prefetch (TD-KVT-PREFETCH); separate
         // from the materialize buffers: a prefetch burst may be in flight
         // while the next materialize reuses cold_incoming/h_stage.
@@ -520,12 +610,8 @@ private:
         memory::NumaBuffer host_arena{};    ///< staging + tables + cold pool
         bool host_registered = false;
         int numa_node = -1;
-        char* h_stage = nullptr;            ///< index_topk × stride_row
-        const void** h_src_ptrs = nullptr;  ///< index_topk
-        const void** h_scatter_ptrs = nullptr;
-        int* h_scatter_idx = nullptr;
-        int* h_indices = nullptr;           ///< index_topk
-        int* h_topk_len = nullptr;          ///< 1
+        int* h_indices = nullptr;           ///< cohort_rows_max × index_topk
+        int* h_topk_len = nullptr;          ///< cohort_rows_max (min 1)
         char* h_pf_stage = nullptr;         ///< index_topk × stride_row
         const void** h_pf_scatter_ptrs = nullptr;  ///< index_topk
         int* h_pf_scatter_idx = nullptr;    ///< index_topk
@@ -538,14 +624,10 @@ private:
         void* d2h_stream = nullptr;
         bool owns_d2h_stream = false;
         void* ev_sync = nullptr;     ///< host-wait event (indices D2H)
-        void* ev_h2d = nullptr;      ///< cold burst completion
         void* ev_attn_order = nullptr;  ///< attention→D2H ordering
         void* ev_pf = nullptr;          ///< prefetch burst+scatter completion
         void* ev_pf_order = nullptr;    ///< attention→prefetch-write ordering
-        void* ev_mat_done = nullptr;    ///< recorded after the step-5 gather
-                                        ///< (host staging-reuse guard)
         bool pf_inflight = false;       ///< ev_pf recorded, h_pf_* in use
-        bool mat_inflight = false;      ///< ev_mat_done recorded, staging in use
         std::vector<int> cold_free;  ///< free cold pool slots
         /// Per-slot holder count (TD-KVT-SPEC-FORK): 0 = free, 1 = single
         /// owner, >1 = shared across a fork family.  A slot returns to
@@ -607,6 +689,14 @@ private:
     void materialize_selection(int rank, int layer_idx, const int* h_idx,
                                int n, const int* seqlens_dev, void* stream,
                                parallelism::TieredKvView* out);
+    /// Steps 1c-5 (classify / cold burst / scatter / gather / fence) over a
+    /// host-resident selection into staging set `ms` (capacity `cap` rows) —
+    /// the placement body shared by materialize_selection (ping-pong sets,
+    /// cache_insert=true) and the union arm (umat, cache_insert=false: the
+    /// union dedups intra-step; row-cache hits still serve as sources).
+    void gather_selection(int rank, int layer_idx, MatSet& ms, int cap,
+                          const int* h_idx, int n, bool cache_insert,
+                          void* stream);
     /// GLOBAL logical page a selection index maps to: idx/page_size under
     /// replicated KV (indices are global positions); under sharded KV the
     /// index is a rank-LOCAL slot — invert the round-robin chunk layout
@@ -681,6 +771,13 @@ private:
     /// is never demoted — its dense staging needs full residency forever.
     std::vector<uint8_t> layer_dense_;
     int total_demoted_or_inflight_ = 0;  ///< across all sequences
+    bool cohort_always_ = false;  ///< LS_KVT_COHORT_ALWAYS=1 (strict per-row)
+    bool cohort_rowwise_ = false; ///< LS_KVT_COHORT_ROWWISE=1: kill-switch —
+                                  ///< force per-row cohort consumption (the
+                                  ///< batched union arm returns false)
+    int union_cap_ = 0;           ///< union staging rows (0 = arm disabled)
+    int u_pages_cap_ = 0;         ///< union fake pages (ceil(cap / page))
+    bool verify_ = false;         ///< LS_KVT_VERIFY=1 byte-oracle (debug)
     bool cold_pool_full_warned_ = false;
     Stats stats_;
     uint64_t last_logged_materializations_ = 0;

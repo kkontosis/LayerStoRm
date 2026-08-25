@@ -440,7 +440,20 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
     // retention window keeps the frontier behind the append position).
     // VRAM-full / missing seam fails the step CLOSED (capacity, not
     // correctness — INV-KVT-2).
-    if (kv_tiering_ && kv_tiering_->has_demotions() && deps_.sideband_base) {
+    // TD-KVT-ADMISSION-UPFRONT: PREFILL-shaped steps are excluded — a
+    // superchunk's layer-wise sweep replays earlier sub-chunks at later
+    // layers, which the GLOBAL demoted frontier misreads as a rewind
+    // (measured: ~half of all prefill demotions were pointlessly
+    // re-promoted, and a re-promotion VRAM failure would kill a legal
+    // prefill).  Chunk writes are per-LAYER; their legality is enforced
+    // per layer at the tier gate (begin_layer cohort check throws over
+    // demoted territory, INV-KVT-2), and a NON-tierable prefill shape on a
+    // demoted sequence is still lifted by the post-tierability full
+    // re-promotion gate (TD-KVT-PREFILL-REPROMOTE).  Chunk re-feeds are
+    // never rewinds (INV-DSA-REWIND: the blessed rewind re-feed class is
+    // decode-shaped, chunk_len == 0).
+    if (kv_tiering_ && kv_tiering_->has_demotions() && deps_.sideband_base
+        && p.is_prefill == 0 && p.chunk_len == 0) {
         const auto* rbe = reinterpret_cast<const ipc::BatchDescriptorEntry*>(
             deps_.sideband_base + ipc::IpcLayout::kBatchDescriptorOff);
         for (int b = 0; b < batch_size; ++b) {

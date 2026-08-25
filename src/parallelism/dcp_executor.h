@@ -440,6 +440,16 @@ public:
         /// chunks.
         bool sparse_prefill = false;
 
+        /// TD-KVT-ADMISSION-UPFRONT (memory.kv_tiering.tiered_prefill):
+        /// with sparse_prefill, a blessed sparse prefill chunk is ALSO
+        /// allowed under SHARDED KV — the producer's per-row global top-k
+        /// is KVS-4-translated per row (indexer_shard_translate is batched)
+        /// and consumption decomposes into per-row B==1 sparse
+        /// sub-dispatches when the dispatcher staged a tier step
+        /// (AttentionExecParams::kv_tiering on a chunk), so cold rows
+        /// materialize per row (INV-KVT-13 extended to chunk cohorts).
+        bool tiered_prefill = false;
+
         int max_batch_size = 64;                   ///< Max decode batch for buffer sizing
         /// TD-PREFILL-SUPERCHUNK: total superchunk token capacity (0 = off).
         /// Sizes the PERSISTENT sparse top-k buffers (sparse_indices_dev_/

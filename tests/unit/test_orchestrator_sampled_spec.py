@@ -403,3 +403,56 @@ def test_single_row_engine_falls_back_to_plain():
         assert daemon.sample_seeds == expect
     finally:
         _finish(daemon)
+
+
+def test_sampled_spec_fallback_trajectory_identical():
+    """INV-SERVE-SPEC-FALLBACK on the sampled arm: a mid-request draft
+    death continues HOST-SAMPLED plain AR on the SAME RNG stream — the
+    full trajectory (across the cut) is EXACTLY the sequential
+    host-sampled reference, i.e. exactly what the speculative arm would
+    have committed (INV-SAMPLED-SPEC continuity)."""
+    smp = SamplingParams(temperature=0.8, top_p=1.0, top_k=0, seed=1234)
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 2              # rounds 1-2 draft, round 3 dies
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=61, prompt_token_ids=[4321], max_tokens=32,
+            sampling=smp, on_token=sink.on_token,
+            on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "length" and len(tokens) == 32
+        assert tokens == _host_reference(4321, 32, smp), (
+            "sampled fallback broke trajectory identity across the cut")
+        assert sink.tokens == tokens
+        st = orch.last_stats
+        assert st.spec_fallback_round == 3
+        assert daemon.dspark_calls == 3      # sticky: no re-issue after
+        assert daemon.samples == 0           # host-side sampling throughout
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_sampled_spec_fallback_logprobs_continue():
+    """Logprobs requests ride the sampled-spec arm; after the fallback
+    every remaining step still serves a StepLogprobs from the readback
+    row (no gap in the per-token list)."""
+    smp = SamplingParams(temperature=0.7, seed=5)
+    orch, daemon = _orch()
+    daemon.dspark_fail_from = 1
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=62, prompt_token_ids=[4321], max_tokens=12,
+            sampling=smp, logprobs=0, on_token=sink.on_token,
+            on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "length" and len(tokens) == 12
+        assert tokens == _host_reference(4321, 12, smp)
+        assert orch.last_stats.spec_fallback_round >= 1
+        assert len(sink.done_lp) == 12
+        assert all(lp is not None for lp in sink.done_lp), (
+            "logprobs must not go dark after the fallback")
+    finally:
+        _finish(daemon)

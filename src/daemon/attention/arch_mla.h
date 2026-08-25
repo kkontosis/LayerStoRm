@@ -40,6 +40,10 @@ private:
     uint64_t tier_seq_ = 0;
     uint32_t tier_pos_ = 0;
     bool tier_step_ = false;
+    /// TD-KVT-ADMISSION-UPFRONT: rows of the current tier step (1 = decode /
+    /// B==1 sparse prefill chunk; >1 = blessed chunk cohort — after_attention
+    /// then demotes behind the LAST row's position).
+    int tier_rows_ = 1;
 };
 
 }  // namespace layerstorm::daemon

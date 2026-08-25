@@ -50,16 +50,24 @@ namespace layerstorm::daemon {
 // OWNER rank's GPU (round-robin by indexer page: owner = pg % dcp); it is
 // written ONLY into the owner's table at the LOCAL-compacted slot pg / dcp
 // (the executor's producer scores rank r's owned pages as a contiguous
-// local run). Returns false on pool exhaustion / beyond-window — the
-// producer then falls back (replicated B==1: executor arena; local: dense),
-// never an error.
-bool CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
-                                             uint32_t token_pos,
-                                             int batch_slot, int dcp_size) {
-    if (!deps_.page_allocator || !deps_.live_config) return false;
+// local run).
+//
+// TD-INDEXER-POOL-EVICT: the two failure modes are DISTINGUISHED.
+// kUnavailable (beyond the serving window / bad slot / dcp mismatch) is a
+// permanent property of this shape — the producer falls back (replicated
+// B==1: executor arena; local: dense), never an error. kExhausted means the
+// POOL is full of OTHER live sequences' pages and is RETRYABLE: the caller
+// may raise a pool-exhaustion CMP_ERROR so the orchestrator evicts a prefix
+// holder and re-issues (a holder's pages are freed with its sequence).
+CommandDispatcher::IndexerPageResult
+CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
+                                        uint32_t token_pos,
+                                        int batch_slot, int dcp_size) {
+    using R = IndexerPageResult;
+    if (!deps_.page_allocator || !deps_.live_config) return R::kUnavailable;
     const auto& cfg = *deps_.live_config;
     const int PT = cfg.memory.kv_cache.indexer_k_page_size_tokens;
-    if (PT <= 0 || dcp_size < 1) return false;
+    if (PT <= 0 || dcp_size < 1) return R::kUnavailable;
 
     const int n_layers = cfg.model.num_hidden_layers
                        + cfg.model.num_nextn_predict_layers;
@@ -82,13 +90,14 @@ bool CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
             indexer_table_bases_[r] = indexer_page_table_[r].data();
     }
     if (static_cast<int>(indexer_page_table_.size()) != dcp_size)
-        return false;  // dcp_size changed under us — should not happen
+        return R::kUnavailable;  // dcp_size changed under us
 
     const int need = static_cast<int>(token_pos) / PT + 1;
-    if (need > indexer_page_stride_) return false;  // beyond serving window
+    if (need > indexer_page_stride_)
+        return R::kUnavailable;  // beyond serving window
     if (batch_slot < 0
         || batch_slot >= static_cast<int>(ipc::kMaxBatchDescriptors))
-        return false;
+        return R::kUnavailable;
 
     // TD-GLM-INDEXER-LOCAL-MERGE: local mode allocates ONE page per (pg, l)
     // on the owner rank's GPU; replicated allocates dcp_size replicas.
@@ -101,7 +110,7 @@ bool CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
     // (page, layer) is per_group, so coverage = size / (n_computing * group).
     int n_computing = 0;
     for (uint8_t c : indexer_computes_) n_computing += c;
-    if (n_computing == 0) return false;
+    if (n_computing == 0) return R::kUnavailable;
     int have = static_cast<int>(handles.size()) / (n_computing * per_group);
 
     for (int pg = have; pg < need; ++pg) {
@@ -116,9 +125,12 @@ bool CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
                 // Return any partial allocation of this (pg, l) group.
                 for (auto& h : page) deps_.page_allocator->free(h);
                 spdlog::warn("ensure_indexer_pages: kIndexerK exhausted at "
-                             "seq {} page {} layer {} — fallback",
-                             seq_id, pg, l);
-                return false;
+                             "seq {} page {} layer {} (seq has {} of {} "
+                             "logical pages; pool is sized for "
+                             "serving.max_concurrent_requests sequences at "
+                             "max_sequence_length) — capacity, retryable",
+                             seq_id, pg, l, have, need);
+                return R::kExhausted;
             }
             for (const auto& h : page) handles.push_back(h);
         }
@@ -151,7 +163,7 @@ bool CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
             }
         }
     }
-    return true;
+    return R::kOk;
 }
 
 // ── Shared side-tier page claim (attention refactor V2 P2 dedup) ──────────

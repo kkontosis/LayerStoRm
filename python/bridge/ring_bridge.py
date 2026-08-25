@@ -105,6 +105,22 @@ class BridgeError(RuntimeError):
     """Fatal IPC error (CMP_ERROR, timeout, or ring overflow)."""
 
 
+class DsparkDraftError(BridgeError):
+    """A DSpark draft step failed — DRAFT-side only, target state intact.
+
+    Raised exclusively by ``dspark_collect_async`` (the per-round draft
+    boundary) for (a) a CMP_ERROR carrying the in-flight
+    D_CMD_RUN_DSPARK_STEP's own cmd_seq (the runtime declined the step —
+    invalid/overflowed drafting context, TD-DSPARK-CTX-CAP class) and
+    (b) draft readback parse/validation failures after a successful
+    completion.  Drafts are ADVISORY (INV-DSPARK-LOSSLESS): none of these
+    touch target KV, so callers may fall back to plain decode for the
+    request's remainder (INV-SERVE-SPEC-FALLBACK) instead of failing the
+    request.  ``wait()`` STASHES an async-dspark error rather than raising
+    it out of a target command's wait — the target completion it was
+    waiting for is still in flight and must be consumed normally."""
+
+
 # ── Lightweight completion view ─────────────────────────────────────────────
 # Uniform result of the poll paths (Cython returns the same tuple shape).
 # Fields mirror Completion.{header, compute payload}; err_msg only for
@@ -271,6 +287,10 @@ class EngineBridge:
         # DSP52_OVERLAP async draft stash (dspark_send_async/collect).
         self._dspark_pending_seq = 0
         self._dspark_cmp: Cmp | None = None
+        # Stashed async-dspark CMP_ERROR message (draft-side failure seen
+        # by wait() while servicing a TARGET command) — surfaced as
+        # DsparkDraftError at the next dspark_collect_async.
+        self._dspark_err: str | None = None
         # Lever-4 prev-chunk-union predictor: layer -> [(l,e,zone,gpu)].
         self.pf_pred: list[list[tuple[int, int, int, int]]] = [
             [] for _ in range(self.num_layers)]
@@ -376,8 +396,13 @@ class EngineBridge:
                               flush=True)
                         continue
                     if seq == self._dspark_pending_seq:
+                        # DRAFT-side failure while waiting on a TARGET
+                        # command: stash, keep waiting — the expected
+                        # completion is still in flight.  Surfaces as
+                        # DsparkDraftError at dspark_collect_async.
                         self._dspark_pending_seq = 0
-                        raise BridgeError(f"CMP_ERROR (async dspark): {msg}")
+                        self._dspark_err = f"CMP_ERROR (async dspark): {msg}"
+                        continue
                     raise BridgeError(
                         f"CMP_ERROR{' (' + ctx + ')' if ctx else ''}: {msg}")
                 if kind == "dspark":
@@ -406,9 +431,12 @@ class EngineBridge:
             if (self._dspark_pending_seq
                     and out.cmd_seq == self._dspark_pending_seq):
                 if out.cmp_type == CMP_ERROR:
+                    # Draft-side failure — stash, keep waiting (see the
+                    # v2 arm above / DsparkDraftError).
                     self._dspark_pending_seq = 0
-                    raise BridgeError(f"CMP_ERROR (async dspark): "
-                                      f"{out.err_msg}")
+                    self._dspark_err = (f"CMP_ERROR (async dspark): "
+                                        f"{out.err_msg}")
+                    continue
                 self._dspark_cmp = out
                 self._dspark_pending_seq = 0
                 continue
@@ -790,14 +818,33 @@ class EngineBridge:
         pending: list[int] = []   # layer ids in flight (FIFO)
         head = 0
         t_prev = time.monotonic()
+        first_err: BridgeError | None = None
 
         def collect_one() -> None:
-            nonlocal lookups, head, t_prev
+            # DRAIN-BEFORE-RAISE (TD-INDEXER-POOL-EVICT): with sends
+            # PIPELINED, a failing layer still leaves the rest of the sweep
+            # in flight. Propagating immediately would abandon their
+            # completions in the cmp ring, and the NEXT command would read
+            # one of THEM — the failure would migrate to an unrelated
+            # command (observed: a stale far CMP_ERROR resurfacing as
+            # "seq_free N: CMP_ERROR"). Stash the first failure, keep
+            # collecting until the ring is clean, then raise it. This is
+            # what makes a RETRYABLE engine error (pool exhaustion) safe to
+            # answer with an eviction + re-issue of the identical chunk.
+            nonlocal lookups, head, t_prev, first_err
             layer = pending[head]
             head += 1
-            out = self.wait(CMP_COMPUTE_DONE, ctx=f"far L{layer} (burst)")
+            try:
+                out = self.wait(CMP_COMPUTE_DONE, ctx=f"far L{layer} (burst)")
+            except BridgeError as err:
+                if first_err is None:
+                    first_err = err
+                return
             if out.status != 0:
-                raise BridgeError(f"far L{layer} status {out.status}")
+                if first_err is None:
+                    first_err = BridgeError(
+                        f"far L{layer} status {out.status}")
+                return
             lookups += out.data_bytes
             now = time.monotonic()
             if moe_ms is not None:
@@ -807,12 +854,16 @@ class EngineBridge:
         for layer in range(self.num_layers):
             while len(pending) - head >= window:
                 collect_one()
+            if first_err is not None:
+                break            # stop sending; drain what is already out
             self._send_far_cmd(layer, num_seqs, is_prefill=is_prefill,
                                chunk_start=chunk_start,
                                chunk_len=chunk_len, timeout_us=timeout_us)
             pending.append(layer)
         while head < len(pending):
             collect_one()
+        if first_err is not None:
+            raise first_err
         return lookups
 
     def _routed_moe(self, layer: int, num_seqs: int, lrus, *,
@@ -1300,20 +1351,24 @@ class EngineBridge:
 
     def _parse_dspark(self, out: Cmp, gamma: int, with_conf: bool
                       ) -> tuple[list[int], list[float]]:
+        # Draft READBACK defects are draft-side only (the ids/confs never
+        # reach a target feed unless the caller verifies them) — classified
+        # DsparkDraftError so serving can fall back instead of failing.
         want = gamma * 4 * (2 if with_conf else 1)
         if out.host_buf_offset == 0 or out.data_bytes < want:
-            raise BridgeError(
+            raise DsparkDraftError(
                 f"dspark step readback missing: off={out.host_buf_offset} "
                 f"bytes={out.data_bytes} (want >= {want})")
         ids, confs = self.read_spec_readback_ids(out.host_buf_offset, gamma,
                                                  with_conf)
         for k, t in enumerate(ids):
             if t < 0 or t >= self.vocab_size:
-                raise BridgeError(f"dspark draft id out of vocab: d_{k}={t}")
+                raise DsparkDraftError(
+                    f"dspark draft id out of vocab: d_{k}={t}")
         if with_conf:
             for k, cf in enumerate(confs):
                 if not math.isfinite(cf) or cf <= 0.0 or cf >= 1.0:
-                    raise BridgeError(
+                    raise DsparkDraftError(
                         f"dspark confidence c_{k} outside (0,1): {cf}")
         return ids, confs
 
@@ -1342,12 +1397,20 @@ class EngineBridge:
     def dspark_send_async(self, seq_id: int, anchor_token: int,
                           anchor_pos: int, gamma: int) -> None:
         self._dspark_cmp = None
+        self._dspark_err = None
         self._dspark_pending_seq = self._send_dspark(
             seq_id, anchor_token, anchor_pos, gamma)
 
     def dspark_collect_async(self, gamma: int, with_conf: bool,
                              timeout_s: float = 300.0
                              ) -> tuple[list[int], list[float]]:
+        if self._dspark_err is not None:
+            # wait() consumed the async draft's CMP_ERROR while servicing
+            # a target command and stashed it — surface it HERE, at the
+            # round's draft boundary.
+            msg = self._dspark_err
+            self._dspark_err = None
+            raise DsparkDraftError(msg)
         if self._dspark_cmp is None:
             deadline = time.monotonic() + timeout_s
             while self._dspark_cmp is None:
@@ -1366,6 +1429,11 @@ class EngineBridge:
                               flush=True)
                     continue
                 if out.cmp_type == CMP_ERROR:
+                    if out.cmd_seq == self._dspark_pending_seq:
+                        # The draft step's own failure — draft-side class.
+                        self._dspark_pending_seq = 0
+                        raise DsparkDraftError(
+                            f"CMP_ERROR (dspark collect): {out.err_msg}")
                     self._dspark_pending_seq = 0
                     raise BridgeError(
                         f"CMP_ERROR (dspark collect): {out.err_msg}")
@@ -1391,6 +1459,7 @@ class EngineBridge:
             except BridgeError as e:
                 print(f"  [bridge] pending dspark drain: {e}", flush=True)
         self._dspark_cmp = None
+        self._dspark_err = None                  # never leak across requests
 
 
 # ── import-time layout self-check ───────────────────────────────────────────

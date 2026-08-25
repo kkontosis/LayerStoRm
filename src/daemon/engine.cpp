@@ -1104,6 +1104,12 @@ void Engine::init_modules() {
         // attends only its causal top-k (INV-SPARSE-CHUNK-CAUSAL). Default
         // OFF (dense chunks, byte-identical legacy behavior).
         .sparse_prefill       = cfg_->compute.dsa_sparse_prefill,
+        // TD-KVT-ADMISSION-UPFRONT: sparse prefill chunks under sharded KV
+        // + per-row tiered consumption (requires dsa_sparse_prefill AND
+        // kv_tiering.enabled — the per-row arm exists for tiering).
+        .tiered_prefill       = cfg_->compute.dsa_sparse_prefill
+                                  && cfg_->memory.kv_tiering.enabled
+                                  && cfg_->memory.kv_tiering.tiered_prefill,
         .max_batch_size       = cfg_->orchestrator.max_batch_size,
         // TD-PREFILL-SUPERCHUNK: persistent sparse top-k rows for the whole
         // superchunk (IndexShare shared layers consume per sub-chunk).

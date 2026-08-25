@@ -58,7 +58,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 1.65,
+          "expert_streaming": 4.0,
           "stable_zone_fraction": 0.95
         }
       },
@@ -74,7 +74,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 1.65,
+          "expert_streaming": 4.0,
           "stable_zone_fraction": 0.95
         }
       },
@@ -88,7 +88,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 11.0,
+          "expert_streaming": 11.5,
           "stable_zone_fraction": 0.95
         }
       },
@@ -102,7 +102,7 @@
           "expert_streaming"
         ],
         "vram_allocation_gb": {
-          "expert_streaming": 11.0,
+          "expert_streaming": 11.5,
           "stable_zone_fraction": 0.95
         }
       }
@@ -139,7 +139,7 @@
       "output_head": null
     },
     "kv_cache": {
-      "max_pages_per_gpu": 81920,
+      "max_pages_per_gpu": 20480,
       "page_size_tokens": 16,
       "speculation_pool_fraction": 0.15,
       "indexer_k_page_size_tokens": 8192,
@@ -237,10 +237,11 @@
     },
     "kv_tiering": {
       "enabled": true,
-      "hot_buffer_slots": 512,
-      "host_to_device_ratio": 16.0
+      "hot_buffer_slots": 2048,
+      "host_to_device_ratio": 8.0,
+      "tiered_prefill": true
     },
-    "vram_safety_margin_gb": 3.0,
+    "vram_safety_margin_gb": 2.25,
     "arena_attach": {
       "enabled": true,
       "persist": true
@@ -409,12 +410,13 @@
       "grouped_gemm": true,
       "fused_swiglu": true
     },
-    "attention_backend": "turboquant_mla"
+    "attention_backend": "turboquant_mla",
+    "dsa_sparse_prefill": true
   },
   "serving": {
     "host": "0.0.0.0",
     "port": 8000,
-    "max_concurrent_requests": 32,
+    "max_concurrent_requests": 2,
     "max_sequence_length": 25600,
     "tokenizer_path": "auto"
   },

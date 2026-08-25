@@ -231,6 +231,15 @@ public:
                        ",nb=" + std::to_string(a.num_blocks) +
                        ",qpos=" + std::to_string(a.query_position) + ")");
     }
+    // KVS-4 wiring probe (TD-KVT-ADMISSION-UPFRONT: sharded sparse chunk
+    // prefill translates the per-row GLOBAL selection to rank-LOCAL slots).
+    void indexer_shard_translate(const void*, const void*, void*, void*,
+                                 int num_tokens, int, int chunk_tokens,
+                                 int, int rank, void*) override {
+        log_.push_back("idx_translate(B=" + std::to_string(num_tokens) +
+                       ",chunk=" + std::to_string(chunk_tokens) +
+                       ",rank=" + std::to_string(rank) + ")");
+    }
 
     // ── Decode graph ops ────────────────────────────────────────────────────
     void decode_graph_update(lc::GraphEntry&, const void*,
@@ -1307,6 +1316,12 @@ struct FakeTieringHook final : lp::KvTieringHook {
     int dense_notifies = 0;
     bool serve_tiered = true;
     int view_rows = 5;
+    // TD-KVT-ADMISSION-UPFRONT cohort seam
+    int row_materializes = 0;
+    std::vector<std::pair<int, int>> rows_seen;  // (row, rows) per call
+    /// Rows served a fake view (empty = none); view skv = 100 + row so the
+    /// log disambiguates fake-view rows from real-bt rows.
+    std::vector<int> serve_rows;
 
     void prepare(int, int, const int*, const int*, int, void*,
                  bool selection_fresh) override {
@@ -1323,6 +1338,47 @@ struct FakeTieringHook final : lp::KvTieringHook {
         out->max_blocks_per_seq = 1;
         out->seq_len_kv = view_rows;
         out->sparse_indices = reinterpret_cast<const int*>(0x3000);
+        return true;
+    }
+    /// Hybrid gate answer (default: per-row — the strict/cold arm).
+    bool cohort_tiered = true;
+    bool cohort_layer_tiered(int) override { return cohort_tiered; }
+    bool materialize_row(int, int, int row, int rows, const int*,
+                         const int* topk_lengths_dev, bool selection_fresh,
+                         void*, lp::TieredKvView* out) override {
+        ++row_materializes;
+        rows_seen.emplace_back(row, rows);
+        last_fresh = selection_fresh;
+        if (std::find(serve_rows.begin(), serve_rows.end(), row)
+            == serve_rows.end())
+            return false;
+        out->kv_cache = reinterpret_cast<void*>(0x1000);
+        out->block_tables = reinterpret_cast<const int*>(0x2000);
+        out->seqlens_k = topk_lengths_dev + row;
+        out->max_blocks_per_seq = 1;
+        out->seq_len_kv = 100 + row;
+        out->sparse_indices = reinterpret_cast<const int*>(0x3000);
+        return true;
+    }
+    // TD-KVT-COHORT-BATCHED-MATERIALIZE: batched union arm.
+    int cohort_materializes = 0;
+    bool serve_union = false;   ///< default false = per-row fallback (the
+                                ///< hook base default; also the kill-switch
+                                ///< / no-cold / over-capacity answer)
+    int union_rows_view = 9;
+    bool materialize_cohort(int, int, int rows, const int*,
+                            const int*, bool selection_fresh,
+                            void*, lp::TieredKvView* out) override {
+        ++cohort_materializes;
+        last_fresh = selection_fresh;
+        (void)rows;
+        if (!serve_union) return false;
+        out->kv_cache = reinterpret_cast<void*>(0x4000);
+        out->block_tables = reinterpret_cast<const int*>(0x5000);
+        out->seqlens_k = reinterpret_cast<const int*>(0x6000);
+        out->max_blocks_per_seq = 2;
+        out->seq_len_kv = union_rows_view;
+        out->sparse_indices = reinterpret_cast<const int*>(0x7000);
         return true;
     }
     void on_dense_layer(int) override { ++dense_notifies; }
@@ -1447,23 +1503,177 @@ TEST(DcpExecutor, SparseChunkPrefillDenseFallbackNotifiesTieringHook) {
                                 "B==1 chunk call";
 }
 
-TEST(DcpExecutor, SparseChunkPrefillTieredB3NeverMaterializes) {
-    // Defensive: the dispatcher only sets kv_tiering on B==1 steps, but the
-    // consumer's tiered branch must ALSO exclude B>1 chunk cohorts on its
-    // own (chunk_rows) — a B>1 materialize would need per-row fake views
-    // (TD-KVT-BATCH-COHORT).
+TEST(DcpExecutor, SparseChunkPrefillTieredCohortConsumesPerRow) {
+    // TD-KVT-ADMISSION-UPFRONT: a B>1 SPARSE prefill chunk staged as a tier
+    // step (kv_tiering set — the dispatcher does this only when the
+    // tiered-prefill mode blessed the cohort) consumes PER ROW as B==1
+    // sub-dispatches: materialize_row per row; rows with a fake view attend
+    // it (skv = view rows), the rest attend their own per-row causal bound
+    // through the real block tables — never one batched full-prefix call.
     FakeTieringHook hook;
+    hook.serve_rows = {1};  // row 1 has cold pages; rows 0/2 fully resident
     std::vector<std::string> log;
     run_tiered_prefill_chunk_case(hook, log, /*with_q_weights=*/true,
                                   /*batch=*/3);
 
-    EXPECT_EQ(hook.materializes, 0);
-    bool found_sparse_causal = false;
+    EXPECT_EQ(hook.materializes, 0)
+        << "cohorts must use materialize_row, never the B==1 materialize";
+    EXPECT_EQ(hook.row_materializes, 3);
+    ASSERT_EQ(hook.rows_seen.size(), 3u);
+    for (int b = 0; b < 3; ++b) {
+        EXPECT_EQ(hook.rows_seen[static_cast<size_t>(b)].first, b);
+        EXPECT_EQ(hook.rows_seen[static_cast<size_t>(b)].second, 3);
+    }
+    auto count = [&](const std::string& s) {
+        int c = 0;
+        for (const auto& e : log) if (e == s) ++c;
+        return c;
+    };
+    EXPECT_EQ(count("prefill(B=1,skv=5,sparse=1,causal=0)"), 1)
+        << "row 0: real block tables, own causal bound";
+    EXPECT_EQ(count("prefill(B=1,skv=101,sparse=1,causal=0)"), 1)
+        << "row 1: fake-view consumption (skv = view rows)";
+    EXPECT_EQ(count("prefill(B=1,skv=7,sparse=1,causal=0)"), 1)
+        << "row 2: real block tables, own causal bound";
     for (const auto& e : log)
-        if (e == "prefill(B=3,skv=7,sparse=1,causal=1)")
-            found_sparse_causal = true;
-    EXPECT_TRUE(found_sparse_causal)
-        << "B>1 chunk keeps the full-prefix sparse chunk-causal call";
+        EXPECT_EQ(e.find("prefill(B=3"), std::string::npos)
+            << "no batched full-prefix chunk call on a tier step: " << e;
+}
+
+TEST(DcpExecutor, SparseChunkPrefillTieredCohortBatchedUnion) {
+    // TD-KVT-COHORT-BATCHED-MATERIALIZE: when the hook serves a UNION view,
+    // the cold-layer cohort runs ONE batched sparse chunk-causal call over
+    // it (skv = union extent, per-row topk_lengths unchanged) — never the
+    // per-row B==1 loop.  serve_union=false (the default, and the manager's
+    // kill-switch / no-cold / over-capacity answer) keeps the per-row arm —
+    // covered by SparseChunkPrefillTieredCohortConsumesPerRow.
+    FakeTieringHook hook;
+    hook.serve_union = true;
+    std::vector<std::string> log;
+    run_tiered_prefill_chunk_case(hook, log, /*with_q_weights=*/true,
+                                  /*batch=*/3);
+
+    EXPECT_EQ(hook.cohort_materializes, 1);
+    EXPECT_EQ(hook.row_materializes, 0)
+        << "the union arm replaces the per-row loop";
+    EXPECT_EQ(hook.materializes, 0);
+    auto count = [&](const std::string& s) {
+        int c = 0;
+        for (const auto& e : log) if (e == s) ++c;
+        return c;
+    };
+    EXPECT_EQ(count("prefill(B=3,skv=9,sparse=1,causal=1)"), 1)
+        << "ONE batched sparse chunk-causal call over the union fake view";
+    for (const auto& e : log)
+        EXPECT_EQ(e.find("prefill(B=1"), std::string::npos)
+            << "no per-row sub-dispatches on the union arm: " << e;
+}
+
+TEST(DcpExecutor, ShardedSparseChunkPrefillTranslatesAndConsumesPerRow) {
+    // TD-KVT-ADMISSION-UPFRONT lifts TD-SPARSE-PREFILL-KVS for tier steps:
+    // under sharded KV with Options::tiered_prefill, a blessed sparse
+    // prefill chunk (a) runs the producer, (b) KVS-4-translates the per-row
+    // GLOBAL selection on every rank (batched indexer_shard_translate), and
+    // (c) consumes per row bounded by each rank's LOCAL per-row shard
+    // lengths — never the dense chunk fallback.
+    std::vector<std::string> log;
+    auto comm = lp::DcpCommunicator(null_comm_opts(2));
+    auto opts = executor_opts(2);
+    opts.has_dsa = true;
+    opts.index_topk = 8;
+    opts.index_n_heads = 4;
+    opts.index_head_dim = 16;
+    opts.sparse_prefill = true;
+    opts.tiered_prefill = true;      // lifts the sharded dense fallback
+    opts.dcp_kv_sharded = true;
+    opts.dcp_chunk_tokens = 4;       // KVS-4 translation geometry
+    RecordingBackends rec(2, log);
+    rec.apply(opts);
+    opts.communicator = &comm;
+    std::vector<float> rope_table(static_cast<size_t>(64) * kQkRope, 0.0f);
+    opts.rope_cos_sin_host = rope_table.data();
+    opts.rope_max_pos = 64;
+
+    auto dcp_wrapper = lc::DcpAttentionWrapper(
+        &comm,
+        {.num_heads_local = kHeads / 2, .head_dim = kKVLora,
+         .hidden_size = kHidden, .max_batch_size = kMaxBatch,
+         .combine_num_heads = kHeads,  // INV-KVS-QAG all-head combine
+         .gpus = make_gpu_refs(2)},
+        opts.attention_devices, lc::null_launch_correction());
+    opts.dcp_wrapper = &dcp_wrapper;
+
+    auto exec = lp::DcpExecutor(opts);
+    init_dequant_pool(exec, exec.dcp_size());
+
+    TestExecParamsBuilder builder(2, /*batch=*/3);
+    // Rank-LOCAL per-row shard lengths (KVS-3): chunk positions 4..6 at
+    // dcp_chunk_tokens=4 — rank 1 owns pages 1.. (positions 4..7), rank 0
+    // owns 0..3: local lens rank0 {4,4,4}, rank1 {1,2,3}.
+    builder.seqlens_data[0] = {4, 4, 4};
+    builder.seqlens_data[1] = {1, 2, 3};
+    std::vector<int> global_seqlens{5, 6, 7};
+    std::vector<const int*> global_ptrs{global_seqlens.data(),
+                                        global_seqlens.data()};
+    std::vector<const int*> host_local_ptrs{builder.seqlens_data[0].data(),
+                                            builder.seqlens_data[1].data()};
+    for (auto& w : builder.weights_data) {
+        w.k_idx = reinterpret_cast<const void*>(0x20);
+        w.k_idx_norm = reinterpret_cast<const void*>(0x30);
+        w.k_idx_norm_bias = reinterpret_cast<const void*>(0x40);
+        w.q_idx_b = reinterpret_cast<const void*>(0x10);
+        w.weights_proj = reinterpret_cast<const void*>(0x50);
+    }
+    auto params = builder.build(/*use_graph=*/false);
+    std::vector<int> host_seqlens{5, 6, 7};
+    params.host_seqlens_k = host_seqlens.data();
+    params.global_seqlens_k = global_ptrs.data();
+    params.host_local_seqlens_k = host_local_ptrs.data();
+    params.chunk_start = 4;
+    params.chunk_len = 3;
+    params.max_seqlen_k = 7;
+    params.indexer_step_key = 0xC0FFEE;
+    params.indexer_prefill_append = true;
+    FakeTieringHook hook;   // all rows resident: real-bt per-row consumption
+    params.kv_tiering = &hook;
+    log.clear();
+    exec.execute_attention(params);
+
+    auto count = [&](const std::string& s) {
+        int c = 0;
+        for (const auto& e : log) if (e == s) ++c;
+        return c;
+    };
+    EXPECT_EQ(count("idx_translate(B=3,chunk=4,rank=0)"), 1);
+    EXPECT_EQ(count("idx_translate(B=3,chunk=4,rank=1)"), 1);
+    EXPECT_EQ(hook.row_materializes, 6) << "3 rows x 2 ranks";
+    // Per-row consumption at each rank's LOCAL per-row bound.
+    EXPECT_EQ(count("prefill(B=1,skv=4,sparse=1,causal=0)"), 3)
+        << "rank 0: local bound 4 for every row";
+    EXPECT_EQ(count("prefill(B=1,skv=1,sparse=1,causal=0)"), 1);
+    EXPECT_EQ(count("prefill(B=1,skv=2,sparse=1,causal=0)"), 1);
+    EXPECT_EQ(count("prefill(B=1,skv=3,sparse=1,causal=0)"), 1);
+    for (const auto& e : log) {
+        EXPECT_EQ(e.find("prefill(B=3"), std::string::npos)
+            << "sharded chunk must not fall back to the batched dense/"
+               "sparse chunk call on a per-row tier step: " << e;
+    }
+
+    // HYBRID gate, all-hot layer (cohort_layer_tiered == false): the
+    // batched SPARSE chunk-causal kernel runs — translated local indices,
+    // rank-LOCAL union bound (TD-SPARSE-PREFILL-KVS lifted) — never the
+    // dense chunk fallback and no per-row split.
+    hook.cohort_tiered = false;
+    hook.row_materializes = 0;
+    log.clear();
+    exec.execute_attention(params);
+    EXPECT_EQ(hook.row_materializes, 0);
+    EXPECT_EQ(count("idx_translate(B=3,chunk=4,rank=0)"), 1);
+    EXPECT_EQ(count("idx_translate(B=3,chunk=4,rank=1)"), 1);
+    EXPECT_EQ(count("prefill(B=3,skv=4,sparse=1,causal=1)"), 1)
+        << "rank 0 batched sparse chunk at its local union bound";
+    EXPECT_EQ(count("prefill(B=3,skv=3,sparse=1,causal=1)"), 1)
+        << "rank 1 batched sparse chunk at its local union bound";
 }
 
 // ── TD-GLM-INDEXER-B1CASCADE resolved (INV-DSA-ROWMIX): mixed cohorts ────────

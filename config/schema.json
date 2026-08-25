@@ -2366,7 +2366,7 @@
           "minimum": 1,
           "maximum": 256,
           "default": 32,
-          "description": "Maximum simultaneous requests"
+          "description": "Maximum simultaneous requests. Also a VRAM SIZING input (INV-KVT-14b): the DSA indexer-K pool and the V4 KV tiers are carved for this many sequences at max_sequence_length, and the page allocator reserves fork/sequence headroom for it. Oversizing it starves the KV pool and expert cache (the indexer pool is capped at a quarter of post-pinned headroom and logs the achievable concurrency at boot)."
         },
         "max_queued_requests": {
           "type": "integer",

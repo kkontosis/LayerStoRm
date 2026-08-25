@@ -450,6 +450,77 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                      cfg.memory.kv_cache.streaming_spill_fraction, spill_frac);
     }
 
+    // ── TD-INDEXER-POOL-EVICT / INV-KVT-14b: indexer-K CONCURRENCY ───────
+    // How many concurrent sequences the kIndexerK pool covers, decided ONCE
+    // for every TP GPU. Two reasons it is not a per-GPU decision:
+    //   (a) replicated indexer pages are claimed on every TP GPU in lockstep
+    //       for the SAME logical page, so an asymmetric pool has the capacity
+    //       of its SMALLEST rank and wastes the difference on the others;
+    //   (b) the KV pool is the RESIDUAL of this carve — every indexer byte is
+    //       taken 1:1 from KV. On a pinned-weight-heavy rank that residual is
+    //       tiny (measured 2026-08-25: GPU 2 had 86 MiB of KV+spec left, so an
+    //       unbounded `* max_concurrent_requests` drove kv_main to ZERO pages).
+    // So: spend at most a QUARTER of the residual a one-sequence pool would
+    // have left for KV, on the tightest rank, and never go below one sequence
+    // (the historical size — a max-length sequence must stay serveable).
+    int indexer_seqs = 1;
+    if (has_dsa && indexer_k_page_size > 0 && num_dsa_layers > 0) {
+        int idx_pages_per_seq = (cfg.serving.max_sequence_length
+                                 + indexer_k_page_size - 1)
+                                / indexer_k_page_size;
+        if (cfg.hardware.dcp_indexer_mode == config::DcpIndexerMode::local
+            && dcp_shard_factor > 1)
+            idx_pages_per_seq =
+                (idx_pages_per_seq + dcp_shard_factor - 1) / dcp_shard_factor;
+        const int64_t per_seq_bytes =
+            static_cast<int64_t>(idx_pages_per_seq) * num_dsa_layers
+            * layout.indexer_k_bytes_per_page;
+        const int max_req = std::max(1, cfg.serving.max_concurrent_requests);
+        int64_t extra_seqs = -1;   // min over TP GPUs
+        for (size_t g = 0; g < budgets.size() && per_seq_bytes > 0; ++g) {
+            if (has_tp && !in_tp[g]) continue;
+            const auto& hw = cfg.hardware.gpus[g];
+            double margin_gb = cfg.memory.vram_safety_margin_gb;
+            if (hw.vram_allocation_gb.has_value()
+                && hw.vram_allocation_gb->safety_margin_gb >= 0.0)
+                margin_gb = hw.vram_allocation_gb->safety_margin_gb;
+            int64_t pinned = budgets[g].pinned_bytes;
+            if (hw.vram_allocation_gb.has_value()
+                && hw.vram_allocation_gb->resident > 0.0)
+                pinned = std::max(pinned, config::vram_gb_to_bytes(
+                                              hw.vram_allocation_gb->resident));
+            int64_t expert_reserve = min_expert_cache;
+            if (hw.vram_allocation_gb.has_value()
+                && hw.vram_allocation_gb->expert_streaming > 0.0)
+                expert_reserve = std::max(
+                    expert_reserve,
+                    config::vram_gb_to_bytes(
+                        hw.vram_allocation_gb->expert_streaming));
+            const int64_t residual = budgets[g].total_vram_bytes
+                                   - config::vram_gb_to_bytes(margin_gb)
+                                   - align_region(pinned)
+                                   - expert_reserve
+                                   - per_seq_bytes;
+            const int64_t afford =
+                residual > 0 ? (residual / 4) / per_seq_bytes : 0;
+            extra_seqs = extra_seqs < 0 ? afford : std::min(extra_seqs, afford);
+        }
+        if (extra_seqs < 0) extra_seqs = 0;
+        indexer_seqs = static_cast<int>(
+            std::min<int64_t>(max_req, 1 + extra_seqs));
+        if (indexer_seqs < max_req)
+            spdlog::warn(
+                "Indexer-K pool: VRAM affords {} concurrent sequence(s), "
+                "below serving.max_concurrent_requests={} ({:.1f} MiB/seq, "
+                "and the KV pool is the residual of this carve). Concurrent "
+                "long-context requests churn prefix-holder evictions "
+                "(retryable, TD-INDEXER-POOL-EVICT); lower "
+                "max_sequence_length or free VRAM (pinned weights / "
+                "expert_streaming reserve) to raise it.",
+                indexer_seqs, max_req,
+                static_cast<double>(per_seq_bytes) / (1024.0 * 1024.0));
+    }
+
     for (size_t gpu_i = 0; gpu_i < budgets.size(); ++gpu_i) {
         auto& budget = budgets[gpu_i];
         GpuVramLayout gpu{};
@@ -515,6 +586,21 @@ VramLayout compute_vram_layout(const config::Config& cfg,
         // Local mode with DCP: pages divided by dcp_shard_factor.
         if (has_dsa && (!has_tp || in_tp[gpu_i])) {
             int max_seq = cfg.serving.max_sequence_length;
+            // TD-INDEXER-POOL-EVICT (INV-KVT-14b): the pool must cover
+            // serving.max_concurrent_requests CONCURRENT sequences, exactly
+            // like the V4 kIndexerK/LID branch above. Sizing it for ONE
+            // sequence made the pool a hard per-sequence wall the moment a
+            // second live sequence existed — and serving ALWAYS has more
+            // than one: every prefix-cache holder is a live sequence that
+            // pins a CoW frontier page GROUP (num_dsa_layers pages). The
+            // 2026-08-24 incident: 84 pages/GPU (= 4 × 21 × 1 seq) against
+            // 6 live holders wanting 21 each ⇒ ensure_indexer_pages
+            // exhausted at a forked 25k prefix ⇒ silent dense downgrade ⇒
+            // full cold-page re-promotion ⇒ fail-closed CMP_ERROR.
+            // Holders BEYOND this budget stay reclaimable, not fatal: the
+            // exhaustion is now a retryable error the orchestrator answers
+            // by evicting a holder (TD-INDEXER-POOL-EVICT), so this sizes
+            // the WORKING set (in-flight requests), not the cache.
             int pages_per_seq = (max_seq + indexer_k_page_size - 1) /
                                 indexer_k_page_size;
             if (cfg.hardware.dcp_indexer_mode == config::DcpIndexerMode::local &&
@@ -525,10 +611,24 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                 pages_per_seq =
                     (pages_per_seq + dcp_shard_factor - 1) / dcp_shard_factor;
             }
-            gpu.indexer_k_pages = pages_per_seq * num_dsa_layers;
+            // `indexer_seqs` is the VRAM-affordable concurrency decided
+            // above, uniform across TP GPUs (see the pre-loop block).
+            const int seqs = indexer_seqs;
+            gpu.indexer_k_pages =
+                static_cast<int>(pages_per_seq) * num_dsa_layers * seqs;
             gpu.indexer_k_bytes = align_region(
                 static_cast<int64_t>(gpu.indexer_k_pages) *
                 layout.indexer_k_bytes_per_page);
+            spdlog::info(
+                "Indexer-K pool on GPU {}: {} pages ({:.1f} MiB) = {} "
+                "pages/seq x {} computing layers x {} sequence(s) "
+                "(max_sequence_length={}). A live sequence beyond this "
+                "budget — prefix-cache holders included — trips a RETRYABLE "
+                "exhaustion answered by holder eviction "
+                "(TD-INDEXER-POOL-EVICT).",
+                gpu_i, gpu.indexer_k_pages,
+                static_cast<double>(gpu.indexer_k_bytes) / (1024.0 * 1024.0),
+                pages_per_seq, num_dsa_layers, seqs, max_seq);
         } else {
             gpu.indexer_k_pages = 0;
             gpu.indexer_k_bytes = 0;

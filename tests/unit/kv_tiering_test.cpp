@@ -312,7 +312,9 @@ struct ManagerFixture {
     explicit ManagerFixture(int hot_slots, int num_logical = 8,
                             std::vector<uint8_t> full_mask = {},
                             double host_to_device_ratio = 8.0,
-                            int spare_pages = 0)
+                            int spare_pages = 0,
+                            int cohort_rows = 0,
+                            int union_rows = 0)
         : fx(num_logical + spare_pages, /*layer=*/0),
           next_free_page(num_logical) {
         auto* be = fx.be.get();
@@ -364,10 +366,14 @@ struct ManagerFixture {
         o.hot_buffer_slots = hot_slots;
         o.host_to_device_ratio = host_to_device_ratio;
         o.indexer_full_layers = std::move(full_mask);
+        o.cohort_rows_max = cohort_rows;  // TD-KVT-ADMISSION-UPFRONT
+        o.union_rows_max = union_rows;    // TD-KVT-COHORT-BATCHED-MATERIALIZE
         mgr = std::make_unique<ld::KvTieringManager>(std::move(o));
 
-        dev_indices = be->device_alloc(kTopk * sizeof(int));
-        dev_len = be->device_alloc(sizeof(int));
+        const int cr = std::max(1, cohort_rows);
+        dev_indices = be->device_alloc(
+            static_cast<size_t>(cr) * kTopk * sizeof(int));
+        dev_len = be->device_alloc(static_cast<size_t>(cr) * sizeof(int));
     }
     ~ManagerFixture() {
         mgr.reset();  // drains before the pool dies
@@ -397,6 +403,23 @@ struct ManagerFixture {
         const int n = static_cast<int>(sel.size());
         fx.be->memcpy_h2d(dev_indices, padded.data(), kTopk * sizeof(int));
         fx.be->memcpy_h2d(dev_len, &n, sizeof(int));
+    }
+
+    /// TD-KVT-ADMISSION-UPFRONT: upload a chunk cohort's per-row selections
+    /// (row b at dev_indices + b*kTopk, length at dev_len + b).
+    void upload_cohort(const std::vector<std::vector<int>>& rows_sel) {
+        const int R = static_cast<int>(rows_sel.size());
+        std::vector<int> padded(static_cast<size_t>(R) * kTopk, -1);
+        std::vector<int> lens(static_cast<size_t>(R), 0);
+        for (int b = 0; b < R; ++b) {
+            for (size_t i = 0; i < rows_sel[b].size(); ++i)
+                padded[static_cast<size_t>(b) * kTopk + i] = rows_sel[b][i];
+            lens[static_cast<size_t>(b)] =
+                static_cast<int>(rows_sel[b].size());
+        }
+        fx.be->memcpy_h2d(dev_indices, padded.data(),
+                          padded.size() * sizeof(int));
+        fx.be->memcpy_h2d(dev_len, lens.data(), lens.size() * sizeof(int));
     }
 
     /// Demote every eligible page of `layer` at position `pos` and wait.
@@ -572,6 +595,192 @@ TEST(KvTieringManager, PrefillChunkFlowDemotesBehindFrontierByteExact) {
     EXPECT_EQ(s.pool_hits, 3u);
     EXPECT_EQ(s.h2d_bursts, 1u);
     EXPECT_EQ(s.demoted_pages, 7u);
+}
+
+TEST(KvTieringManager, CohortPerRowMaterializeByteExactChunkBoundaryDemote) {
+    REQUIRES_GPU();
+    // TD-KVT-ADMISSION-UPFRONT: a blessed sparse prefill CHUNK cohort —
+    // ONE batched selection readback per (rank, layer), per-row fake views
+    // byte-exact against ground truth with the demoted VRAM pages
+    // clobbered, chunk-boundary demotion behind the LAST row's position,
+    // and per-LAYER cohort write legality (superchunk layer-wise sweep:
+    // replaying an earlier sub-chunk at a later layer is legal while
+    // writing over THIS layer's demoted territory throws, INV-KVT-2).
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/10, {}, 8.0,
+                     /*spare_pages=*/0, /*cohort_rows=*/4);
+    // Decode-style history to pos 31: pages 0..5 of layer 0 demote.
+    m.demote(/*layer=*/0, /*pos=*/31);
+    ASSERT_EQ(m.freed.size(), 6u);
+    std::vector<char> junk(6 * kStrideBlock, '\xAA');
+    m.fx.be->memcpy_h2d(m.fx.pool, junk.data(), junk.size());
+
+    // Chunk cohort [32, 36): per-layer legality passes (no non-hot page of
+    // layer 0 at/after logical 8).
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, /*pos=*/32, bts, /*rows=*/4));
+    const std::vector<std::vector<int>> sel = {
+        {23, 0, 31},      // cold 23, 0 + hot 31
+        {9, 33},          // cold 9 + hot 33
+        {},               // empty selection → untiered row
+        {5, 24, 0, 35},   // cold 5 + hot 24, 35 + repeat 0 (cache hit)
+    };
+    m.upload_cohort(sel);
+    for (int b = 0; b < 4; ++b) {
+        layerstorm::parallelism::TieredKvView tv{};
+        const bool t = m.mgr->materialize_row(
+            0, /*layer=*/0, b, /*rows=*/4,
+            static_cast<const int*>(m.dev_indices),
+            static_cast<const int*>(m.dev_len),
+            /*selection_fresh=*/true, m.fx.stream, &tv);
+        if (sel[static_cast<size_t>(b)].empty()) {
+            EXPECT_FALSE(t) << "empty row " << b;
+            continue;
+        }
+        ASSERT_TRUE(t) << "row " << b;
+        // Per-row check BEFORE the next row's gather reuses the scratch.
+        m.check_scratch(tv, sel[static_cast<size_t>(b)]);
+    }
+    const auto& s = m.mgr->stats();
+    EXPECT_EQ(s.cohort_readbacks, 1u)
+        << "ONE batched selection readback per (rank, layer)";
+    EXPECT_EQ(s.cohort_rows_tiered, 3u);
+    EXPECT_GE(s.cache_hits, 1u) << "repeated cold pos must hit the row cache";
+
+    // Chunk-boundary demotion: after_attention at the LAST row's position.
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+    m.fx.be->synchronize_device();
+    m.mgr->after_attention(0, 1, /*token_pos=*/35, m.handles.data() + 0,
+                           NL, kLayers);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    // demote_end = 36 − 8 = 28 → page 6 (tokens 24..27) newly demoted.
+    ASSERT_EQ(m.freed.size(), 7u);
+    EXPECT_EQ(m.freed.back().second, 6);
+
+    // Cohort write over layer 0's demoted territory: fail-loud.
+    EXPECT_THROW(m.mgr->begin_layer(0, 1, /*pos=*/16, bts, /*rows=*/4),
+                 std::runtime_error);
+    // Same replay on layer 1 (no demotions): legal — the superchunk
+    // layer-wise sweep revisits earlier sub-chunks at later layers.
+    EXPECT_TRUE(m.mgr->begin_layer(1, 1, /*pos=*/16, bts, /*rows=*/4));
+    // Rows above the cohort staging cap are rejected (not a tier step).
+    EXPECT_FALSE(m.mgr->begin_layer(1, 1, /*pos=*/16, bts, /*rows=*/5));
+}
+
+TEST(KvTieringManager, CohortBatchedUnionMaterializeByteExactRewrite) {
+    REQUIRES_GPU();
+    // TD-KVT-COHORT-BATCHED-MATERIALIZE: the batched union consumer — ONE
+    // gather of the ascending unique union of the cohort's selections
+    // (byte-exact against ground truth with the demoted VRAM pages
+    // clobbered), per-row indices rewritten to union slots ORDER-PRESERVING,
+    // per-row seqlens all = the union extent, and the per-row arm still
+    // byte-exact afterwards (fallback coexistence).
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/10, {}, 8.0,
+                     /*spare_pages=*/0, /*cohort_rows=*/4, /*union_rows=*/64);
+    m.demote(/*layer=*/0, /*pos=*/31);  // pages 0..5 of layer 0 demote
+    ASSERT_EQ(m.freed.size(), 6u);
+    std::vector<char> junk(6 * kStrideBlock, '\xBB');
+    m.fx.be->memcpy_h2d(m.fx.pool, junk.data(), junk.size());
+
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, /*pos=*/32, bts, /*rows=*/4));
+    const std::vector<std::vector<int>> sel = {
+        {23, 0, 31},      // cold 23, 0 + hot 31
+        {9, 33},          // cold 9 + hot 33
+        {},               // empty selection (rewritten length 0)
+        {5, 24, 0, 35},   // cold 5 + hot 24, 35 + repeat 0 (union dedup)
+    };
+    m.upload_cohort(sel);
+    layerstorm::parallelism::TieredKvView tv{};
+    ASSERT_TRUE(m.mgr->materialize_cohort(
+        0, /*layer=*/0, /*rows=*/4,
+        static_cast<const int*>(m.dev_indices),
+        static_cast<const int*>(m.dev_len),
+        /*selection_fresh=*/true, m.fx.stream, &tv));
+    // Union = ascending unique positions across all rows.
+    const std::vector<int> uni{0, 5, 9, 23, 24, 31, 33, 35};
+    m.check_scratch(tv, uni);
+
+    // Rewritten per-row indices (union slots, order-preserving) + seqlens.
+    m.fx.be->synchronize_device();
+    std::vector<int> got_idx(4 * kTopk);
+    std::vector<int> got_len(4);
+    m.fx.be->memcpy_d2h_async(got_idx.data(), tv.sparse_indices,
+                              got_idx.size() * sizeof(int), m.fx.stream);
+    m.fx.be->memcpy_d2h_async(got_len.data(), tv.seqlens_k,
+                              got_len.size() * sizeof(int), m.fx.stream);
+    m.fx.be->synchronize_device();
+    const std::vector<std::vector<int>> want_rw = {
+        {3, 0, 5}, {2, 6}, {}, {1, 4, 0, 7}};
+    for (int b = 0; b < 4; ++b) {
+        EXPECT_EQ(got_len[static_cast<size_t>(b)],
+                  static_cast<int>(uni.size()))
+            << "row " << b << " seqlen must be the union extent";
+        for (size_t i = 0; i < want_rw[static_cast<size_t>(b)].size(); ++i) {
+            EXPECT_EQ(got_idx[static_cast<size_t>(b) * kTopk + i],
+                      want_rw[static_cast<size_t>(b)][i])
+                << "row " << b << " rewritten index " << i;
+        }
+    }
+    const auto& s = m.mgr->stats();
+    EXPECT_EQ(s.cohort_unions, 1u);
+    EXPECT_EQ(s.cohort_union_rows, uni.size());
+    EXPECT_EQ(s.cohort_union_rewrites, 1u);
+    EXPECT_EQ(s.cohort_readbacks, 1u)
+        << "ONE batched selection readback per (rank, layer)";
+    EXPECT_EQ(s.cache_hits, 0u)
+        << "union gathers must not cache-insert (nothing to hit yet)";
+
+    // Same step, per-row arm still byte-exact after the union (fallback
+    // coexistence: the union and per-row staging sets are independent).
+    layerstorm::parallelism::TieredKvView rtv{};
+    ASSERT_TRUE(m.mgr->materialize_row(
+        0, /*layer=*/0, /*row=*/0, /*rows=*/4,
+        static_cast<const int*>(m.dev_indices),
+        static_cast<const int*>(m.dev_len),
+        /*selection_fresh=*/false, m.fx.stream, &rtv));
+    m.check_scratch(rtv, sel[0]);
+}
+
+TEST(KvTieringManager, CohortUnionCapacityAndRowwiseFallback) {
+    REQUIRES_GPU();
+    // Union larger than union_rows_max → materialize_cohort returns false
+    // (fail-safe per-row fallback), never throws.
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/10, {}, 8.0,
+                     /*spare_pages=*/0, /*cohort_rows=*/4, /*union_rows=*/4);
+    m.demote(/*layer=*/0, /*pos=*/31);
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, /*pos=*/32, bts, /*rows=*/4));
+    const std::vector<std::vector<int>> sel = {
+        {23, 0, 31}, {9, 33}, {}, {5, 24, 0, 35}};  // union 8 > cap 4
+    m.upload_cohort(sel);
+    layerstorm::parallelism::TieredKvView tv{};
+    EXPECT_FALSE(m.mgr->materialize_cohort(
+        0, 0, 4, static_cast<const int*>(m.dev_indices),
+        static_cast<const int*>(m.dev_len), true, m.fx.stream, &tv));
+    // Per-row arm consumes the same host selection (identity reuse).
+    layerstorm::parallelism::TieredKvView rtv{};
+    ASSERT_TRUE(m.mgr->materialize_row(
+        0, 0, 0, 4, static_cast<const int*>(m.dev_indices),
+        static_cast<const int*>(m.dev_len), false, m.fx.stream, &rtv));
+    m.check_scratch(rtv, sel[0]);
+    EXPECT_EQ(m.mgr->stats().cohort_unions, 0u);
+
+    // LS_KVT_COHORT_ROWWISE=1 kill-switch: the arm is disabled at init.
+    setenv("LS_KVT_COHORT_ROWWISE", "1", 1);
+    {
+        ManagerFixture m2(8, 10, {}, 8.0, 0, /*cohort_rows=*/4,
+                          /*union_rows=*/64);
+        m2.demote(0, 31);
+        const int* bts2[1] = {m2.bt()};
+        ASSERT_TRUE(m2.mgr->begin_layer(0, 1, 32, bts2, /*rows=*/4));
+        m2.upload_cohort(sel);
+        layerstorm::parallelism::TieredKvView tv2{};
+        EXPECT_FALSE(m2.mgr->materialize_cohort(
+            0, 0, 4, static_cast<const int*>(m2.dev_indices),
+            static_cast<const int*>(m2.dev_len), true, m2.fx.stream, &tv2));
+    }
+    unsetenv("LS_KVT_COHORT_ROWWISE");
 }
 
 TEST(KvTieringManager, LruEvictionUnderTinyHotBufferStaysCorrect) {
