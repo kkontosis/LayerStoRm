@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -223,6 +224,14 @@ public:
     /// (index = expert_idx). Missing files yield invalid identities.
     static std::vector<ExpertFileIdentity> stat_expert_files(
         const std::string& prepacked_dir, uint32_t num_experts);
+
+    /// LIVE PREPACK identity table: one COMBINED identity over the whole
+    /// source shard set (max mtime, summed size), replicated for every
+    /// expert index — any shard change invalidates all cached slots. A
+    /// missing/empty shard yields an all-invalid table (never adopt).
+    static std::vector<ExpertFileIdentity> stat_source_files(
+        const std::vector<std::filesystem::path>& source_files,
+        uint32_t num_experts);
 
     // ── Record ops (INV-ARENA-CACHE-ORDER) ───────────────────────────────
 

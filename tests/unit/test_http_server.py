@@ -1358,6 +1358,11 @@ class TestClassifyRequestError:
         (_POOL_BUSY, (503, "server_error", "kv_cache_exhausted")),
         ("prefix-cache fork: pool exhausted after evicting every entry",
          (503, "server_error", "kv_cache_exhausted")),
+        # 80-byte CMP field truncation (INV-IPC-ERRMSG-80): the 2026-08-26
+        # V4 side-tier failure arrived as "...pool exha" — still capacity.
+        ("CMP_ERROR (far L0 (burst)): attention: V4 side-tier page "
+         "provisioning failed (kSwa/kHca/kIndexerK pool exha",
+         (503, "server_error", "kv_cache_exhausted")),
         (_POOL_TOO_BIG, (400, "invalid_request_error",
                          "context_length_exceeded")),
         ("empty prompt", (400, "invalid_request_error", "invalid_prompt")),

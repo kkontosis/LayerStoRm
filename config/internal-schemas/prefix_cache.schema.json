@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "x-configFile": "prefix_cache.json",
+  "description": "Prefix-cache internal knobs (Python PrefixCacheConfig fields not part of the user-facing serving.prefix_cache section). Loaded from prefix_cache.json if not inlined.",
+  "properties": {
+    "max_entry_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048576,
+      "default": 0,
+      "description": "PER-ENTRY registration cap: a prompt prefix longer than this is not registered as a holder (the request itself is unaffected). 0 (default) = no separate cap — an entry is bounded only by the TOTAL budget (serving.prefix_cache.max_cached_tokens; an entry longer than the total budget can never fit and is always refused). Set it below the total budget to stop one huge prompt from evicting the whole working set; set it to serving.max_sequence_length in serving profiles so every admissible prompt is cacheable. Independent of the total budget by design — the pre-2026-08-26 single 8192 number silently killed long-prompt caching (skips are now logged per request)."
+    }
+  },
+  "additionalProperties": false
+}

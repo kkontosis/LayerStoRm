@@ -410,8 +410,25 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
                    static_cast<uint32_t>(cmd.cmd_seq));
         have_evict_map = true;
     } else {
-        const uint32_t tp = static_cast<uint32_t>(
-            deps_.live_config->hardware.gpus.size());
+        // ACT arm: static e % <expert hosts>.  Expert hosts = the
+        // expert-role PREFIX of hardware.gpus (a GPU whose roles carry
+        // neither resident nor expert_streaming — e.g. a dedicated draft
+        // host — stops the scan; the schema default gives a role-less GPU
+        // all roles).  Mirrors the bridge's moe_gpus rule exactly so the
+        // FAR act arm places byte-identically to the split act arm.
+        const auto& gpus = deps_.live_config->hardware.gpus;
+        uint32_t tp = 0;
+        for (const auto& g : gpus) {
+            bool expert_host = false;
+            for (const auto r : g.roles)
+                if (r == config::GpuRole::resident
+                    || r == config::GpuRole::expert_streaming) {
+                    expert_host = true;
+                    break;
+                }
+            if (!expert_host) break;
+            ++tp;
+        }
         for (uint32_t i = 0; i < count; ++i) {
             entries[i].layer_idx  = p.layer_idx;
             entries[i].expert_idx = topk[i];

@@ -6,7 +6,7 @@
 
 #include <spdlog/spdlog.h>
 
-#include "model/weight_pipeline/prepacked_source.h"
+#include "model/weight_pipeline/expert_slot_source.h"
 
 #ifdef LAYERSTORM_HAS_URING
 #include <liburing.h>
@@ -70,7 +70,7 @@ ArenaLoader::~ArenaLoader() {
 }
 
 bool ArenaLoader::submit(ExpertKey key, int gpu, void* dst,
-                         const model::PrepackedSource* src) {
+                         const model::ExpertSlotSource* src) {
     if (!dst || !src) return false;
 
 #ifdef LAYERSTORM_HAS_URING

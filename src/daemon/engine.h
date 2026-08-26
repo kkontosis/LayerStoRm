@@ -41,6 +41,8 @@ class ModelConfig;
 class QuantInterface;
 class LayerRegistry;
 class PrepackedSource;
+class ExpertSlotSource;
+class LiveGgufExpertSource;
 class PackedBufferCache;
 struct LoadedModel;
 struct PrepackResult;
@@ -336,6 +338,18 @@ private:
 
     // ── Pre-processed source (WP-3, optional) ──
     std::unique_ptr<model::PrepackedSource> prepacked_source_;
+
+    // ── Live prepack source (preprocessing.live_prepack, optional) ──
+    // Synthesizes prepacked-identical slot bytes straight from the source
+    // GGUF shards (INV-LIVE-PREPACK-IDENTITY). Mutually exclusive with
+    // prepacked_source_ (config-validated). Borrows loaded_model_'s
+    // gguf_shards — declared AFTER loaded_model_ destruction-order-wise is
+    // unnecessary (engine tears down daemon before members), but keep it
+    // adjacent to prepacked_source_ for the shared consumers.
+    std::unique_ptr<model::LiveGgufExpertSource> live_source_;
+
+    /// The active expert slot source (prepacked or live), or nullptr.
+    model::ExpertSlotSource* expert_source_() const;
 
     // M3b: online self-tuning arena placement (LS_ARENA_PLACE_ONLINE=1,
     // default OFF). Declared AFTER pinned_arena_/prepacked_source_ so it is

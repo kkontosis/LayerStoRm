@@ -1720,9 +1720,14 @@ bool ArchDeepseekV4::execute(
     if (!d_.ensure_v4_tier_pages(
             v4_seq, v4_pos + static_cast<uint32_t>(v4_rows - 1))) {
         d_.last_internal_error_cat_ = ipc::CmpErrorCategory::kKvPoolExhausted;
+        // INV-IPC-ERRMSG-80: the CMP_ERROR message field is 80 bytes — the
+        // previous 100-byte message truncated to "...pool exha", so the
+        // orchestrator's "exhausted" retry match never fired and requests
+        // failed outright (2026-08-26 incident). Keep retry keywords early
+        // and the whole message <= 79 bytes.
         d_.last_internal_error_msg_ =
-            "attention: V4 side-tier page provisioning failed "
-            "(kSwa/kHca/kIndexerK pool exhausted — fail-closed)";
+            "attention: V4 side-tier pool exhausted "
+            "(kSwa/kHca/kIndexerK; evict and retry)";
         return false;
     }
     const int L = d_.kv_layers_ > 0 ? d_.kv_layers_ : 1;

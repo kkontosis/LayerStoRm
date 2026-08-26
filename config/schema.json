@@ -1305,6 +1305,22 @@
             }
           },
           "additionalProperties": false
+        },
+        "prefill_chunk_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512,
+          "default": 64,
+          "x-changeable": false,
+          "description": "Serving-orchestrator prefill chunk ROWS: the chunked-path prefill stride (and its prefix-cache registration grid) and the attention sub-chunk row count on the superchunk path. Model-physics knob, not an arch switch: architectures whose per-chunk routed-expert UNION saturates toward the full expert set (DeepSeek-V4-class) set 512 (= kMaxBatchDescriptors) so each layer's expert union streams ~once per chunk; the GLM champion keeps the test-proven 64. Clamped at boot to EngineInfo.moe_batch_capacity (engine-reported). Env LS_ORCH_PREFILL_CHUNK overrides (diagnostic)."
+        },
+        "decode_expert_fetch_timeout_s": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 5,
+          "x-changeable": false,
+          "description": "Daemon-side expert-fetch deadline in SECONDS for decode-shaped steps (FETCH_AND_RUN / FAR timeout_us); prefill uses max(120 s, this). Default 5 = the historical champion value. Streaming-wall deployments (e.g. DeepSeek-V4 routed experts from the GGUF page cache, ~3.4 GB/token cold) set 200 — the golden-harness precedent (deepseek_v4_gguf_golden_test)."
         }
       },
       "additionalProperties": false
@@ -2425,15 +2441,15 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 1048576,
-              "default": 8192,
-              "description": "LRU token budget: the sum of registered prefix lengths is kept at or below this by evicting oldest entries (0 = unbounded is NOT allowed; use enabled=false to disable). Retained holders are cheap in pages (shared refcounts + one CoW append-frontier logical page group per fork) but each pins its prefix's pages against reuse-by-free."
+              "default": 131072,
+              "description": "TOTAL unique-token LRU budget: the chain-aware sum of registered prefix tokens (each entry counts only its unique tail beyond its longest registered ancestor) is kept at or below this by evicting oldest entries (0 = unbounded is NOT allowed; use enabled=false to disable). Independent of the PER-ENTRY registration cap (_internal-prefix_cache.max_entry_tokens) — until 2026-08-26 one 8192 number served both roles and silently killed caching for every >8k prompt. A generous budget is safe for the MAIN KV pool: kMain holder pages are refcounted CoW, and pool exhaustion evicts holders on demand (TD-INDEXER-POOL-EVICT), so pressure degrades by LRU churn, never by wedging admission. NOTE holder cost is architecture-dependent (INV-PREFIX-CACHE-3): V4 side tiers are copy-on-fork per holder — those pools are pre-sized from max_entries, not this budget. Default 131072 = a few full-length long-context conversations of unique tokens."
             },
             "max_entries": {
               "type": "integer",
               "minimum": 1,
               "maximum": 64,
               "default": 8,
-              "description": "Maximum retained prefix holder sequences (LRU). Also bounded by the engine page budget's max_concurrent_forks sizing."
+              "description": "Maximum retained prefix holder sequences (LRU). Also bounded by the engine page budget's max_concurrent_forks sizing. SIZING INPUT (INV-PREFIX-CACHE-3): on deepseek_v4 every holder owns a full COPY-ON-FORK side-tier set (kSwa/kHca/kIndexerK, ~45 MiB/holder/TP-GPU at 32k), so the engine carves the side pools for max_concurrent_requests + max_entries sequences and logs the achievable holder count at boot (warns when VRAM caps it below max_entries — expect retryable eviction churn there). GLM holders are refcount-cheap and do not scale pools."
             }
           },
           "additionalProperties": false
@@ -2471,9 +2487,23 @@
           "type": "boolean",
           "default": false,
           "description": "Force legacy weight loading (routed experts from safetensors) even when prepacked_dir exists. For A/B testing and migration validation."
+        },
+        "live_prepack": {
+          "type": "boolean",
+          "default": false,
+          "description": "LIVE PREPACK: build the pinned host expert arena DIRECTLY from the source GGUF shards (model.weights_path), running the prepack transform in memory — no prepacked_dir needed and no prepacked files written. Byte-identical slots to a prepacked build (INV-LIVE-PREPACK-IDENTITY); the cold build becomes source-disk-bound. GGUF weights only. Requires memory.pin_host_expert_pool + pin_host_expert_pool_preload + preload_expert_buffers; mutually exclusive with prepacked_dir, auto_preprocess, and legacy_weights.",
+          "x-devDoc": "LiveGgufExpertSource + live_prepack_build: io_uring O_DIRECT readers over the de-stacked expert tensor ranges, NUMA-pinned transform workers (pack_gguf_expert), slot commit through the standard reserve→mark_ready record discipline. Runtime cold misses stay covered (load_into synthesizes any slot on demand through the worker-pool ArenaLoader)."
+        },
+        "live_prepack_threads": {
+          "type": "integer",
+          "default": 0,
+          "description": "Worker threads for the live-prepack bulk arena build. 0 = auto (min(hardware_concurrency, 32), split across destination NUMA nodes proportionally to their slot counts)."
         }
       },
       "additionalProperties": false
+    },
+    "_internal-prefix_cache": {
+      "$ref": "internal-schemas/prefix_cache.schema.json"
     },
     "_internal-prescope": {
       "$ref": "internal-schemas/prescope.schema.json"

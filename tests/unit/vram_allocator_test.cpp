@@ -1715,7 +1715,7 @@ namespace {
 
 // Mirrors test-data/config/deepseek_v4_flash_gguf.json: 2 SWA + 21 CSA +
 // 20 HCA layers, 32k max_seq, 32 concurrent requests.
-lc::Config v4_config(const std::string& backend = "csa_hca") {
+nlohmann::json v4_config_json(const std::string& backend = "csa_hca") {
     std::vector<int> ratios{0, 0};
     for (int l = 2; l < 43; ++l) ratios.push_back(l % 2 == 0 ? 4 : 128);
     auto j = nlohmann::json{
@@ -1773,7 +1773,11 @@ lc::Config v4_config(const std::string& backend = "csa_hca") {
                       {"tp_array", {0}},
                       {"system_ram_gb", 512}}},
     };
-    return lc::parse_config(j);
+    return j;
+}
+
+lc::Config v4_config(const std::string& backend = "csa_hca") {
+    return lc::parse_config(v4_config_json(backend));
 }
 
 lmem::VramLayout v4_layout(const lc::Config& cfg) {
@@ -1843,16 +1847,68 @@ TEST(VramAllocatorV4, LayoutPageCountsDemandDriven) {
     EXPECT_EQ(layout.indexer_k_bytes_per_page, 270336);
 
     // 32 req × ceil(32768/256)=128 blocks × layer counts (demand fits VRAM).
+    // Side tiers additionally carry the DEFAULT prefix-holder budget
+    // (serving.prefix_cache: enabled, max_entries=8, uncapped entry length
+    // → 8 full-length copy-on-fork holder tier sets, INV-PREFIX-CACHE-3);
+    // kMain (CSA) is refcount-shared with holders and NOT holder-scaled.
     EXPECT_EQ(gpu.kv_main_pages, 32 * 128 * 21);        // 86016 CSA pages
-    EXPECT_EQ(gpu.kv_hca_pages, 32 * 128 * 20);         // 81920 HCA pages
+    EXPECT_EQ(gpu.kv_hca_pages, (32 + 8) * 128 * 20);   // 102400 HCA pages
     // SWA/raw: per seq — 2 SWA layers×2 + 21 CSA×3 + 20 HCA×3 + 1 MTP×2.
-    EXPECT_EQ(gpu.kv_swa_pages, 32 * (2 * 2 + 21 * 3 + 20 * 3 + 2));
+    EXPECT_EQ(gpu.kv_swa_pages, (32 + 8) * (2 * 2 + 21 * 3 + 20 * 3 + 2));
     // Speculation: CSA-page-size sibling, 15 % of CSA demand.
     EXPECT_EQ(gpu.kv_speculation_pages,
               static_cast<int>(32 * 128 * 21 * 0.15));
-    // Indexer: ceil(32768/8192)=4 pages/seq × 21 CSA layers × 32 req.
-    EXPECT_EQ(gpu.indexer_k_pages, 4 * 21 * 32);
+    // Indexer: ceil(32768/8192)=4 pages/seq × 21 CSA layers × (32 req + 8
+    // holders).
+    EXPECT_EQ(gpu.indexer_k_pages, 4 * 21 * (32 + 8));
     EXPECT_EQ(gpu.max_kv_pages, gpu.kv_main_pages + gpu.kv_speculation_pages);
+}
+
+// INV-PREFIX-CACHE-3: V4 prefix holders are COPY-ON-FORK full side-tier
+// sets (TD-V4-SERVE-PREFIX), so the kSwa/kHca/kIndexerK pools must be sized
+// for max_concurrent_requests + serving.prefix_cache.max_entries — the
+// 2026-08-26 incident was 8 holders + 1 in-flight against side pools carved
+// for max_concurrent_requests=2.
+TEST(VramAllocatorV4, SideTierPoolsIncludeHolderBudget) {
+    auto joff = v4_config_json();
+    joff["serving"]["prefix_cache"] = {{"enabled", false}};
+    auto jon = v4_config_json();
+    jon["serving"]["prefix_cache"] = {{"enabled", true}, {"max_entries", 5}};
+    // Per-entry cap bounds the holder tier demand for the LENGTH-scaled
+    // tiers (LID/HCA); SWA is length-independent (window ring).
+    jon["_internal-prefix_cache"] = {{"max_entry_tokens", 8192}};
+
+    auto off = v4_layout(lc::parse_config(joff)).gpus[0];
+    auto on = v4_layout(lc::parse_config(jon)).gpus[0];
+
+    // Per holder at the 8192-token cap: LID ceil(8192/8192)=1 page × 21 CSA
+    // layers; HCA ceil(8192/256)=32 blocks × 20 layers; SWA full per-seq set
+    // (2×2 + 21×3 + 20×3 + 1 MTP×2 = 129 pages).
+    EXPECT_EQ(on.indexer_k_pages - off.indexer_k_pages, 5 * 1 * 21);
+    EXPECT_EQ(on.kv_hca_pages - off.kv_hca_pages, 5 * 32 * 20);
+    EXPECT_EQ(on.kv_swa_pages - off.kv_swa_pages,
+              5 * (2 * 2 + 21 * 3 + 20 * 3 + 2));
+    // kMain (CSA) + speculation are refcount-shared with holders — NOT
+    // holder-scaled (their holder pressure stays soft: max_cached_tokens
+    // budget + evict-on-exhaustion, TD-INDEXER-POOL-EVICT).
+    EXPECT_EQ(on.kv_main_pages, off.kv_main_pages);
+    EXPECT_EQ(on.kv_speculation_pages, off.kv_speculation_pages);
+}
+
+// Uncapped entries (max_entry_tokens=0) budget holders at full
+// max_sequence_length.
+TEST(VramAllocatorV4, HolderBudgetUncappedUsesMaxSequenceLength) {
+    auto joff = v4_config_json();
+    joff["serving"]["prefix_cache"] = {{"enabled", false}};
+    auto jon = v4_config_json();
+    jon["serving"]["prefix_cache"] = {{"enabled", true}, {"max_entries", 2}};
+
+    auto off = v4_layout(lc::parse_config(joff)).gpus[0];
+    auto on = v4_layout(lc::parse_config(jon)).gpus[0];
+
+    // Full-length holder: LID ceil(32768/8192)=4 × 21; HCA 128 × 20.
+    EXPECT_EQ(on.indexer_k_pages - off.indexer_k_pages, 2 * 4 * 21);
+    EXPECT_EQ(on.kv_hca_pages - off.kv_hca_pages, 2 * 128 * 20);
 }
 
 TEST(VramAllocatorV4, RegionsSumToTotal) {

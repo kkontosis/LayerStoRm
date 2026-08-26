@@ -10,7 +10,7 @@
 #include "core/memory/pinned_expert_arena.h"
 #include "model/weight_loader/weight_loader.h"
 #include "model/weight_pipeline/packed_buffer_cache.h"
-#include "model/weight_pipeline/prepacked_source.h"
+#include "model/weight_pipeline/expert_slot_source.h"
 
 namespace layerstorm::transfer {
 

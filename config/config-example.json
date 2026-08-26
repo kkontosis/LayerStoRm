@@ -219,7 +219,9 @@
       "reader_max_retries": 200000000,
       "reader_backoff_stage_size": 4096,
       "reader_stage0_yield_every": 64
-    }
+    },
+    "prefill_chunk_tokens": 64,
+    "decode_expert_fetch_timeout_s": 5
   },
   "prefetch": {
     "prescope": {
@@ -442,7 +444,7 @@
     "tokenizer_mode": "auto",
     "prefix_cache": {
       "enabled": true,
-      "max_cached_tokens": 8192,
+      "max_cached_tokens": 131072,
       "max_entries": 8
     }
   },
@@ -451,7 +453,12 @@
     "auto_preprocess": false,
     "auto_preprocess_target": "",
     "host_cache_mode": "mmap",
-    "legacy_weights": false
+    "legacy_weights": false,
+    "live_prepack": false,
+    "live_prepack_threads": 0
+  },
+  "_internal-prefix_cache": {
+    "max_entry_tokens": 0
   },
   "_internal-prescope": {
     "hidden_size": 7168,
@@ -574,7 +581,9 @@
     "confidence_trace_capacity": 4096
   },
   "_internal-orchestrator": {
-    "ep_gpu_indices": []
+    "ep_gpu_indices": [],
+    "prefill_sc_min_tokens": 256,
+    "prefill_sc_small_chunk_tokens": 64
   },
   "gpu_loader": {
     "enabled": false,

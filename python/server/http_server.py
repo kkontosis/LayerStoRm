@@ -275,7 +275,12 @@ def classify_request_error(detail: str) -> tuple[int, str, str]:
     d = (detail or "").lower()
     if not d:
         return _ERR_INTERNAL
-    if "pool exhausted" in d:
+    # "pool exha" (not "pool exhausted"): the CMP message field is 80
+    # bytes and a long engine message can truncate mid-word — the
+    # 2026-08-26 V4 side-tier failure arrived as "...pool exha" and was
+    # misclassified 500 instead of 503-retryable (INV-IPC-ERRMSG-80).
+    # The prefix matches both the full and the truncated form.
+    if "pool exha" in d:
         need = _POOL_NEED_RE.search(d)
         total = _POOL_TOTAL_RE.search(d)
         if need and total and int(need.group(1)) > int(total.group(1)):

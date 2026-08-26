@@ -1337,6 +1337,8 @@ static OrchestratorConfig parse_orchestrator(const nlohmann::json& j) {
     if (j.contains("coactivation_graph")) r.coactivation_graph = parse_coactivation_graph(j.at("coactivation_graph"));
     if (j.contains("workload_detection")) r.workload_detection = parse_workload_detection(j.at("workload_detection"));
     if (j.contains("ipc_transaction")) r.ipc_transaction = parse_ipc_transaction(j.at("ipc_transaction"));
+    r.prefill_chunk_tokens = get_or(j, "prefill_chunk_tokens", 64);
+    r.decode_expert_fetch_timeout_s = get_or(j, "decode_expert_fetch_timeout_s", 5);
     return r;
 }
 
@@ -1348,6 +1350,8 @@ static nlohmann::json orchestrator_to_json(const OrchestratorConfig& r) {
     j["coactivation_graph"] = coactivation_graph_to_json(r.coactivation_graph);
     j["workload_detection"] = workload_detection_to_json(r.workload_detection);
     j["ipc_transaction"] = ipc_transaction_to_json(r.ipc_transaction);
+    j["prefill_chunk_tokens"] = r.prefill_chunk_tokens;
+    j["decode_expert_fetch_timeout_s"] = r.decode_expert_fetch_timeout_s;
     return j;
 }
 
@@ -1996,7 +2000,7 @@ static nlohmann::json compute_to_json(const ComputeConfig& r) {
 static PrefixCacheConfig parse_prefix_cache(const nlohmann::json& j) {
     PrefixCacheConfig r;
     r.enabled = get_or(j, "enabled", true);
-    r.max_cached_tokens = get_or(j, "max_cached_tokens", 8192);
+    r.max_cached_tokens = get_or(j, "max_cached_tokens", 131072);
     r.max_entries = get_or(j, "max_entries", 8);
     return r;
 }
@@ -2050,6 +2054,8 @@ static PreprocessingConfig parse_preprocessing(const nlohmann::json& j) {
     r.auto_preprocess_target = get_or(j, "auto_preprocess_target", std::string{""});
     if (j.contains("host_cache_mode")) r.host_cache_mode = parse_host_cache_mode(j.at("host_cache_mode").get<std::string>());
     r.legacy_weights = get_or(j, "legacy_weights", false);
+    r.live_prepack = get_or(j, "live_prepack", false);
+    r.live_prepack_threads = get_or(j, "live_prepack_threads", 0);
     return r;
 }
 
@@ -2060,6 +2066,20 @@ static nlohmann::json preprocessing_to_json(const PreprocessingConfig& r) {
     j["auto_preprocess_target"] = r.auto_preprocess_target;
     j["host_cache_mode"] = to_string(r.host_cache_mode);
     j["legacy_weights"] = r.legacy_weights;
+    j["live_prepack"] = r.live_prepack;
+    j["live_prepack_threads"] = r.live_prepack_threads;
+    return j;
+}
+
+static PrefixCacheInternalConfig parse_prefix_cache_internal(const nlohmann::json& j) {
+    PrefixCacheInternalConfig r;
+    r.max_entry_tokens = get_or(j, "max_entry_tokens", 0);
+    return r;
+}
+
+static nlohmann::json prefix_cache_internal_to_json(const PrefixCacheInternalConfig& r) {
+    nlohmann::json j;
+    j["max_entry_tokens"] = r.max_entry_tokens;
     return j;
 }
 
@@ -2385,12 +2405,16 @@ static OrchestratorInternalConfig parse_orchestrator_internal(const nlohmann::js
         r.ep_gpu_indices.clear();
         for (const auto& el : j.at("ep_gpu_indices")) r.ep_gpu_indices.push_back(el.get<int>());
     }
+    r.prefill_sc_min_tokens = get_or(j, "prefill_sc_min_tokens", 256);
+    r.prefill_sc_small_chunk_tokens = get_or(j, "prefill_sc_small_chunk_tokens", 64);
     return r;
 }
 
 static nlohmann::json orchestrator_internal_to_json(const OrchestratorInternalConfig& r) {
     nlohmann::json j;
     j["ep_gpu_indices"] = r.ep_gpu_indices;
+    j["prefill_sc_min_tokens"] = r.prefill_sc_min_tokens;
+    j["prefill_sc_small_chunk_tokens"] = r.prefill_sc_small_chunk_tokens;
     return j;
 }
 
@@ -2427,6 +2451,7 @@ Config parse_config(const nlohmann::json& j) {
     if (j.contains("compute")) cfg.compute = parse_compute(j.at("compute"));
     if (j.contains("serving")) cfg.serving = parse_serving(j.at("serving"));
     if (j.contains("preprocessing")) cfg.preprocessing = parse_preprocessing(j.at("preprocessing"));
+    if (j.contains("_internal-prefix_cache")) cfg._internal_prefix_cache = parse_prefix_cache_internal(j.at("_internal-prefix_cache"));
     if (j.contains("_internal-prescope")) cfg._internal_prescope = parse_prescope_internal(j.at("_internal-prescope"));
     if (j.contains("_internal-residual_correction")) cfg._internal_residual_correction = parse_residual_correction_internal(j.at("_internal-residual_correction"));
     if (j.contains("_internal-utility_scorer")) cfg._internal_utility_scorer = parse_utility_scorer_internal(j.at("_internal-utility_scorer"));
@@ -2470,6 +2495,7 @@ nlohmann::json config_to_json(const Config& cfg) {
     j["compute"] = compute_to_json(cfg.compute);
     j["serving"] = serving_to_json(cfg.serving);
     j["preprocessing"] = preprocessing_to_json(cfg.preprocessing);
+    j["_internal-prefix_cache"] = prefix_cache_internal_to_json(cfg._internal_prefix_cache);
     j["_internal-prescope"] = prescope_internal_to_json(cfg._internal_prescope);
     j["_internal-residual_correction"] = residual_correction_internal_to_json(cfg._internal_residual_correction);
     j["_internal-utility_scorer"] = utility_scorer_internal_to_json(cfg._internal_utility_scorer);
@@ -2750,6 +2776,8 @@ const char* field_name(FieldId id) {
         case FieldId::kOrchestratorIpcTransactionReaderMaxRetries: return "orchestrator.ipc_transaction.reader_max_retries";
         case FieldId::kOrchestratorIpcTransactionReaderBackoffStageSize: return "orchestrator.ipc_transaction.reader_backoff_stage_size";
         case FieldId::kOrchestratorIpcTransactionReaderStage0YieldEvery: return "orchestrator.ipc_transaction.reader_stage0_yield_every";
+        case FieldId::kOrchestratorPrefillChunkTokens: return "orchestrator.prefill_chunk_tokens";
+        case FieldId::kOrchestratorDecodeExpertFetchTimeoutS: return "orchestrator.decode_expert_fetch_timeout_s";
         case FieldId::kPrefetchPrescopeEnabled: return "prefetch.prescope.enabled";
         case FieldId::kPrefetchPrescopeLookaheadLayers: return "prefetch.prescope.lookahead_layers";
         case FieldId::kPrefetchPrescopeTopK: return "prefetch.prescope.top_k";
@@ -2899,6 +2927,9 @@ const char* field_name(FieldId id) {
         case FieldId::kPreprocessingAutoPreprocessTarget: return "preprocessing.auto_preprocess_target";
         case FieldId::kPreprocessingHostCacheMode: return "preprocessing.host_cache_mode";
         case FieldId::kPreprocessingLegacyWeights: return "preprocessing.legacy_weights";
+        case FieldId::kPreprocessingLivePrepack: return "preprocessing.live_prepack";
+        case FieldId::kPreprocessingLivePrepackThreads: return "preprocessing.live_prepack_threads";
+        case FieldId::kInternalPrefixCacheMaxEntryTokens: return "_internal-prefix_cache.max_entry_tokens";
         case FieldId::kInternalPrescopeHiddenSize: return "_internal-prescope.hidden_size";
         case FieldId::kInternalPrescopePcaDim: return "_internal-prescope.pca_dim";
         case FieldId::kInternalPrescopeHiddenDim: return "_internal-prescope.hidden_dim";
@@ -2977,6 +3008,8 @@ const char* field_name(FieldId id) {
         case FieldId::kInternalVerifierAcceptanceEmaAlpha: return "_internal-verifier.acceptance_ema_alpha";
         case FieldId::kInternalDsparkAcceptanceEmaAlpha: return "_internal-dspark.acceptance_ema_alpha";
         case FieldId::kInternalDsparkConfidenceTraceCapacity: return "_internal-dspark.confidence_trace_capacity";
+        case FieldId::kInternalOrchestratorPrefillScMinTokens: return "_internal-orchestrator.prefill_sc_min_tokens";
+        case FieldId::kInternalOrchestratorPrefillScSmallChunkTokens: return "_internal-orchestrator.prefill_sc_small_chunk_tokens";
         case FieldId::kGpuLoaderEnabled: return "gpu_loader.enabled";
         case FieldId::kGpuLoaderCalibrationMode: return "gpu_loader.calibration_mode";
         case FieldId::kGpuLoaderCalibrationPath: return "gpu_loader.calibration_path";
@@ -3448,6 +3481,7 @@ bool apply_field_update(Config& cfg, FieldId id, uint8_t value_type, uint32_t ra
 // ── Config file-link table (auto-generated from x-configFile) ────────────────
 
 const ConfigFileLink kConfigFileLinks[] = {
+    {"_internal-prefix_cache", "prefix_cache.json"},
     {"_internal-prescope", "prescope.json"},
     {"_internal-residual_correction", "residual_correction.json"},
     {"_internal-utility_scorer", "utility_scorer.json"},
@@ -3465,6 +3499,6 @@ const ConfigFileLink kConfigFileLinks[] = {
     {"_internal-dspark", "dspark.json"},
     {"_internal-orchestrator", "orchestrator.json"},
 };
-const size_t kConfigFileLinkCount = 16;
+const size_t kConfigFileLinkCount = 17;
 
 }  // namespace layerstorm::config

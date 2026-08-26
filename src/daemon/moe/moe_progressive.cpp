@@ -10,6 +10,7 @@
 #include "core/perf_trace.h"
 
 #include <algorithm>
+#include <array>    // LS_MOE_DECODE_WAVE_GATE per-rank fetch flags
 #include <atomic>   // TD-DRIFT-ROOTCAUSE diagnostic dump sequence counter
 #include <chrono>
 #include <cstdio>  // I8b shadow-dump JSONL sink (fopen/fprintf)
@@ -1172,6 +1173,26 @@ bool CommandDispatcher::run_moe_overlap_pass(ProgressiveMoeState& st) {
     const int n_experts = deps_.live_config->model.n_routed_experts;
     if (n_experts <= 0) return false;
 
+    // LS_MOE_DECODE_WAVE_GATE (default OFF): only ranks with an in-flight
+    // missing-expert fetch benefit from the overlap pass — their kFinal is
+    // the one gated behind the DMA. A rank whose routed subset is fully
+    // resident pays the duplicated kPartial dispatch (mHC collapse + norm +
+    // permute + FFN graph replay + accumulate) for zero overlap gain; when
+    // gated, it computes everything in the finalize instead (kFinal with its
+    // full bitset — dispatch_moe_ep_extras even keeps kNone for non-waved
+    // extras). Pass-membership-only change: each permuted row is computed by
+    // exactly one pass either way (x+0 exact ⇒ bit-identical tokens).
+    const bool wave_gate = moe_decode_wave_gate_enabled();
+    std::array<uint8_t, 64> gpu_fetching{};  // indexed by target_gpu
+    if (wave_gate) {
+        for (const auto& er : st.experts) {
+            if (er.fetch_requested && !er.is_arrived
+                && er.target_gpu >= 0
+                && static_cast<size_t>(er.target_gpu) < gpu_fetching.size())
+                gpu_fetching[er.target_gpu] = 1;
+        }
+    }
+
     // Group the arrived-and-uncomputed (i.e. initially-resident) experts per
     // target GPU — including extra (expert-only) ranks.
     std::unordered_map<int, std::vector<size_t>> per_gpu;
@@ -1181,6 +1202,10 @@ bool CommandDispatcher::run_moe_overlap_pass(ProgressiveMoeState& st) {
         if (er.target_gpu < 0
             || static_cast<size_t>(er.target_gpu) >= moe_scratch_.size())
             continue;
+        if (wave_gate
+            && (static_cast<size_t>(er.target_gpu) >= gpu_fetching.size()
+                || !gpu_fetching[er.target_gpu]))
+            continue;  // no in-flight fetch on this rank — nothing to overlap
         per_gpu[er.target_gpu].push_back(i);
     }
     if (per_gpu.empty()) return false;

@@ -1,12 +1,14 @@
-"""V4-mode orchestrator tests (ticket I; chunked prefill 2026-08-21).
+"""V4-shape orchestrator tests (ticket I; unified ONE FLOW 2026-08-25).
 
-deepseek_v4 boots the successor orchestrator ARCHITECTURE-AWARE:
-split/ACT command flow (use_far=False, route_arm "act" — the ticket-H
-golden harness shape), prefix cache OFF, first_moe_layer 0
-(all-MoE: the bridge's dense branch never fires), CHUNKED prefill at
-512-token chunks (TD-V4-CHUNK-PREFILL resolved — the engine's V4 chunk
-arm; the teacher-forced per-token feed is retained as a debug arm),
-200 s expert-fetch deadline.
+INV-ORCH-ONE-FLOW: every architecture boots the SAME champion flow —
+REEF routing + fused FAR burst, superchunk prefill, spec arms, prefix
+cache.  Arch-different behavior is driven by CONFIG
+(orchestrator.prefill_chunk_tokens / decode_expert_fetch_timeout_s,
+gpu roles, gpu_loader) or ENGINE-REPORTED capability
+(EngineInfo.moe_batch_capacity, v4_attention_types) — never model-name
+checks.  The split/ACT arm survives as machinery (configs without
+gpu_loader; LS_ORCH_FORCE_SPLIT_ACT=1 diagnostic) and its V4-shaped
+flow tests below exercise it, plus the unified REEF+FAR shape.
 
 Driven against the scripted FakeDaemon from test_bridge_ring — no CUDA.
 """
@@ -41,14 +43,22 @@ def _meta(eos: tuple[int, ...] = ()) -> EngineMetadata:
 
 
 def _v4_orch(eos: tuple[int, ...] = (), *, teacher_forced: bool = False,
-             superchunk: bool = False, prefill_chunk: int = 512):
-    """Orchestrator wired the way Orchestrator.boot wires deepseek_v4.
+             superchunk: bool = False, prefill_chunk: int = 512,
+             use_far: bool = False, route_arm: str = "act",
+             sc_min_tokens: int = 0):
+    """V4-SHAPED orchestrator over the scripted daemon (all-MoE,
+    512-row chunks, 200 s deadline — the values the V4 recipes carry).
 
-    ``teacher_forced=True`` exercises the RETAINED per-token debug arm
-    (the ticket-H lock-step shape); the boot default is superchunk
-    prefill (SC port — sub-chunked attention + one MOE_BIG per layer);
-    ``superchunk=False`` keeps the P1 chunked path for its own tests."""
-    bridge, daemon, _ = _make(use_far=False, route_arm="act")
+    Default arms exercise the RETAINED split/ACT machinery (configs
+    without gpu_loader; the LS_ORCH_FORCE_SPLIT_ACT diagnostic);
+    ``use_far=True, route_arm="reef"`` is the unified serving shape.
+    ``teacher_forced=True`` exercises the per-token debug arm (the
+    ticket-H lock-step shape); ``superchunk=False`` keeps the P1
+    chunked path for its own tests.  ``sc_min_tokens`` defaults to 0
+    (small-prefill downgrade OFF) — this suite's tiny prompts exercise
+    the superchunk MECHANISM itself; the routing threshold has its own
+    tests in test_orchestrator_bridge.py."""
+    bridge, daemon, _ = _make(use_far=use_far, route_arm=route_arm)
     bridge.first_moe_layer = 0            # V4-Flash is all-MoE
     bridge.decode_timeout_us = 200_000_000
     orch = Orchestrator(
@@ -59,7 +69,8 @@ def _v4_orch(eos: tuple[int, ...] = (), *, teacher_forced: bool = False,
         prefix_cache=PrefixCacheConfig(enabled=False),
         teacher_forced_prefill=teacher_forced,
         prefill_chunk=prefill_chunk,
-        prefill_superchunk=superchunk)
+        prefill_superchunk=superchunk,
+        prefill_sc_min_tokens=sc_min_tokens)
     return orch, daemon
 
 
@@ -157,6 +168,36 @@ def test_v4_superchunk_splits_at_capacity():
         _finish(daemon)
 
 
+def test_v4_unified_reef_far_flow_lossless():
+    # INV-ORCH-ONE-FLOW: the V4-shaped orchestrator on the UNIFIED
+    # champion arms — REEF-routed superchunk prefill (E_CMD_REEF_ROUTE +
+    # one MOE_BIG per layer) and fused FAR burst decode — produces the
+    # same greedy chain as the split/ACT arms above (losslessness of the
+    # arm selection itself).
+    prompt = chain(11, 8)                  # body = 7 rows
+    orch, daemon = _v4_orch(superchunk=True, prefill_chunk=2,
+                            use_far=True, route_arm="reef")
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=5,
+            on_token=sink.on_token, on_complete=sink.on_complete))
+        _, tokens, reason = sink.done
+        assert reason == "length"
+        assert tokens == chain(prompt[-1], 5)
+        # Prefill: REEF-routed superchunk — one route + one MOE_BIG per
+        # layer (all-MoE: first_moe_layer 0), no split FETCH_AND_RUN.
+        assert daemon.reef_routes == NUM_LAYERS
+        assert daemon.fetch_moe_bigs == NUM_LAYERS
+        assert daemon.moe_big_rows == [7] * NUM_LAYERS
+        # Decode: fused FAR burst — one FAR command per layer per step.
+        assert daemon.far_layers == NUM_LAYERS * 5
+        assert daemon.fetch_moes == 0
+        assert daemon.dense_moes == 0
+    finally:
+        _finish(daemon)
+
+
 def test_v4_teacher_forced_prompt_feed_lossless():
     # The RETAINED debug arm (teacher_forced_prefill=True).
     prompt = chain(11, 5)
@@ -239,12 +280,16 @@ _V4_BOOT_CFG = {
     "model": {"architecture": "deepseek_v4", "vocab_size": 129280,
               "first_k_dense_replace": 0},
     # Ticket J: a configured dspark method arms V4 speculation (the engine
-    # runs the dflash draft; verify rides the V4 micro-chunk arm). FAR/REEF/
-    # prefix cache stay forced OFF for V4 regardless.
+    # runs the dflash draft; verify rides the V4 micro-chunk arm).
     "speculation": {"enabled": True, "method": "dspark",
                     "dspark": {"speculative_tokens": 4}},
     "gpu_loader": {"enabled": True},
     "serving": {"prefix_cache": {"enabled": True}},
+    # INV-ORCH-ONE-FLOW: the arch-different values ride CONFIG — the
+    # fields the V4 recipes carry (schema defaults are the GLM champion
+    # values 64 / 5 s).
+    "orchestrator": {"prefill_chunk_tokens": 512,
+                     "decode_expert_fetch_timeout_s": 200},
 }
 
 
@@ -255,29 +300,83 @@ def _boot(cfg: dict, tmp_path):
         FakeInfo()))
 
 
-def test_boot_deepseek_v4_arch_awareness(tmp_path):
+def test_boot_deepseek_v4_unified_flow(tmp_path):
+    # INV-ORCH-ONE-FLOW: a V4 config boots the SAME champion flow as GLM
+    # — REEF (gpu_loader.enabled) + fused FAR; the V4-different values
+    # come from the config fields above, not from the model name.
     orch = _boot(_V4_BOOT_CFG, tmp_path)
     b = orch.bridge
-    assert b.use_far is False
-    assert b.route_arm == "act"
-    assert b.first_moe_layer == 0
-    assert b.decode_timeout_us == 200_000_000
+    assert b.use_far is True
+    assert b.route_arm == "reef"          # gpu_loader.enabled
+    assert b.first_moe_layer == 0         # model.first_k_dense_replace
+    assert b.decode_timeout_us == 200_000_000   # config field
     assert b.vocab_size == 129280
+    # No hardware section → every engine GPU hosts experts, and the
+    # superchunk stride clamps to the single-shot bound (expert hosts
+    # beyond the 1-entry default tp_array — TD-MOE-EP-XTP-WAVES).
+    assert b.moe_gpus == 4
+    assert orch._prefill_sc_stride == 512
     # Ticket J: V4 speculation follows the config (dspark armed above).
     assert orch.spec.enabled is True and orch.spec.gamma == 4
-    # TD-V4-SERVE-PREFIX resolved: fork clones complete V4 state, so the
-    # prefix cache is enabled for V4 (superchunk-grid registration).
+    # TD-V4-SERVE-PREFIX resolved: fork clones complete per-seq state,
+    # so the prefix cache is config-only (superchunk-grid registration).
     assert orch.prefix_cache is not None
-    # TD-V4-CHUNK-PREFILL resolved: V4 boots chunked (512-token chunks).
     assert orch._teacher_forced_prefill is False
-    assert orch._prefill_chunk == 512
-    # SC (superchunk port): V4 boots superchunk the prompt body (MOE_BIG
-    # per layer over up to moe_batch_capacity rows, 512-row sub-chunks).
+    assert orch._prefill_chunk == 512     # config field
     assert orch._prefill_superchunk is True
-    # TD-V4-SPEC-PREFILL-CTX RESOLVED: the engine fires the final aux tap
-    # at the last layer's MoE finalize for headless chunks, so V4 chunked
-    # prefill arms the dflash draft context like GLM.
     assert orch._chunk_prefill_arms_draft is True
+
+
+def test_boot_expert_role_prefix_and_elastic_stride(tmp_path):
+    # Expert hosts = the expert-role PREFIX of hardware.gpus (schema
+    # default fills a role-less entry with ALL roles); the elastic
+    # superchunk stride (0 = moe_batch_capacity) engages iff every
+    # expert host is a TP rank.
+    cfg = json.loads(json.dumps(_V4_BOOT_CFG))
+    cfg["hardware"] = {
+        "tp_array": [0],
+        "gpus": [
+            {"id": 0, "roles": ["attention", "resident",
+                                "expert_streaming"]},
+            # Dedicated draft host: no expert roles → stops the scan.
+            {"id": 1, "roles": ["attention"]},
+            {"id": 2},                      # never reached
+            {"id": 3},
+        ],
+    }
+    orch = _boot(cfg, tmp_path)
+    assert orch.bridge.moe_gpus == 1      # ticket-J pin, via roles
+    assert orch._prefill_sc_stride == 0   # TP-only expert hosts: elastic
+    # EP beyond TP (expert hosts extend past the tp ranks) → clamp.
+    cfg2 = json.loads(json.dumps(_V4_BOOT_CFG))
+    cfg2["hardware"] = {
+        "tp_array": [0, 1],
+        "gpus": [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}],
+    }
+    orch2 = _boot(cfg2, tmp_path)
+    assert orch2.bridge.moe_gpus == 4     # role-less = schema default all
+    assert orch2._prefill_sc_stride == 512
+
+
+def test_boot_force_split_act_kill_switch(tmp_path, monkeypatch):
+    # LS_ORCH_FORCE_SPLIT_ACT=1 restores the legacy split/ACT arm
+    # end-to-end (no FAR, no REEF) — the unification bisect lever.
+    monkeypatch.setenv("LS_ORCH_FORCE_SPLIT_ACT", "1")
+    orch = _boot(_V4_BOOT_CFG, tmp_path)
+    assert orch.bridge.use_far is False
+    assert orch.bridge.route_arm == "act"
+
+
+def test_boot_prefill_chunk_clamped_to_engine_capacity(tmp_path):
+    # The config chunk is clamped to the ENGINE-REPORTED MoE batch
+    # capacity (EngineInfo) — covers builds whose capacity shrinks.
+    info = FakeInfo()
+    info.moe_batch_capacity = 128
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(_V4_BOOT_CFG))
+    orch = Orchestrator.boot(str(p),
+                             engine_module=_FakeEngineModule(info))
+    assert orch._prefill_chunk == 128
 
 
 def test_boot_deepseek_v4_spec_off_without_dspark(tmp_path):
@@ -285,7 +384,7 @@ def test_boot_deepseek_v4_spec_off_without_dspark(tmp_path):
     cfg["speculation"] = {"enabled": False}
     orch = _boot(cfg, tmp_path)
     assert orch.spec.enabled is False
-    assert orch.bridge.use_far is False and orch.bridge.route_arm == "act"
+    assert orch.bridge.use_far is True and orch.bridge.route_arm == "reef"
 
 
 def test_boot_deepseek_v4_spec_depth_zero_forces_plain(tmp_path):
@@ -299,10 +398,33 @@ def test_boot_deepseek_v4_spec_depth_zero_forces_plain(tmp_path):
     assert orch2.spec.enabled is False
 
 
+def test_boot_architecture_name_is_irrelevant(tmp_path):
+    # INV-ORCH-ONE-FLOW: the SAME config boots the SAME flow whatever
+    # model.architecture says — arm selection is config/capability-only.
+    orch_v4 = _boot(_V4_BOOT_CFG, tmp_path)
+    cfg = json.loads(json.dumps(_V4_BOOT_CFG))
+    cfg["model"]["architecture"] = "glm_moe_dsa"
+    orch_glm = _boot(cfg, tmp_path)
+    for a, b in ((orch_v4, orch_glm),):
+        assert (a.bridge.use_far, a.bridge.route_arm, a.bridge.moe_gpus,
+                a.bridge.decode_timeout_us, a.bridge.first_moe_layer) == \
+               (b.bridge.use_far, b.bridge.route_arm, b.bridge.moe_gpus,
+                b.bridge.decode_timeout_us, b.bridge.first_moe_layer)
+        assert (a._prefill_chunk, a._prefill_superchunk,
+                a._prefill_sc_stride) == \
+               (b._prefill_chunk, b._prefill_superchunk,
+                b._prefill_sc_stride)
+
+
 def test_boot_glm_shape_unchanged(tmp_path):
+    # The GLM champion boots on SCHEMA DEFAULTS (its recipe sets neither
+    # prefill_chunk_tokens nor decode_expert_fetch_timeout_s) — the
+    # unified boot resolves them byte-identically to the pre-unification
+    # GLM arm selection.
     cfg = json.loads(json.dumps(_V4_BOOT_CFG))
     cfg["model"]["architecture"] = "glm_moe_dsa"
     cfg["model"]["first_k_dense_replace"] = 3
+    del cfg["orchestrator"]               # GLM recipe carries defaults
     orch = _boot(cfg, tmp_path)
     b = orch.bridge
     assert b.use_far is True
@@ -328,6 +450,7 @@ def test_boot_glm_superchunk_kill_switch(tmp_path, monkeypatch):
     cfg = json.loads(json.dumps(_V4_BOOT_CFG))
     cfg["model"]["architecture"] = "glm_moe_dsa"
     cfg["model"]["first_k_dense_replace"] = 3
+    del cfg["orchestrator"]               # GLM recipe carries defaults
     orch = _boot(cfg, tmp_path)
     assert orch._prefill_superchunk is False
     assert orch._prefill_chunk == 64

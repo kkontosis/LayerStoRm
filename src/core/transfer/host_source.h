@@ -12,7 +12,7 @@
 
 namespace layerstorm::model {
 struct LoadedModel;
-class PrepackedSource;
+class ExpertSlotSource;
 class PackedBufferCache;
 }
 
@@ -68,7 +68,7 @@ struct HostSourceDeps {
     // daemon thread) and resolve returns kPending instead of blocking on the
     // synchronous copy. When null, the synchronous load_into fallback is used.
     memory::ArenaLoader*        arena_loader     = nullptr;
-    model::PrepackedSource*     prepacked_source = nullptr;
+    model::ExpertSlotSource*    prepacked_source = nullptr;
     memory::NvmeTier*           nvme_tier        = nullptr;
     model::PackedBufferCache*   packed_cache     = nullptr;
     model::LoadedModel*         loaded_model     = nullptr;

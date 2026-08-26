@@ -17,13 +17,14 @@
 #include <vector>
 
 #include "core/memory/eviction_policy.h"  // ExpertKey
+#include "model/weight_pipeline/expert_slot_source.h"
 #include "model/weight_pipeline/manifest.h"
 
 namespace layerstorm::model {
 
 class QuantInterface;
 
-class PrepackedSource {
+class PrepackedSource final : public ExpertSlotSource {
 public:
     /// Construct from a prepacked directory containing manifest.json +
     /// expert_NNN.bin files. Validates manifest against the QuantInterface.
@@ -37,7 +38,7 @@ public:
     PrepackedSource(const std::filesystem::path& prepacked_dir,
                     const QuantInterface& quant,
                     bool direct_io = false, bool o_direct = false);
-    ~PrepackedSource();
+    ~PrepackedSource() override;
 
     PrepackedSource(const PrepackedSource&) = delete;
     PrepackedSource& operator=(const PrepackedSource&) = delete;
@@ -46,20 +47,20 @@ public:
 
     /// Returns pointer to the packed expert slot data for a given key,
     /// or nullptr if the key is out of range or layer_idx is not a MoE layer.
-    const void* resolve(memory::ExpertKey key) const;
+    const void* resolve(memory::ExpertKey key) const override;
 
     /// Returns true if this source covers the given expert key.
-    bool has(memory::ExpertKey key) const;
+    bool has(memory::ExpertKey key) const override;
 
     /// Bytes per packed expert slot (one MoE layer's worth for one expert).
-    int64_t slot_size_bytes() const { return slot_size_bytes_; }
+    int64_t slot_size_bytes() const override { return slot_size_bytes_; }
 
     /// P-24 cold loader: copy this expert's packed slot bytes from the mmap'd
     /// prepacked file into `dst` (a pre-pinned arena slot of at least
     /// slot_size_bytes()). Returns true on success, false if the key is not
     /// covered. This is the SSD→pinned-arena step of the 3-tier model: the
     /// mmap stays the cold backing store; the arena slot becomes the DMA source.
-    bool load_into(memory::ExpertKey key, void* dst) const;
+    bool load_into(memory::ExpertKey key, void* dst) const override;
 
     /// Register all mmap regions as pinned memory for faster DMA.
     /// Requires CUDA runtime to be initialized. Returns the number of
@@ -76,18 +77,18 @@ public:
 
     /// True if this source is in direct-I/O (mmap-free) mode (Stage 2). In that
     /// mode resolve()/host_ptr() return null and loads go through pread.
-    bool is_direct() const { return direct_io_; }
+    bool is_direct() const override { return direct_io_; }
 
     /// Stage 3 (io_uring): resolve `key` to a raw read descriptor — the open file
     /// descriptor, byte offset, and length (the on-disk stride) — so a caller can
     /// issue an io_uring_prep_read straight into a pinned slot. Returns false if
     /// not in direct mode (no kept fd) or the key is not covered.
     bool read_descriptor(memory::ExpertKey key, int& fd, int64_t& offset,
-                         int64_t& length) const;
+                         int64_t& length) const override;
 
     /// True if the region backing `key`'s expert is page-locked (so the H2D
     /// source needs no staging copy).
-    bool is_pinned(memory::ExpertKey key) const;
+    bool is_pinned(memory::ExpertKey key) const override;
 
     /// Unregister all pinned regions. Called automatically by destructor.
     void unregister_pinned_dma();
@@ -105,7 +106,7 @@ public:
     /// is not a MoE layer or the manifest has no per-layer block (non-GGUF).
     /// The global manifest gguf_types triple remains the per-projection MAX
     /// used for slot/cache sizing.
-    std::optional<GgufExpertTypes> gguf_types_for_layer(int layer_idx) const;
+    std::optional<GgufExpertTypes> gguf_types_for_layer(int layer_idx) const override;
 
     /// Access the manifest (for logging/diagnostics).
     const Manifest& manifest() const { return manifest_; }

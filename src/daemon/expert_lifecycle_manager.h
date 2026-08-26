@@ -25,7 +25,7 @@
 
 namespace layerstorm::model {
 struct LoadedModel;
-class PrepackedSource;
+class ExpertSlotSource;
 class PackedBufferCache;
 }
 
@@ -99,7 +99,7 @@ public:
         memory::PinnedExpertArena*       pinned_arena     = nullptr;  // nullable (P-24 warm DMA tier)
         memory::ArenaLoader*             arena_loader     = nullptr;  // nullable (J-1 async cold load)
         model::LoadedModel*              loaded_model     = nullptr;  // nullable
-        model::PrepackedSource*          prepacked_source = nullptr;  // nullable (WP-3)
+        model::ExpertSlotSource*         prepacked_source = nullptr;  // nullable (WP-3)
         model::PackedBufferCache*        packed_cache     = nullptr;  // nullable (WP-4)
         ipc::StateSnapshot*              snapshot         = nullptr;  // nullable (null in unit tests)
         uint32_t                         first_moe_layer  = 0;

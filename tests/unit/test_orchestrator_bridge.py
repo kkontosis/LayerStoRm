@@ -279,7 +279,8 @@ def test_prefix_superchunk_grid_registration_and_hit():
         speculation=SpeculationConfig(enabled=True, gamma=5,
                                       conf_thresh=0.0),
         prefix_cache=PrefixCacheConfig(),
-        prefill_superchunk=True)
+        prefill_superchunk=True,
+        prefill_sc_min_tokens=0)   # mechanism test: downgrade OFF
     try:
         s1, s2 = _Sink(), _Sink()
         _serve(orch, InferenceRequest(
@@ -328,7 +329,8 @@ def test_prefix_superchunk_exact_body_hit_short_prompt():
         speculation=SpeculationConfig(enabled=True, gamma=5,
                                       conf_thresh=0.0),
         prefix_cache=PrefixCacheConfig(),
-        prefill_superchunk=True)
+        prefill_superchunk=True,
+        prefill_sc_min_tokens=0)   # mechanism test: downgrade OFF
     try:
         s1, s2, s3 = _Sink(), _Sink(), _Sink()
         _serve(orch, InferenceRequest(
@@ -385,6 +387,221 @@ def test_prefix_cache_token_budget_eviction():
         pc = orch.prefix_cache
         assert len(pc._entries) == 1         # 64+64 > 100 → LRU evicted
         assert pc.evictions == 1
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_prefix_cache_long_prompt_registers_and_hits_default_config():
+    """User report 2026-08-26: prefix caching went DEAD above ~10k ctx —
+    PrefixCacheConfig.max_cached_tokens (8192) silently refused every
+    long-prompt registration AND doubled as the total eviction budget.
+    Under the DEFAULT config a >8192-token prompt must now register and a
+    repeat request must hit it."""
+    prompt = chain(91, 8260)             # pre 8259 → grid holder at 8256
+    orch, daemon = _orch_pc()
+    try:
+        s1, s2 = _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=3,
+            on_complete=s1.on_complete))
+        assert daemon.forks == 1         # 8256 > old 8192 cap: registered
+        assert orch.prefix_cache._entries[0].tokens == tuple(prompt[:8256])
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=prompt, max_tokens=3,
+            on_complete=s2.on_complete))
+        assert s2.done[1] == s1.done[1] == chain(prompt[-1], 3)
+        assert orch.last_stats.prefix_hit_tokens == 8256
+        assert orch.prefix_cache.hits == 1
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_prefix_cache_entry_cap_and_total_budget_independent():
+    """The PER-ENTRY cap (_internal-prefix_cache.max_entry_tokens) and the
+    TOTAL budget (serving.prefix_cache.max_cached_tokens) are independent
+    knobs, independently enforced."""
+    # Per-entry cap refuses ONLY over-cap entries; the budget never fires.
+    pc = _pc(max_entry_tokens=100, max_cached_tokens=10_000)
+    assert not pc.register(tuple(range(150)), src_seq_id=1, holder_seq_id=2)
+    assert "over-sized" in pc.last_skip
+    assert "max_entry_tokens" in pc.last_skip
+    _reg(pc, list(range(90)), 1)             # under the cap: registers
+    assert pc.last_skip is None
+    assert pc.evictions == 0
+    # No separate cap (0): an entry longer than the WHOLE budget can never
+    # fit and is refused up front...
+    pc2 = _pc(max_entry_tokens=0, max_cached_tokens=200)
+    assert not pc2.register(tuple(range(250)), src_seq_id=1, holder_seq_id=2)
+    assert "over-sized" in pc2.last_skip
+    assert "max_cached_tokens" in pc2.last_skip
+    # ...while under-budget entries register and BUDGET pressure (not the
+    # cap) evicts LRU.
+    _reg(pc2, list(range(150)), 1)
+    _reg(pc2, list(range(500, 650)), 2)      # unique 300 > 200 → evict #1
+    assert {e.seq_id for e in pc2._entries} == {2}
+    assert pc2.evictions == 1
+
+
+def test_prefix_cache_skipped_registration_is_logged(capsys):
+    """A skipped registration must not be silent (the pre-2026-08-26
+    silent over-sized skip read as a wall-clock regression): the serve
+    log carries one line per request with the reason."""
+    # over-sized: per-entry cap below the grid holder length.
+    from orchestrator.orchestrator import PrefixCacheConfig
+    orch, daemon = _orch_pc(max_entry_tokens=64)
+    try:
+        prompt = chain(31, 130)              # grid holder at 128 > cap 64
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=3,
+            on_complete=sink.on_complete))
+        out = capsys.readouterr().out
+        assert "prefix-cache registration skipped" in out
+        assert "over-sized" in out and "max_entry_tokens 64" in out
+        assert daemon.forks == 0             # nothing registered
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+    # duplicate: a repeat request re-attempts the same grid holder.
+    orch, daemon = _orch_pc()
+    try:
+        prompt = chain(37, 130)
+        for rid in (1, 2):
+            sink = _Sink()
+            _serve(orch, InferenceRequest(
+                request_id=rid, prompt_token_ids=prompt, max_tokens=3,
+                on_complete=sink.on_complete))
+        out = capsys.readouterr().out
+        assert "request 2: prefix-cache registration skipped" in out
+        assert "duplicate" in out
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+# ── SC small-prefill downgrade (user report 2026-08-26): a superchunk
+# sweeps the whole delta's expert UNION in one MOE_BIG per layer, evicting
+# the decode-warmed expert cache — below prefill_sc_min_tokens the delta
+# runs the ordinary chunked path in small increments instead.  Adaptive
+# successor: TD-SC-SMALL-PREFILL-ADAPTIVE. ─────────────────────────────────
+
+
+def _orch_sc(sc_min: int, **kw):
+    from orchestrator.orchestrator import PrefixCacheConfig
+    bridge, daemon, _ = _make(gamma=5, use_far=True)
+    orch = Orchestrator(
+        bridge, metadata=_meta(),
+        speculation=SpeculationConfig(enabled=True, gamma=5,
+                                      conf_thresh=0.0),
+        prefix_cache=PrefixCacheConfig(),
+        prefill_superchunk=True,
+        prefill_sc_min_tokens=sc_min, **kw)
+    return orch, daemon
+
+
+def test_sc_small_prefill_routes_chunked_below_threshold():
+    prompt = chain(43, 130)                  # pre 129 < 256
+    orch, daemon = _orch_sc(256)
+    try:
+        s1, s2 = _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=4,
+            on_complete=s1.on_complete))
+        # Chunked path: NO whole-delta MOE_BIG union sweep; small chunks.
+        assert daemon.fetch_moe_bigs == 0
+        assert daemon.embed_calls[:2] == [64, 64]
+        # Registration mirrors the sc branch: the EXACT-body holder is
+        # still registered (SC-grid policy) and a repeat request hits it.
+        assert daemon.forks == 1
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=prompt, max_tokens=4,
+            on_complete=s2.on_complete))
+        assert s2.done[1] == s1.done[1] == chain(prompt[-1], 4)
+        assert orch.last_stats.prefix_hit_tokens == 129
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_sc_small_prefill_threshold_boundary_is_strictly_below():
+    prompt = chain(47, 131)                  # pre (delta) = 130
+    # delta == threshold → SUPERCHUNK (threshold is strictly-below).
+    orch, daemon = _orch_sc(130)
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=2,
+            on_complete=sink.on_complete))
+        assert daemon.fetch_moe_bigs > 0
+    finally:
+        _finish(daemon)
+    # delta == threshold - 1 → chunked.
+    orch, daemon = _orch_sc(131)
+    try:
+        sink = _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=2,
+            on_complete=sink.on_complete))
+        assert daemon.fetch_moe_bigs == 0
+    finally:
+        _finish(daemon)
+
+
+def test_sc_above_threshold_byte_identical_to_no_threshold():
+    """The threshold must be invisible above itself: an above-threshold
+    prefill issues the exact same command stream as a threshold-0 boot
+    (the champion 8k/20k/25k profiles route identically)."""
+    prompt = chain(53, 600)                  # pre 599 >= 256
+    traces = []
+    for sc_min in (0, 256):
+        orch, daemon = _orch_sc(sc_min)
+        try:
+            sink = _Sink()
+            _serve(orch, InferenceRequest(
+                request_id=1, prompt_token_ids=prompt, max_tokens=5,
+                on_complete=sink.on_complete))
+            traces.append((daemon.embed_calls, daemon.fetch_moe_bigs,
+                           daemon.moe_big_rows, daemon.forks,
+                           sink.done[1]))
+            assert not daemon.errors, daemon.errors
+        finally:
+            _finish(daemon)
+    assert traces[0] == traces[1]
+
+
+def test_sc_small_delta_on_cache_hit_routes_chunked():
+    """The downgrade decision input is the DELTA actually prefilled (the
+    eviction pressure), not the prompt length: a short follow-up on a
+    cached long prefix takes the chunked path."""
+    prompt = chain(59, 600)                  # pre 599: sc path, registers
+    orch, daemon = _orch_sc(256)             # grid 512 + exact 599 holders
+    try:
+        s1, s2, s3 = _Sink(), _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=prompt, max_tokens=4,
+            on_complete=s1.on_complete))
+        bigs_after_1 = daemon.fetch_moe_bigs
+        assert bigs_after_1 > 0 and daemon.forks == 2
+        # Follow-up: shares the 512-grid prefix, delta 99 < 256.
+        follow = prompt[:512] + chain(888, 100)
+        mark = len(daemon.embed_calls)
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=follow, max_tokens=4,
+            on_complete=s2.on_complete))
+        assert s2.done[1] == chain(follow[-1], 4)
+        assert orch.last_stats.prefix_hit_tokens == 512
+        assert daemon.fetch_moe_bigs == bigs_after_1   # no new MOE_BIG
+        # 99-delta prefill = small chunks [64, 35] (decode embeds follow).
+        assert daemon.embed_calls[mark:mark + 2] == [64, 35]
+        # Downgraded registration stays on the SC lookup grid: the new
+        # EXACT-body holder (611) serves a full repeat.
+        _serve(orch, InferenceRequest(
+            request_id=3, prompt_token_ids=follow, max_tokens=4,
+            on_complete=s3.on_complete))
+        assert s3.done[1] == s2.done[1]
+        assert orch.last_stats.prefix_hit_tokens == 611
         assert not daemon.errors, daemon.errors
     finally:
         _finish(daemon)
@@ -464,6 +681,43 @@ def test_prefill_pool_exhaustion_reraises_when_nothing_evictable():
         # No holder existed yet (registration happens mid-prefill, after the
         # first chunk), so nothing was evictable and the retry did not spin.
         assert orch._pool_evict_retries == 0
+    finally:
+        _finish(daemon)
+
+
+def test_prefill_evicts_holder_on_v4_side_tier_exhaustion():
+    """INV-PREFIX-CACHE-3 seam (2026-08-26 incident): V4 side-tier
+    exhaustion (kSwa/kHca/kIndexerK — COPY-ON-FORK holder cost) arrives as
+    a CMP_ERROR whose 80-byte message field TRUNCATED the word "exhausted"
+    to "...pool exha".  The evict-retry seam must recognize retryability
+    from error_category=kKvPoolExhausted and answer exactly like indexer-K
+    exhaustion: free one holder, re-issue the identical step."""
+    orch, daemon = _orch_pc()
+    try:
+        s1, s2 = _Sink(), _Sink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=chain(11, 130), max_tokens=8,
+            on_token=s1.on_token, on_complete=s1.on_complete))
+        assert len(orch.prefix_cache._entries) == 1      # holder retained
+
+        # The regression shape: the delivered message must NOT contain
+        # "exhausted" (it truncates at "exha") — the category alone must
+        # carry the retry decision.
+        wire_msg = FakeDaemon.V4_TIER_EXHAUST_MSG.encode()[:79].decode()
+        assert "exhausted" not in wire_msg and "pool exha" in wire_msg
+
+        daemon.v4_tier_exhaust_until_frees = daemon.seq_frees + 1
+        prompt_b = chain(500, 130)                       # different prefix
+        _serve(orch, InferenceRequest(
+            request_id=2, prompt_token_ids=prompt_b, max_tokens=8,
+            on_token=s2.on_token, on_complete=s2.on_complete))
+
+        assert daemon.v4_tier_exhaust_rejects >= 1
+        assert orch.prefix_cache.evictions >= 1
+        assert orch._pool_evict_retries >= 1
+        assert s2.done[2] == "length"
+        assert s2.done[1] == chain(prompt_b[-1], 8)      # token-identical
+        assert not daemon.errors, daemon.errors
     finally:
         _finish(daemon)
 
@@ -550,6 +804,27 @@ def test_error_detail_threaded_for_seq_create_failure():
         assert sink.done[2] == "error"
         assert "pool exhausted" in sink.error
         assert "seq_create" in sink.error
+    finally:
+        _finish(daemon)
+
+
+def test_v4_side_tier_exhaustion_truncated_error_when_nothing_evictable():
+    """With no holder to evict, the truncated side-tier CMP_ERROR surfaces
+    verbatim ("...pool exha") as the request error — proving the retry in
+    test_prefill_evicts_holder_on_v4_side_tier_exhaustion was carried by
+    the error CATEGORY, not by a message substring."""
+    orch, daemon = _orch_pc()
+    try:
+        daemon.v4_tier_exhaust_until_frees = 10**6      # never satisfiable
+        sink = _ErrSink()
+        _serve(orch, InferenceRequest(
+            request_id=1, prompt_token_ids=chain(11, 130), max_tokens=8,
+            on_complete=sink.on_complete))
+        assert sink.done[2] == "error"
+        assert "pool exha" in sink.error
+        assert "exhausted" not in sink.error             # truncation fidelity
+        assert daemon.v4_tier_exhaust_rejects >= 1
+        assert orch._pool_evict_retries == 0             # nothing evictable
     finally:
         _finish(daemon)
 

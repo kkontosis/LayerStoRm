@@ -102,7 +102,36 @@ def _fb_v2() -> bool:
 
 
 class BridgeError(RuntimeError):
-    """Fatal IPC error (CMP_ERROR, timeout, or ring overflow)."""
+    """Fatal IPC error (CMP_ERROR, timeout, or ring overflow).
+
+    ``category`` mirrors the CMP_ERROR ``error_category`` field
+    (src/daemon/ipc_protocol.h CmpErrorCategory) when the error came off
+    the completion ring; 0 for local errors (timeout, ring overflow)."""
+
+    def __init__(self, msg: str = "", category: int = 0) -> None:
+        super().__init__(msg)
+        self.category = category
+
+
+# src/daemon/ipc_protocol.h CmpErrorCategory::kKvPoolExhausted — the one
+# category the orchestrator dispatches on (retryable pool exhaustion).
+ERR_CAT_KV_POOL_EXHAUSTED = 29
+
+
+def is_pool_exhaustion(err: BaseException) -> bool:
+    """True when ``err`` is a RETRYABLE engine pool-exhaustion error
+    (TD-INDEXER-POOL-EVICT: answered by prefix-holder eviction + re-issue).
+
+    Match the CMP error CATEGORY first — the CMP_ERROR message field is an
+    80-byte buffer, and a long engine message can truncate the word
+    "exhausted" right out (2026-08-26 incident: the V4 side-tier message
+    arrived as "...kSwa/kHca/kIndexerK pool exha", so substring matching
+    silently disarmed the evict-retry seam and requests failed outright).
+    The substring arm stays for exhaustion raised under other categories
+    (seq_create/seq_fork carry their own categories with "exhausted" early
+    in the message)."""
+    return (getattr(err, "category", 0) == ERR_CAT_KV_POOL_EXHAUSTED
+            or "exhausted" in str(err))
 
 
 class DsparkDraftError(BridgeError):
@@ -140,6 +169,7 @@ class Cmp:
     top1_prob: float = 0.0
     entropy: float = 0.0
     err_msg: str = ""
+    err_category: int = 0    # CMP_ERROR only (CmpErrorCategory value)
 
 
 def _parse_completion(data: bytes) -> Cmp:
@@ -147,7 +177,8 @@ def _parse_completion(data: bytes) -> Cmp:
     if c.cmp_type == CMP_ERROR:
         return Cmp(c.cmp_type, c.cmd_seq, c.gpu_idx, c.status,
                    err_msg=bytes(c.payload.error.message).split(b"\0")[0]
-                   .decode(errors="replace"))
+                   .decode(errors="replace"),
+                   err_category=int(c.payload.error.error_category))
     p = c.payload.compute
     return Cmp(c.cmp_type, c.cmd_seq, c.gpu_idx, c.status,
                p.cmd_type, p.layer_idx, p.host_buf_offset, p.data_bytes,
@@ -243,11 +274,13 @@ class EngineBridge:
         self.sideband = base + int(info.sideband_offset)
 
         self.num_gpus = int(info.num_gpus)
-        # Ticket J: GPUs that HOST routed experts (static e%moe_gpus
-        # placement). Defaults to every engine GPU (GLM EP byte-identical);
-        # V4 sets 1 — the second GPU is the dspark draft host and must not
-        # receive expert work (an e%2 spread changes the EP-combine bf16
-        # rounding and forks the ticket-H golden trajectory).
+        # GPUs that HOST routed experts (static e%moe_gpus placement on
+        # the ACT arm).  Defaults to every engine GPU; boot derives it
+        # from the expert-role PREFIX of hardware.gpus (a GPU without
+        # resident/expert_streaming roles — e.g. a dedicated dspark draft
+        # host — must not receive expert work: an e%N spread over it
+        # changes the EP-combine bf16 rounding and forks the golden
+        # trajectory — the ticket-J finding, now config-roles-driven).
         self.moe_gpus = int(info.num_gpus)
         self.num_layers = int(info.num_layers)
         self.num_experts = int(info.num_experts)
@@ -268,10 +301,11 @@ class EngineBridge:
         self.logits_host_rows = 1
         # Daemon-side expert-fetch deadline for DECODE-shaped steps
         # (FETCH_AND_RUN / FAR timeout_us).  Default = the historical
-        # champion value (byte-identical GLM behavior).  V4 boot raises it
-        # to the golden harness's 200 s: teacher-forced steps stream
-        # experts from the GGUF page cache and a cold layer can exceed
-        # 5 s (deepseek_v4_gguf_golden_test.cpp precedent).
+        # champion value; boot overrides from config
+        # (orchestrator.decode_expert_fetch_timeout_s — streaming-wall
+        # recipes set 200 s: experts streamed from the GGUF page cache
+        # can exceed 5 s cold, deepseek_v4_gguf_golden_test.cpp
+        # precedent).
         self.decode_timeout_us = 5_000_000
 
         # v2 hot-path argument tuples (splatted into _fastbridge calls).
@@ -390,6 +424,9 @@ class EngineBridge:
                                r[6], r[7], r[8])
                 if kind == "err":
                     seq, msg = r[1], r[2]
+                    # r[3] = error_category (older _fastbridge builds
+                    # return a 3-tuple — degrade to 0/local).
+                    cat = int(r[3]) if len(r) > 3 else 0
                     if self.fire_forget_seqs and seq in self.fire_forget_seqs:
                         self.fire_forget_seqs.discard(seq)
                         print(f"  [bridge PF] prefetch error: {msg}",
@@ -404,7 +441,8 @@ class EngineBridge:
                         self._dspark_err = f"CMP_ERROR (async dspark): {msg}"
                         continue
                     raise BridgeError(
-                        f"CMP_ERROR{' (' + ctx + ')' if ctx else ''}: {msg}")
+                        f"CMP_ERROR{' (' + ctx + ')' if ctx else ''}: {msg}",
+                        category=cat)
                 if kind == "dspark":
                     self._dspark_cmp = Cmp(*r[1])
                     self._dspark_pending_seq = 0
@@ -443,7 +481,7 @@ class EngineBridge:
             if out.cmp_type == CMP_ERROR:
                 raise BridgeError(
                     f"CMP_ERROR{' (' + ctx + ')' if ctx else ''}: "
-                    f"{out.err_msg}")
+                    f"{out.err_msg}", category=out.err_category)
             if out.cmp_type == CMP_CHECKPOINT:
                 continue
             if out.cmp_type == expected:
@@ -1436,7 +1474,8 @@ class EngineBridge:
                             f"CMP_ERROR (dspark collect): {out.err_msg}")
                     self._dspark_pending_seq = 0
                     raise BridgeError(
-                        f"CMP_ERROR (dspark collect): {out.err_msg}")
+                        f"CMP_ERROR (dspark collect): {out.err_msg}",
+                        category=out.err_category)
                 if out.cmp_type == CMP_CHECKPOINT:
                     continue
                 if out.cmd_seq == self._dspark_pending_seq:

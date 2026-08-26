@@ -21,7 +21,7 @@
 #include "core/memory/arena_loader.h"
 #include "core/memory/host_pool_sizing.h"
 #include "core/memory/numa_manager.h"
-#include "model/weight_pipeline/prepacked_source.h"
+#include "model/weight_pipeline/expert_slot_source.h"
 
 namespace layerstorm::memory {
 
@@ -1002,7 +1002,7 @@ size_t PinnedExpertArena::node_scratch_bytes(int node) const {
 }
 
 size_t PinnedExpertArena::preload(
-        const model::PrepackedSource& src, uint32_t num_layers,
+        const model::ExpertSlotSource& src, uint32_t num_layers,
         uint32_t num_experts, ArenaLoader* loader,
         const std::unordered_map<ExpertKey, int>* placement) {
     // Expert-MAJOR order (expert outer, layer inner): the decode working set
@@ -1114,6 +1114,54 @@ size_t PinnedExpertArena::preload(
                      "placement-directed, {} fell back to tiered fill "
                      "(planned node full/absent)", placed, place_fallback);
     return filled;
+}
+
+std::vector<PinnedExpertArena::PreloadAssignment>
+PinnedExpertArena::plan_preload(
+        const model::ExpertSlotSource& src, uint32_t num_layers,
+        uint32_t num_experts,
+        const std::unordered_map<ExpertKey, int>* placement,
+        PreloadPlanStats* stats) {
+    // Mirrors preload()'s reservation phase EXACTLY (expert-major order,
+    // placement-map first, extend-only tiered fill fallback) so a live-built
+    // arena lands each key on the same node/slot a prepacked preload would.
+    std::unordered_map<int, int> gpu_on_node;
+    for (int g = 0; g < numa_.num_gpus(); ++g) {
+        int nd = numa_.gpu_numa_node(g);
+        gpu_on_node.emplace(nd, g);   // first GPU per node
+    }
+
+    PreloadPlanStats local;
+    PreloadPlanStats& st = stats ? *stats : local;
+    std::vector<PreloadAssignment> out;
+    out.reserve(static_cast<size_t>(num_layers) * num_experts);
+
+    for (uint32_t e = 0; e < num_experts; ++e) {
+        for (uint32_t L = 0; L < num_layers; ++L) {
+            ExpertKey key{L, static_cast<uint16_t>(e)};
+            if (!src.has(key)) continue;          // not a MoE layer / range
+            if (is_ready(key)) { ++st.already; continue; }  // adopted warm
+            int home = numa_.expert_home_node(key.expert_idx);
+            auto git = gpu_on_node.find(home);
+            int gpu = (git != gpu_on_node.end()) ? git->second : -1;
+            int node = -1;
+            void* slot = nullptr;
+            if (placement) {
+                auto pit = placement->find(key);
+                if (pit != placement->end()) {
+                    slot = reserve_on_node(key, pit->second);
+                    if (slot) { node = pit->second; ++st.placed; }
+                    else ++st.place_fallback;
+                }
+            }
+            if (!slot)
+                slot = reserve_for_fill(key, gpu, &node,
+                                        /*extend_only=*/true);
+            if (!slot) { ++st.skipped_full; continue; }
+            out.push_back(PreloadAssignment{key, node, slot});
+        }
+    }
+    return out;
 }
 
 }  // namespace layerstorm::memory

@@ -172,6 +172,14 @@ class FakeDaemon(threading.Thread):
         # sequence to dense. None = never fail.
         self.indexer_exhaust_until_frees: int | None = None
         self.indexer_exhaust_rejects = 0
+        # Scripted V4 side-tier exhaustion (INV-PREFIX-CACHE-3 seam): same
+        # gate as indexer_exhaust_until_frees, but the CMP_ERROR replays
+        # the 2026-08-26 incident EXACTLY — the engine's 100-byte message
+        # TRUNCATED by the 80-byte CMP field to "...pool exha" (NO
+        # "exhausted" substring!) with error_category=kKvPoolExhausted(29).
+        # Retryability must be recognized from the CATEGORY.
+        self.v4_tier_exhaust_until_frees: int | None = None
+        self.v4_tier_exhaust_rejects = 0
         # Scripted draft-context invalidation (TD-DSPARK-CTX-CAP /
         # INV-SERVE-SPEC-FALLBACK): from dspark call index N on, every
         # D_CMD_RUN_DSPARK_STEP is declined with the engine's real
@@ -231,15 +239,33 @@ class FakeDaemon(threading.Thread):
         except Exception as e:  # surfaced by the test after join
             self.errors.append(repr(e))
 
-    def _error(self, cmd: Command, msg: str) -> None:
+    def _error(self, cmd: Command, msg: str, category: int = 2) -> None:
         c = Completion()
         c.cmp_type = CMP_ERROR
         c.cmd_seq = cmd.cmd_seq
         c.gpu_idx = 0
         c.status = 1
-        c.payload.error.error_category = 2
-        c.payload.error.message = msg.encode()
+        c.payload.error.error_category = category
+        # Engine-faithful: the CMP message field is 80 bytes (NUL-
+        # terminated) — long messages truncate exactly like write_error's.
+        c.payload.error.message = msg.encode()[:79]
         self._write_cmp(c)
+
+    # The 2026-08-26 regression message, byte-for-byte as delivered: the
+    # engine's 100-byte string cut at 79 bytes by the CMP field.
+    V4_TIER_EXHAUST_MSG = ("attention: V4 side-tier page provisioning "
+                           "failed (kSwa/kHca/kIndexerK pool exhausted "
+                           "— fail-closed)")
+    ERR_CAT_KV_POOL_EXHAUSTED = 29
+
+    def _v4_tier_exhausted(self, cmd: Command) -> bool:
+        if (self.v4_tier_exhaust_until_frees is not None
+                and self.seq_frees < self.v4_tier_exhaust_until_frees):
+            self.v4_tier_exhaust_rejects += 1
+            self._error(cmd, self.V4_TIER_EXHAUST_MSG,
+                        category=self.ERR_CAT_KV_POOL_EXHAUSTED)
+            return True
+        return False
 
     def _admission_full(self) -> bool:
         return (self.seq_capacity is not None
@@ -297,6 +323,8 @@ class FakeDaemon(threading.Thread):
                 self.indexer_exhaust_rejects += 1
                 self._error(cmd, "indexer-K pool exhausted (demoted seq) "
                                  "— retryable, evict a prefix holder")
+                return
+            if self._v4_tier_exhausted(cmd):
                 return
             p = cmd.payload.run_attention
             ro = int(p.row_offset)     # SC sub-launch reads staged rows
@@ -365,6 +393,8 @@ class FakeDaemon(threading.Thread):
                 self.indexer_exhaust_rejects += 1
                 self._error(cmd, "indexer-K pool exhausted (demoted seq) "
                                  "— retryable, evict a prefix holder")
+                return
+            if self._v4_tier_exhausted(cmd):
                 return
             # Emulate the fused layer: routing union from the embedded rows
             # (the same formula the attention emit_gating path uses here),
@@ -681,3 +711,26 @@ def test_drain_pending_dspark_clears_error_stash():
             bridge.free_sequence(1)
     finally:
         _finish(daemon)
+
+
+def test_is_pool_exhaustion_matches_category_and_substring():
+    """INV-PREFIX-CACHE-3 seam predicate: retryable pool exhaustion is
+    recognized by CMP error CATEGORY first — the 80-byte CMP message field
+    truncated the 2026-08-26 V4 side-tier message to "...pool exha",
+    silently disarming the substring-only match — with the substring arm
+    retained for seq_create/seq_fork exhaustion (their own categories,
+    "exhausted" early in the message)."""
+    from bridge.ring_bridge import (BridgeError, ERR_CAT_KV_POOL_EXHAUSTED,
+                                    is_pool_exhaustion)
+    truncated = FakeDaemon.V4_TIER_EXHAUST_MSG.encode()[:79].decode()
+    assert "exhausted" not in truncated
+    # Category carries it even when truncation ate the keyword.
+    assert is_pool_exhaustion(
+        BridgeError(truncated, category=ERR_CAT_KV_POOL_EXHAUSTED))
+    # Substring arm: other categories with the keyword intact.
+    assert is_pool_exhaustion(
+        BridgeError("seq_fork: indexer-K pool exhausted during CoW split",
+                    category=0))
+    # Neither: not retryable.
+    assert not is_pool_exhaustion(BridgeError(truncated, category=2))
+    assert not is_pool_exhaustion(BridgeError("dispatch exception"))

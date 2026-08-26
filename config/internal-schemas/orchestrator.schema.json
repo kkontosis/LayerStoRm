@@ -9,6 +9,20 @@
       "uniqueItems": true,
       "default": [],
       "description": "EP owner set for the FETCH_AND_RUN_MOE round-robin: GPU positions (index into hardware.gpus[], INV-4.18) allowed to OWN routed experts. Empty (DEFAULT) = derive from topology (drivers' derived value; byte-identical to prior behavior). HAZARD (INV-FAR deadline-burn): MUST exclude GPUs that host no expert cache — e.g. a dspark draft GPU — an expert round-robined onto such a GPU can never become ready, and every MoE layer then burns the full FETCH_AND_RUN fetch deadline. Mirrors Python OrchestratorConfig.ep_gpu_indices (drivers pass this value through when present)."
+    },
+    "prefill_sc_min_tokens": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1048576,
+      "default": 256,
+      "description": "SC small-prefill downgrade threshold: a superchunk-path prefill whose DELTA (tokens actually prefilled after any prefix-cache hit) is STRICTLY BELOW this runs the ordinary chunked path at prefill_sc_small_chunk_tokens rows instead — a whole-delta MOE_BIG union sweep on a small delta (a short follow-up turn on a cached prefix) evicts the decode-warmed expert cache for no amortization win. 0 = off (everything superchunk, pre-2026-08-26 behavior). Default 256: below one superchunk stride, and small enough that the champion long-prompt prefill numbers (glm_prefill.md 44.6/43.6/42.4 tok/s @ 8k/20k/25k, cold cache => delta >= 256) route identically. A downgraded delta's chunk shapes differ from an uncached superchunk run's — the accepted bf16 batch-width shape class of TD-SERVE-SC-TRAJECTORY. Adaptive successor: TD-SC-SMALL-PREFILL-ADAPTIVE."
+    },
+    "prefill_sc_small_chunk_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 512,
+      "default": 64,
+      "description": "Chunk rows a below-threshold (prefill_sc_min_tokens) delta is prefilled at — deliberately SMALL so experts are touched in per-chunk unions the resident expert cache can absorb, independent of orchestrator.prefill_chunk_tokens (which union-saturating recipes carry at 512). Clamped to min(512, EngineInfo.moe_batch_capacity) at boot. Default 64 = the GLM test-proven stride."
     }
   },
   "additionalProperties": false

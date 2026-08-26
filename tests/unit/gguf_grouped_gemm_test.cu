@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <random>
@@ -215,9 +216,16 @@ TEST(GgufGroupedGemmGpu, AllEmptyExperts) {
 
 namespace {
 
+// `null_experts` (INV-MOE-OVERLAP null-skip, int strategy only): these experts'
+// B pointers are passed as NULL — the grouped kernels must early-return their
+// CTAs and write NOTHING (verified via a sentinel-initialized D). This is the
+// contract the engine's decode NULL-skip (LS_MOE_NULL_SKIP_DECODE, kNone pass)
+// relies on: the caller pre-zeroes the skipped rows, so "writes nothing" is
+// what keeps them exact zeros downstream.
 void run_mxfp4_case(GgufGroupedStrategy strat, int N, int K,
                     const std::vector<int>& tokens_per_expert,
-                    double min_cos, uint32_t seed) {
+                    double min_cos, uint32_t seed,
+                    const std::vector<int>& null_experts = {}) {
     namespace mg = layerstorm::model::gguf;
     const int num_experts = static_cast<int>(tokens_per_expert.size());
     std::mt19937 rng(seed);
@@ -273,13 +281,20 @@ void run_mxfp4_case(GgufGroupedStrategy strat, int N, int K,
 
     __nv_bfloat16* dA = upload(A_bf);
     int32_t* dOff = upload(offsets);
-    std::vector<__nv_bfloat16> D_init(static_cast<size_t>(total) * N, f2bf(0.0f));
+    // Sentinel-filled D when testing NULL-skip: a skipped expert's rows must
+    // come back bit-unchanged (the kernel writes NOTHING for NULL B ptrs).
+    const __nv_bfloat16 sentinel = f2bf(-7.5f);
+    std::vector<__nv_bfloat16> D_init(static_cast<size_t>(total) * N,
+                                      null_experts.empty() ? f2bf(0.0f)
+                                                           : sentinel);
     __nv_bfloat16* dD = upload(D_init);
     std::vector<void*> dW(num_experts);
     for (int e = 0; e < num_experts; ++e) dW[e] = upload(packed[e]);
+    std::vector<void*> b_tbl = dW;
+    for (int e : null_experts) b_tbl[static_cast<size_t>(e)] = nullptr;
     void** dBptrs = nullptr;
     cudaMalloc(&dBptrs, num_experts * sizeof(void*));
-    cudaMemcpy(dBptrs, dW.data(), num_experts * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(dBptrs, b_tbl.data(), num_experts * sizeof(void*), cudaMemcpyHostToDevice);
 
     void* ws = nullptr;
     size_t ws_bytes = 0;
@@ -305,11 +320,44 @@ void run_mxfp4_case(GgufGroupedStrategy strat, int N, int K,
     std::vector<__nv_bfloat16> D_gpu_bf(static_cast<size_t>(total) * N);
     cudaMemcpy(D_gpu_bf.data(), dD, D_gpu_bf.size() * sizeof(__nv_bfloat16),
                cudaMemcpyDeviceToHost);
-    std::vector<float> D_gpu(D_gpu_bf.size());
-    for (size_t i = 0; i < D_gpu.size(); ++i) D_gpu[i] = bf2f(D_gpu_bf[i]);
 
-    double c = cosine(D_gpu, D_ref);
-    EXPECT_GE(c, min_cos) << "cosine=" << c << " N=" << N << " K=" << K;
+    if (null_experts.empty()) {
+        std::vector<float> D_gpu(D_gpu_bf.size());
+        for (size_t i = 0; i < D_gpu.size(); ++i) D_gpu[i] = bf2f(D_gpu_bf[i]);
+        double c = cosine(D_gpu, D_ref);
+        EXPECT_GE(c, min_cos) << "cosine=" << c << " N=" << N << " K=" << K;
+    } else {
+        auto is_null = [&](int e) {
+            return std::find(null_experts.begin(), null_experts.end(), e)
+                   != null_experts.end();
+        };
+        const uint16_t sentinel_bits =
+            *reinterpret_cast<const uint16_t*>(&sentinel);
+        std::vector<float> g_rows, r_rows;
+        int sentinel_mismatches = 0;
+        for (int e = 0; e < num_experts; ++e) {
+            for (int m = offsets[e]; m < offsets[e + 1]; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    const size_t i = static_cast<size_t>(m) * N + n;
+                    if (is_null(e)) {
+                        const uint16_t bits =
+                            *reinterpret_cast<const uint16_t*>(&D_gpu_bf[i]);
+                        if (bits != sentinel_bits) ++sentinel_mismatches;
+                    } else {
+                        g_rows.push_back(bf2f(D_gpu_bf[i]));
+                        r_rows.push_back(D_ref[i]);
+                    }
+                }
+            }
+        }
+        // NULL-skip contract: skipped experts' output rows are UNTOUCHED.
+        EXPECT_EQ(sentinel_mismatches, 0)
+            << "NULL-B-ptr expert rows were written (" << sentinel_mismatches
+            << " elems) — the engine's pre-zero/NULL-skip contract is broken";
+        // Non-skipped experts still compute correctly alongside NULL entries.
+        double c = cosine(g_rows, r_rows);
+        EXPECT_GE(c, min_cos) << "cosine=" << c << " N=" << N << " K=" << K;
+    }
 
     cudaFree(dA); cudaFree(dOff); cudaFree(dD); cudaFree(dBptrs);
     for (void* p2 : dW) cudaFree(p2);
@@ -332,6 +380,30 @@ TEST(GgufGroupedGemmGpu, MXFP4_Dequant_MixedM) {
     run_mxfp4_case(GgufGroupedStrategy::Dequant,
                    /*N=*/128, /*K=*/512, /*tokens=*/{3, 12},
                    0.9999, 0xA7);
+}
+
+// INV-MOE-OVERLAP null-skip (decode kNone extension, LS_MOE_NULL_SKIP_DECODE):
+// non-resident experts get NULL B ptrs at B=1 decode (M_e=1 → mmvq route).
+// The kernel must write NOTHING for them (sentinel rows untouched) while the
+// resident experts still compute correctly — the exact contract the engine's
+// pre-zero + NULL-skip finalize relies on for bit-identical tokens.
+TEST(GgufGroupedGemmGpu, MXFP4_Int_NullBptrSkip_DecodeM1) {
+    REQUIRES_GPU();
+    run_mxfp4_case(GgufGroupedStrategy::Int,
+                   /*N=*/128, /*K=*/256, /*tokens=*/{1, 1, 1, 1, 1, 1},
+                   0.999, 0xC9, /*null_experts=*/{1, 4});
+}
+
+// Same contract with multi-row experts, still on the mmvq route (avg M_e <= 8).
+// NOTE: NULL-skip is an MMVQ-ROUTE contract ONLY — the mmq (avg M_e > 8) tile
+// kernels dereference B_ptrs[e] without a NULL check. The engine only emits
+// NULL B ptrs at num_tokens==1 (avg_m << 8 → always mmvq), so this is safe by
+// construction; LS_GG_FORCE=mmq is the one (diagnostic-only) way to violate it.
+TEST(GgufGroupedGemmGpu, MXFP4_Int_NullBptrSkip_MultiRow) {
+    REQUIRES_GPU();
+    run_mxfp4_case(GgufGroupedStrategy::Int,
+                   /*N=*/128, /*K=*/256, /*tokens=*/{4, 8, 3, 8, 2},
+                   0.999, 0xDA, /*null_experts=*/{0, 3});
 }
 
 // MXFP4 int strategy, V4-Flash-shaped projection K (4096) at decode-like M.

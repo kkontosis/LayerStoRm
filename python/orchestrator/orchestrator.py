@@ -57,7 +57,8 @@ from typing import Any, Callable
 
 import numpy as np
 
-from bridge.ring_bridge import BridgeError, DsparkDraftError, EngineBridge
+from bridge.ring_bridge import (BridgeError, DsparkDraftError, EngineBridge,
+                                is_pool_exhaustion)
 from orchestrator.types import EngineMetadata, StepLogprobs, TokenLogprob
 
 __all__ = [
@@ -70,12 +71,13 @@ __all__ = [
 ]
 
 _PREFILL_CHUNK = 64          # test-proven prefill chunk (spec_decode parity)
-# deepseek_v4 prefill chunk (TD-V4-CHUNK-PREFILL): the routed-expert UNION
-# saturates toward all 256 experts/layer, so a maximal chunk streams each
-# layer's expert set ~once per chunk instead of 6 experts × tokens times.
-# 512 = ipc kMaxBatchDescriptors / kMaxSidebandTokenIds = the engine's
-# elastic-superchunk floor (prefill_moe_big) = the executor's V4 row bound.
-_V4_PREFILL_CHUNK = 512
+# Boot-time prefill chunk rows come from config
+# (orchestrator.prefill_chunk_tokens, schema default 64): expert-union-
+# saturating architectures (DeepSeek-V4-class — the routed union approaches
+# the full expert set per layer) carry 512 in their recipes so a maximal
+# chunk streams each layer's expert set ~once per chunk (512 = ipc
+# kMaxBatchDescriptors / kMaxSidebandTokenIds = the engine's
+# elastic-superchunk floor).  Clamped to EngineInfo.moe_batch_capacity.
 _DECODE_TIMEOUT_US = 5_000_000
 _PREFILL_TIMEOUT_US = 120_000_000
 
@@ -205,19 +207,35 @@ class SpeculationConfig:
 
 @dataclass
 class PrefixCacheConfig:
-    """serving.prefix_cache (config/schema.json) — basic prompt-prefix KV
-    caching via retained SEQ_FORK holder sequences."""
+    """serving.prefix_cache + _internal-prefix_cache (config/schema.json)
+    — basic prompt-prefix KV caching via retained SEQ_FORK holder
+    sequences.
+
+    max_cached_tokens is the TOTAL unique-token budget (chain-aware, see
+    PrefixCache.total_unique_tokens); max_entry_tokens is the independent
+    PER-ENTRY registration cap (0 = bounded only by the total budget).
+    They were ONE number (8192) from the 2026-08-18 landing until
+    2026-08-26 — a leftover from before TD-KVT-ADMISSION-UPFRONT made
+    >8k prompts servable — which silently killed prefix caching for every
+    long prompt AND let a handful of sub-8192 prompts evict each other.
+    Budgets are soft working-set bounds, not reservations: page-pool /
+    indexer-K exhaustion evicts holders on demand (evict_for_admission +
+    fork evict-retry, TD-INDEXER-POOL-EVICT), so a generous budget
+    degrades by LRU churn, never by wedging admission."""
     enabled: bool = True
-    max_cached_tokens: int = 8192
+    max_cached_tokens: int = 131072
     max_entries: int = 8
+    max_entry_tokens: int = 0
 
     @classmethod
     def from_config(cls, cfg: dict) -> "PrefixCacheConfig":
         pc = (cfg.get("serving") or {}).get("prefix_cache") or {}
+        pci = cfg.get("_internal-prefix_cache") or {}
         return cls(
             enabled=bool(pc.get("enabled", True)),
-            max_cached_tokens=int(pc.get("max_cached_tokens", 8192)),
+            max_cached_tokens=int(pc.get("max_cached_tokens", 131072)),
             max_entries=int(pc.get("max_entries", 8)),
+            max_entry_tokens=int(pci.get("max_entry_tokens", 0)),
         )
 
 
@@ -301,6 +319,11 @@ class PrefixCache:
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        # Why the most recent register() returned False (None after a
+        # success) — surfaced in the serve log by the orchestrator so a
+        # skipped registration is never silent (the pre-2026-08-26 silent
+        # over-sized skip read as a wall-clock regression).
+        self.last_skip: str | None = None
 
     # ── chain helpers ────────────────────────────────────────────────────
 
@@ -372,12 +395,36 @@ class PrefixCache:
                  holder_seq_id: int) -> bool:
         """Fork src → a frozen holder and register it. Returns False when
         registration is skipped (duplicate/empty/over-sized prefix) or the
-        fork fails even after eviction (caller proceeds uncached)."""
-        if (not tokens or self.has_exact(tokens)
-                or len(tokens) > self.cfg.max_cached_tokens):
+        fork fails even after eviction (caller proceeds uncached);
+        ``last_skip`` then carries the reason for the serve log.
+
+        Per-entry cap and total budget are INDEPENDENT knobs: the cap
+        (max_entry_tokens, 0 = no separate cap) bounds one entry; the
+        budget (max_cached_tokens) bounds the chain-aware unique-token
+        SUM via LRU eviction. An entry longer than the total budget can
+        never fit and is refused up front."""
+        self.last_skip = None
+        if not tokens:
+            self.last_skip = "empty prefix"
+            return False
+        if self.has_exact(tokens):
+            self.last_skip = (f"duplicate ({len(tokens)}-token prefix "
+                              f"already registered)")
+            return False
+        cap = self.cfg.max_entry_tokens
+        if cap > 0 and len(tokens) > cap:
+            self.last_skip = (f"over-sized ({len(tokens)} tokens > "
+                              f"max_entry_tokens {cap})")
+            return False
+        if len(tokens) > self.cfg.max_cached_tokens:
+            self.last_skip = (f"over-sized ({len(tokens)} tokens > total "
+                              f"budget max_cached_tokens "
+                              f"{self.cfg.max_cached_tokens})")
             return False
         if not self._fork_with_evict_retry(src_seq_id, holder_seq_id,
                                            protect=None):
+            self.last_skip = ("fork-failed (page/indexer pool exhausted "
+                              "after eviction)")
             return False
         self._clock += 1
         entry = _PrefixEntry(tokens, holder_seq_id, self._clock)
@@ -435,7 +482,7 @@ class PrefixCache:
                 self._bridge.fork_sequence(src, dst)
                 return True
             except BridgeError as err:
-                if "exhausted" not in str(err):
+                if not is_pool_exhaustion(err):
                     raise
                 if not self._evict_one(protect):
                     return False
@@ -461,7 +508,9 @@ class Orchestrator:
                  prefill_chunk: int = _PREFILL_CHUNK,
                  chunk_prefill_arms_draft: bool = True,
                  prefill_superchunk: bool = False,
-                 prefill_superchunk_stride: int = 0) -> None:
+                 prefill_superchunk_stride: int = 0,
+                 prefill_sc_min_tokens: int = 256,
+                 prefill_sc_small_chunk: int = 64) -> None:
         self.bridge = bridge
         self.metadata = metadata
         self.spec = speculation or SpeculationConfig()
@@ -482,19 +531,34 @@ class Orchestrator:
         # (row_offset + superchunk flag, exports unioned) + ONE
         # FETCH_AND_RUN_MOE_BIG per layer, so each layer's expert union
         # streams once per superchunk instead of once per 512-row chunk.
-        # V4 boots enable it (with prefill_moe_big); GLM serving uses it
-        # with a bounded STRIDE (below) since 2026-08-23.
+        # Every serving boot enables it (with prefill_moe_big; default ON
+        # since 2026-08-23).
         self._prefill_superchunk = bool(prefill_superchunk)
         # Superchunk STRIDE: tokens per superchunk (also the prefix-cache
         # registration grid on the sc path).  0 = the engine's elastic
-        # moe_batch_capacity (V4).  GLM serving on the EP4 champion
-        # topology must bound it at the engine's single-shot MoE chunk
-        # capacity — max(compute.moe_big_chunk_tokens, orchestrator.
-        # max_batch_size) — because CHUNKED MoE batches are rejected with
-        # expert-only ranks resident (TD-MOE-EP-XTP-WAVES) and the layer's
-        # output would be WRONG; at or below the capacity MOE_BIG runs the
+        # moe_batch_capacity (valid on TP-only topologies).  Topologies
+        # with expert-only ranks (the EP4 champions) must bound it at the
+        # engine's single-shot MoE chunk capacity —
+        # max(compute.moe_big_chunk_tokens, orchestrator.max_batch_size)
+        # — because CHUNKED MoE batches are rejected with expert-only
+        # ranks resident (TD-MOE-EP-XTP-WAVES) and the layer's output
+        # would be WRONG; at or below the capacity MOE_BIG runs the
         # byte-identical single-shot pipeline (INV-MOE-BIG-1).
         self._prefill_sc_stride = max(0, int(prefill_superchunk_stride))
+        # SC SMALL-PREFILL threshold (_internal-orchestrator.
+        # prefill_sc_min_tokens): a superchunk-path prefill whose DELTA
+        # (tokens actually prefilled after any prefix-cache hit) is
+        # STRICTLY BELOW this runs the ordinary chunked path at
+        # _prefill_sc_small_chunk rows instead — a whole-delta MOE_BIG
+        # union sweep on a small delta evicts the decode-warmed expert
+        # cache for no amortization win (user report 2026-08-26).
+        # 0 disables the downgrade.  Default 256: below one superchunk
+        # stride, and small enough that per-64-row unions stay a fraction
+        # of the routed set; the champion 8k/20k/25k prefill numbers
+        # (glm_prefill.md) route identically (delta >= 256 on a cold
+        # cache).  Adaptive successor: TD-SC-SMALL-PREFILL-ADAPTIVE.
+        self._prefill_sc_min = max(0, int(prefill_sc_min_tokens))
+        self._prefill_sc_small_chunk = max(1, int(prefill_sc_small_chunk))
         # TD-V4-SPEC-PREFILL-CTX RESOLVED (2026-08-22): the engine now
         # fires the V4 dflash draft's LAST aux tap (id == num_layers) at
         # the final layer's FETCH_AND_RUN finalize whenever the capture
@@ -563,11 +627,19 @@ class Orchestrator:
         ``gpu_loader.enabled`` (and null-backend test engines) fall back
         to the static ACT arm.
 
-        deepseek_v4 configs boot ARCHITECTURE-AWARE: split/ACT command
-        flow (no FAR, no REEF), prefix cache OFF, first_moe_layer 0
-        (all-MoE), CHUNKED prefill at 512-token chunks (TD-V4-CHUNK-
-        PREFILL resolved 2026-08-21 — the expert-fetch union amortizes
-        the streaming wall), 200 s expert-fetch deadline."""
+        ONE FLOW (INV-ORCH-ONE-FLOW, 2026-08-25): every architecture
+        boots the SAME champion flow — REEF routing (E_CMD_REEF_ROUTE +
+        epoch-latched banks), fused FAR + pipelined burst, superchunk
+        prefill, the spec arms, prefix cache.  Where behavior must
+        genuinely differ it is driven by CONFIG (schema fields the
+        recipes carry: prefill_chunk_tokens,
+        decode_expert_fetch_timeout_s, gpu roles, gpu_loader) or by
+        ENGINE-REPORTED capability (EngineInfo.moe_batch_capacity,
+        vocab_size, v4_attention_types) — never by model-name checks
+        (the orchestrator mirror of INV-ATTN-ARCH / INV-MOE-ARCH).
+        Diagnostic kill switch: LS_ORCH_FORCE_SPLIT_ACT=1 restores the
+        legacy split/ACT command arm (no FAR, no REEF, static e%N
+        placement)."""
         import json
 
         if engine_module is None:
@@ -579,24 +651,18 @@ class Orchestrator:
                 else engine_module.start_engine(config_path))
         try:
             model = cfg.get("model") or {}
-            # Architecture-aware boot: deepseek_v4's landed engine path is
-            # the SPLIT command sequence (EMBEDDING → per-layer
-            # RUN_ATTENTION + FETCH_AND_RUN_MOE with static e%tp entries →
-            # OUTPUT_HEAD → SAMPLE — the ticket-H golden harness shape,
-            # which the bridge's split/ACT arm speaks byte-identically).
-            # The FAR fused command and the REEF service are MLA/GLM-shaped
-            # seams; V4 forces use_far=False + route_arm "act".
-            is_v4 = str(model.get("architecture") or "") == "deepseek_v4"
             # TD-VOCAB-AUTODETECT: prefer the engine's resolved vocab width
             # (EngineInfo.vocab_size — weights-derived when the config field
             # is 0/absent, cross-checked otherwise). The config dict read is
             # the fallback for engine builds predating the field.
             vocab = int(getattr(info, "vocab_size", 0) or 0) \
                 or int(model.get("vocab_size", 0))
-            # V4-Flash is all-MoE (first_k_dense_replace 0): the bridge's
-            # dense branch must never fire.
-            first_moe = 0 if is_v4 \
-                else int(model.get("first_k_dense_replace", 3))
+            # Dense-prefix depth is the config field the DAEMON itself
+            # reads for the FAR dense/moe split (far_forward_layer's
+            # is_moe test) — config is the single source of truth on both
+            # sides.  All-MoE architectures (V4-Flash) carry 0 in their
+            # recipes: the bridge's dense branch never fires.
+            first_moe = int(model.get("first_k_dense_replace", 3))
 
             buffer_ids = engine_module.query_buffer_ids()
             hidden_buf = logits_buf = 0
@@ -608,25 +674,56 @@ class Orchestrator:
             if not (hidden_buf and logits_buf) and not test_engine:
                 raise BridgeError("hidden/logits buffers not found")
 
+            # Route arm: REEF whenever the config arms the calibrated
+            # gpu_loader service (the engine self-calibrates FULL and
+            # writes the weights-adjacent calibration file on the first
+            # absent run — engine.cpp kLoaded fallback); gpu_loader-less
+            # configs and null-backend test engines fall back to the
+            # static ACT arm.  LS_ORCH_FORCE_SPLIT_ACT=1 (diagnostic)
+            # restores the legacy split/ACT arm end-to-end (no FAR).
+            force_split = \
+                os.environ.get("LS_ORCH_FORCE_SPLIT_ACT") == "1"
             reef_ok = bool((cfg.get("gpu_loader") or {}).get("enabled")) \
-                and not test_engine and not is_v4
+                and not test_engine and not force_split
             bridge = EngineBridge(info, vocab_size=vocab,
                                   first_moe_layer=first_moe,
                                   hidden_buf_id=hidden_buf,
                                   logits_buf_id=logits_buf,
                                   route_arm="reef" if reef_ok else "act",
-                                  use_far=not is_v4)
-            if is_v4:
-                # Golden-harness fetch deadline: V4 streams ~3.4 GB of
-                # routed experts per token from the GGUF page cache; a
-                # cold layer can exceed the 5 s champion default.
-                bridge.decode_timeout_us = 200_000_000
-                # Ticket J: with the dspark draft on a second GPU, routed
-                # experts stay on the tp GPUs (position 0) — an e%num_gpus
-                # spread would fork the ticket-H golden trajectory (EP
-                # combine order) and target the draft GPU.
-                tp_arr = (cfg.get("hardware") or {}).get("tp_array") or [0]
-                bridge.moe_gpus = max(1, len(tp_arr))
+                                  use_far=not force_split)
+            orch_cfg = cfg.get("orchestrator") or {}
+            # Daemon-side expert-fetch deadline: config
+            # (orchestrator.decode_expert_fetch_timeout_s, schema default
+            # 5 s = the historical champion value).  Streaming-wall
+            # recipes (V4 routed experts from the GGUF page cache — a
+            # cold layer can exceed 5 s) carry 200, the golden-harness
+            # precedent.
+            bridge.decode_timeout_us = max(1, int(
+                orch_cfg.get("decode_expert_fetch_timeout_s")
+                or 5)) * 1_000_000
+            # Expert-hosting GPUs = the expert-role PREFIX of
+            # hardware.gpus (schema default: a role-less GPU entry has
+            # ALL roles).  A GPU whose declared roles carry neither
+            # `resident` nor `expert_streaming` (e.g. a dedicated dspark
+            # draft host) stops the scan — the static e%N placement
+            # addresses gpu indices 0..N-1, so later non-expert gpus get
+            # no expert work (correct, narrower EP; the ticket-J
+            # draft-host pin, now carried BY CONFIG roles).  Configs
+            # without a hardware section keep every engine GPU (the
+            # champion default).  The daemon's FAR act placement mirrors
+            # this rule exactly (dispatch_reef.cpp).
+            gpus_cfg = (cfg.get("hardware") or {}).get("gpus") or []
+            if gpus_cfg:
+                expert_roles = {"expert_streaming", "resident"}
+                default_roles = ("attention", "resident",
+                                 "expert_streaming")
+                n_moe = 0
+                for g in gpus_cfg:
+                    if not expert_roles & set(g.get("roles")
+                                              or default_roles):
+                        break
+                    n_moe += 1
+                bridge.moe_gpus = max(1, n_moe)
             # Guided-decoding logits readback row (0 when the engine build
             # predates it or vocab is unknown).
             if hasattr(engine_module, "logits_readback_addr"):
@@ -676,15 +773,11 @@ class Orchestrator:
                     getattr(info, "v4_attention_types", ()) or ()),
             )
             pc_cfg = PrefixCacheConfig.from_config(cfg)
-            # TD-V4-SERVE-PREFIX RESOLVED (2026-08-22): CMD_SEQ_FORK now
-            # clones complete V4 per-seq state (kMain CoW + side-tier
-            # copy-on-fork + executor state rings), so the prefix cache is
-            # enabled for V4 like GLM.  The V4 registration grid is the
-            # SUPERCHUNK stride (moe_batch_capacity) — see _generate.
-            # V4 chunk = 512 rides the engine's elastic-superchunk row
-            # sizing (prefill_moe_big, schema default ON — floor 512); a
-            # config that turns it off shrinks the executor's V4 row bound
-            # to orchestrator.max_batch_size, so fall back to 64 there.
+            # TD-V4-SERVE-PREFIX RESOLVED (2026-08-22): CMD_SEQ_FORK
+            # clones complete per-seq state for every arch (kMain CoW +
+            # side-tier copy-on-fork + executor state rings), so the
+            # prefix cache is config-only.  On the superchunk path the
+            # registration grid is the SUPERCHUNK stride — see _generate.
             moe_big = bool((cfg.get("compute") or {})
                            .get("prefill_moe_big", True))
             # Served-prefill levers (2026-08-23 serving-prefill campaign):
@@ -709,7 +802,7 @@ class Orchestrator:
             #     errors at stride 3069).  At or below it, MOE_BIG is the
             #     byte-identical single-shot pipeline (INV-MOE-BIG-1).
             #     LS_ORCH_NO_SC=1 restores the chunked 64-token path.
-            #     V4 (TP-only, no expert-only ranks) keeps the full
+            #     TP-only topologies (no expert-only ranks) keep the full
             #     elastic-capacity stride (0 = moe_batch_capacity).
             #     GREEN-LIT DEFAULT ON (user verdict 2026-08-23; was
             #     opt-in): the stride-512 served-prefill trajectory
@@ -721,25 +814,52 @@ class Orchestrator:
             #     to the chunk-64 path (and its pre-flip trajectory).
             sc_arm = moe_big and os.environ.get("LS_ORCH_NO_SC") != "1"
             comp = cfg.get("compute") or {}
-            sc_stride = 0 if is_v4 else max(
+            # Superchunk STRIDE — ONE topology rule (arch-free, the
+            # TD-V4-TP-DSPARK predicate generalized): the full elastic
+            # stride (0 = moe_batch_capacity) is valid ONLY while every
+            # expert host is a TP rank.  With expert-only ranks resident
+            # (bridge.moe_gpus beyond the tp_array — the ep4 champion
+            # topologies), MoE batches above the single-shot capacity run
+            # the CHUNKED grouped-GEMM path, which is REJECTED with
+            # extra-rank residents (TD-MOE-EP-XTP-WAVES) — clamp to the
+            # single-shot bound.
+            ep_extra = bridge.moe_gpus > len(
+                (cfg.get("hardware") or {}).get("tp_array") or [0])
+            sc_stride = max(
                 int(comp.get("moe_big_chunk_tokens") or 512),
-                int((cfg.get("orchestrator") or {})
-                    .get("max_batch_size") or 64))
+                int(orch_cfg.get("max_batch_size") or 64)) \
+                if ep_extra else 0
             se = os.environ.get("LS_ORCH_SC_STRIDE")  # diagnostic override
             if se and se.isdigit() and int(se) > 0:
                 sc_stride = int(se)
-            chunk = _V4_PREFILL_CHUNK if is_v4 and moe_big \
-                else _PREFILL_CHUNK
+            # Prefill chunk rows: config (orchestrator.
+            # prefill_chunk_tokens, schema default 64 — the GLM
+            # test-proven stride; expert-union-saturating recipes carry
+            # 512), clamped to the engine-reported MoE batch capacity
+            # (covers prefill_moe_big-off builds whose capacity shrinks).
+            chunk = max(1, min(
+                int(orch_cfg.get("prefill_chunk_tokens") or 64), 512,
+                int(getattr(info, "moe_batch_capacity", 0) or 512)))
             ce = os.environ.get("LS_ORCH_PREFILL_CHUNK")
             if ce and ce.isdigit() and int(ce) > 0:
                 chunk = min(int(ce), 512)
+            # SC small-prefill downgrade knobs (_internal-orchestrator):
+            # threshold (delta tokens; 0 = off) + the small chunk size the
+            # downgraded delta runs at (clamped like `chunk` above).
+            iorch = cfg.get("_internal-orchestrator") or {}
+            sc_min = max(0, int(iorch.get("prefill_sc_min_tokens", 256)))
+            sc_small_chunk = max(1, min(
+                int(iorch.get("prefill_sc_small_chunk_tokens", 64)), 512,
+                int(getattr(info, "moe_batch_capacity", 0) or 512)))
             orch = cls(bridge, metadata=meta, speculation=spec,
                        prefix_cache=pc_cfg,
                        engine_module=engine_module,
                        prefill_chunk=chunk,
                        chunk_prefill_arms_draft=True,
                        prefill_superchunk=sc_arm,
-                       prefill_superchunk_stride=sc_stride)
+                       prefill_superchunk_stride=sc_stride,
+                       prefill_sc_min_tokens=sc_min,
+                       prefill_sc_small_chunk=sc_small_chunk)
             orch.info = info                  # EngineInfo (reporting)
             return orch
         except Exception:
@@ -864,7 +984,7 @@ class Orchestrator:
             try:
                 return fn()
             except BridgeError as err:
-                if ("exhausted" not in str(err)
+                if (not is_pool_exhaustion(err)
                         or self.prefix_cache is None
                         or not self.prefix_cache.evict_for_admission()):
                     raise
@@ -918,6 +1038,25 @@ class Orchestrator:
         def check_cancel() -> None:
             if self._shutdown or req.request_id in self._cancelled:
                 raise _Cancelled()
+
+        pc_skip_logged = False
+
+        def pc_register(toks: tuple[int, ...]) -> None:
+            """Register a frozen prefix holder for this request.  A
+            skipped registration is LOGGED once per request with the
+            reason (over-sized / duplicate / fork-failed) — a silent skip
+            reads as a wall-clock regression on the next shared-prefix
+            request (user report 2026-08-26: prefix caching 'dead' above
+            the old 8192-token default)."""
+            nonlocal pc_skip_logged
+            pc = self.prefix_cache
+            holder_id = self._next_seq_id
+            if pc.register(toks, seq_id, holder_id):
+                self._next_seq_id += 1
+            elif not pc_skip_logged:
+                pc_skip_logged = True
+                print(f"  [orch] request {req.request_id}: prefix-cache "
+                      f"registration skipped — {pc.last_skip}")
 
         # ── prefix-cache lookup: fork from a retained holder when the
         # prompt starts with a registered prefix.  INV-PREFIX-CACHE-1
@@ -978,12 +1117,32 @@ class Orchestrator:
                     self.bridge.create_sequence(seq_id, len(prompt))
                     break
                 except BridgeError as err:
-                    if ("exhausted" not in str(err)
+                    if (not is_pool_exhaustion(err)
                             or self.prefix_cache is None
                             or not self.prefix_cache.evict_for_admission()):
                         raise
             pos = 0
             draft_adoptable = True  # position-0 capture re-arms the context
+        # ── SC small-prefill downgrade (user report 2026-08-26): a
+        # superchunk sweeps the UNION of experts for the whole chunk in
+        # one MOE_BIG per layer — on a SMALL prefill (a short follow-up
+        # turn on a cached prefix) that sweep evicts the decode-warmed
+        # expert cache for no amortization win.  Below the threshold the
+        # DELTA (pre - pos: the tokens actually swept — the decision input
+        # is eviction pressure, not prompt length) runs the ordinary
+        # chunked path at a SMALL chunk size, touching experts in
+        # increments the resident cache can absorb.  0 disables (route
+        # everything superchunk — pre-2026-08-26 behavior).  Lookup above
+        # already used the SC validity filter, so a downgraded delta still
+        # starts sc-grid-aligned; registration below stays on the SC grid
+        # (holders remain hittable by later superchunk lookups).  A
+        # downgraded delta's chunk shapes differ from an uncached sc run's
+        # — same accepted bf16 batch-width shape class as
+        # TD-SERVE-SC-TRAJECTORY (INV-PREFIX-CACHE-1 relaxation recorded
+        # there and in SPEC_UPDATES); the adaptive successor is
+        # TD-SC-SMALL-PREFILL-ADAPTIVE.
+        sc_small = (sc_path and self._prefill_sc_min > 0
+                    and (pre - pos) < self._prefill_sc_min)
         # Pessimise the mirror while this request's captures are in flight:
         # a cancel mid-prefill leaves the engine context partially fed, so
         # only a COMPLETED prefill may re-validate it (below).
@@ -1007,7 +1166,7 @@ class Orchestrator:
                             prompt[pos], seq_id, pos, None))
                     self._guard(r)
                     pos += 1
-            elif sc_path:
+            elif sc_path and not sc_small:
                 # SC (superchunk port): superchunks of `sc_stride` tokens
                 # (V4: the engine's elastic MoE batch capacity; GLM: the
                 # single-shot MoE chunk capacity — TD-MOE-EP-XTP-WAVES),
@@ -1020,11 +1179,7 @@ class Orchestrator:
                 while pos < pre:
                     if (self.prefix_cache is not None and pos == grid_len
                             and grid_len > 0):
-                        holder_id = self._next_seq_id
-                        if self.prefix_cache.register(
-                                tuple(prompt[:grid_len]), seq_id,
-                                holder_id):
-                            self._next_seq_id += 1
+                        pc_register(tuple(prompt[:grid_len]))
                     check_cancel()
                     n = min(sc_stride, pre - pos)
                     self._with_pool_evict_retry(
@@ -1035,29 +1190,51 @@ class Orchestrator:
                 if (self.prefix_cache is not None and pos == grid_len
                         and grid_len > 0):
                     # pre was exactly grid-aligned — register at the end.
-                    holder_id = self._next_seq_id
-                    if self.prefix_cache.register(tuple(prompt[:grid_len]),
-                                                  seq_id, holder_id):
-                        self._next_seq_id += 1
+                    pc_register(tuple(prompt[:grid_len]))
                 if (self.prefix_cache is not None and pre > 0
                         and pre != grid_len):
                     # EXACT-prompt-body holder: a repeated identical body
                     # (the common shared-prompt case) reuses shapes by
                     # construction even when pre is not superchunk-aligned
                     # — a hit skips the whole prefill.
-                    holder_id = self._next_seq_id
-                    if self.prefix_cache.register(tuple(prompt[:pre]),
-                                                  seq_id, holder_id):
-                        self._next_seq_id += 1
+                    pc_register(tuple(prompt[:pre]))
+            elif sc_path:
+                # SC-SMALL downgrade (see sc_small above): the
+                # below-threshold DELTA runs ordinary chunked FETCH_AND_RUN
+                # at the SMALL chunk size — per-chunk expert unions the
+                # decode-warmed cache can absorb, instead of one whole-
+                # delta MOE_BIG union sweep.  Registration MIRRORS the sc
+                # branch (SC grid + exact body): holders must stay on the
+                # sc lookup grid to be hittable by later superchunk-path
+                # requests (a small-chunk grid entry would be filtered
+                # out by the SC validity check and only waste budget).
+                step = self._prefill_sc_small_chunk
+                while pos < pre:
+                    if (self.prefix_cache is not None and pos == grid_len
+                            and grid_len > 0):
+                        pc_register(tuple(prompt[:grid_len]))
+                    check_cancel()
+                    n = min(step, pre - pos)
+                    if pos < grid_len:       # never stride past the SC
+                        n = min(n, grid_len - pos)   # registration point
+                    self._with_pool_evict_retry(
+                        lambda: self.bridge.prefill_chunk_fetch_and_run(
+                            prompt[pos:pos + n], seq_id, pos, None))
+                    pos += n
+                if (self.prefix_cache is not None and pos == grid_len
+                        and grid_len > 0):
+                    # pre was exactly grid-aligned — register at the end.
+                    pc_register(tuple(prompt[:grid_len]))
+                if (self.prefix_cache is not None and pre > 0
+                        and pre != grid_len):
+                    # EXACT-prompt-body holder (same rationale as the sc
+                    # branch — serves exact repeats of this prompt).
+                    pc_register(tuple(prompt[:pre]))
             else:
                 while pos < pre:
                     if (self.prefix_cache is not None and pos == grid_len
                             and grid_len > 0):
-                        holder_id = self._next_seq_id
-                        if self.prefix_cache.register(
-                                tuple(prompt[:grid_len]), seq_id,
-                                holder_id):
-                            self._next_seq_id += 1
+                        pc_register(tuple(prompt[:grid_len]))
                     check_cancel()
                     n = min(self._prefill_chunk, pre - pos)
                     self._with_pool_evict_retry(
@@ -1067,10 +1244,7 @@ class Orchestrator:
                 if (self.prefix_cache is not None and pos == grid_len
                         and grid_len > 0):
                     # pre was exactly grid-aligned — register at the end.
-                    holder_id = self._next_seq_id
-                    if self.prefix_cache.register(tuple(prompt[:grid_len]),
-                                                  seq_id, holder_id):
-                        self._next_seq_id += 1
+                    pc_register(tuple(prompt[:grid_len]))
             stats.prefill_ms = (time.monotonic() - t0) * 1e3
 
             # TD-V4-SPEC-PREFILL-CTX: headless V4 prefill chunks never fire
@@ -1197,9 +1371,15 @@ class Orchestrator:
             if base is not None:
                 sampling = (base[0], base[1], base[2],
                             self._step_seed(base[3], pos))
-            r = self.bridge.decode_step_fetch_and_run(
-                token, seq_id, pos, None, sampling=sampling,
-                logprobs_readback=want_lp)
+            # Evict-retry on pool exhaustion: V4 side tiers (HCA every 256
+            # tokens, LID every 8192) and DSA indexer pages also GROW during
+            # decode; the engine's provisioning guard fail-closes BEFORE any
+            # KV/tier mutation, so the retry is exact — same seam as the
+            # prefill steps (TD-INDEXER-POOL-EVICT).
+            r = self._with_pool_evict_retry(
+                lambda: self.bridge.decode_step_fetch_and_run(
+                    token, seq_id, pos, None, sampling=sampling,
+                    logprobs_readback=want_lp))
             self._guard(r)
             stats.rounds += 1
             pos += 1
@@ -1238,9 +1418,15 @@ class Orchestrator:
                 "verify_embed,verify_layers,verify_head,gap_ms,j,g_use\n")
 
         # Seed feed: one plain step arms the draft context (aux export).
+        # Evict-retry: no draft is in flight yet, so a pool-exhausted step
+        # (side-tier/indexer growth) is safely re-issued after freeing a
+        # holder.  Mid-round steps stay UNWRAPPED: with dspark_send_async
+        # pending, interleaving a holder seq_free is not a validated path
+        # (TD-SPEC-ROUND-POOL-EVICT).
         check_cancel()
-        r0 = b.decode_step_fetch_and_run(prompt[-1], seq_id,
-                                         len(prompt) - 1, None)
+        r0 = self._with_pool_evict_retry(
+            lambda: b.decode_step_fetch_and_run(prompt[-1], seq_id,
+                                                len(prompt) - 1, None))
         self._guard(r0)
         anchor = r0.sampled_token
         fed = len(prompt)
@@ -1485,10 +1671,13 @@ class Orchestrator:
 
         # Seed feed: one plain step (host-side pick) arms the draft
         # context.  logits_readback=1 skips CMD_SAMPLE_TOKENS entirely.
+        # Evict-retry: safe here (no draft in flight yet) — see the greedy
+        # arm / TD-SPEC-ROUND-POOL-EVICT for the mid-round exclusion.
         check_cancel()
-        r0 = b.decode_step_fetch_and_run(prompt[-1], seq_id,
-                                         len(prompt) - 1, None,
-                                         logits_readback=True)
+        r0 = self._with_pool_evict_retry(
+            lambda: b.decode_step_fetch_and_run(prompt[-1], seq_id,
+                                                len(prompt) - 1, None,
+                                                logits_readback=True))
         self._guard(r0)
         anchor, lp0 = pick(self._read_logits())
         fed = len(prompt)

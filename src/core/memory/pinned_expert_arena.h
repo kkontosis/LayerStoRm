@@ -34,7 +34,7 @@
 #include "core/memory/eviction_policy.h"   // ExpertKey
 #include "core/memory/numa_manager.h"       // NumaManager, NumaBuffer
 
-namespace layerstorm::model { class PrepackedSource; }
+namespace layerstorm::model { class ExpertSlotSource; }
 
 namespace layerstorm::memory {
 
@@ -597,9 +597,40 @@ public:
     /// every key — the slot is reserved on the planned node (extend-only,
     /// reserve_on_node). Keys absent from the map, or whose planned node is
     /// full, fall back to the legacy tiered home→spill fill.
-    size_t preload(const model::PrepackedSource& src, uint32_t num_layers,
+    size_t preload(const model::ExpertSlotSource& src, uint32_t num_layers,
                    uint32_t num_experts, ArenaLoader* loader = nullptr,
                    const std::unordered_map<ExpertKey, int>* placement = nullptr);
+
+    // ── Live prepack (bulk parallel fill) ────────────────────────────────
+
+    /// One planned slot reservation from plan_preload: fill `slot` with
+    /// `key`'s bytes (any thread), then mark_ready(key) (daemon/init thread).
+    struct PreloadAssignment {
+        ExpertKey key;
+        int       node = -1;
+        void*     slot = nullptr;
+    };
+
+    struct PreloadPlanStats {
+        size_t already = 0;         ///< adopted-warm keys skipped
+        size_t skipped_full = 0;    ///< every node arena full
+        size_t placed = 0;          ///< placement-map directed
+        size_t place_fallback = 0;  ///< planned node full → tiered fill
+    };
+
+    /// Reserve slots for every source-covered, not-yet-ready key using the
+    /// SAME ordering + tiered placement rules as preload() (expert-major
+    /// loop; placement map first, extend-only reserve_for_fill fallback) —
+    /// WITHOUT filling them. The caller (the live-prepack parallel builder)
+    /// writes each slot's bytes off-thread and then mark_ready()s the key on
+    /// the init/daemon thread; a failed fill is simply never marked ready
+    /// (slot stays reserved-empty + record EMPTY — same crash/error semantics
+    /// as a failed preload load, INV-ARENA-CACHE-ORDER). Init-thread only.
+    std::vector<PreloadAssignment> plan_preload(
+        const model::ExpertSlotSource& src, uint32_t num_layers,
+        uint32_t num_experts,
+        const std::unordered_map<ExpertKey, int>* placement = nullptr,
+        PreloadPlanStats* stats = nullptr);
 
 private:
     NumaManager& numa_;

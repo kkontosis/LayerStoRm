@@ -39,7 +39,7 @@
 
 struct io_uring;  // forward decl (liburing C struct); ring lives in the .cpp
 
-namespace layerstorm::model { class PrepackedSource; }
+namespace layerstorm::model { class ExpertSlotSource; }
 
 namespace layerstorm::memory {
 
@@ -76,7 +76,7 @@ public:
     /// skips loading slots, so it won't be reused). `gpu` is echoed back in the
     /// completion. No-op (returns false) if `key` is already in flight here
     /// (dedup) — a slot is filled at most once per outstanding load.
-    bool submit(ExpertKey key, int gpu, void* dst, const model::PrepackedSource* src);
+    bool submit(ExpertKey key, int gpu, void* dst, const model::ExpertSlotSource* src);
 
     /// Drain finished loads into `out` (appends; daemon thread only). Non-blocking.
     void poll_completed(std::vector<ArenaLoadCompletion>& out);
@@ -107,7 +107,7 @@ private:
         ExpertKey key;
         int       gpu = -1;
         void*     dst = nullptr;
-        const model::PrepackedSource* src = nullptr;
+        const model::ExpertSlotSource* src = nullptr;
     };
 
     void worker_main();

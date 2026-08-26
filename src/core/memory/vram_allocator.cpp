@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -521,6 +522,30 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                 static_cast<double>(per_seq_bytes) / (1024.0 * 1024.0));
     }
 
+    // ── V4 prefix-holder side-tier budget (INV-PREFIX-CACHE-3) ──
+    // Prefix-cache holder cost is ARCHITECTURE-DEPENDENT. On DSA/GLM a
+    // retained holder shares kMain pages by refcount and materializes one
+    // CoW indexer frontier page group — holders are nearly free, so the
+    // pools above size for max_concurrent_requests only. On V4 the side
+    // tiers (kSwa/kHca/kIndexerK-LID) are COPY-ON-FORK (TD-V4-SERVE-PREFIX:
+    // mutate-in-place rings, sharing would corrupt the parent), so EVERY
+    // retained holder owns a complete side-tier set — a full extra
+    // sequence's worth of side pages (~45 MiB/GPU at 32k on the serve
+    // profile). Size the V4 side pools for max_concurrent_requests
+    // in-flight sequences PLUS the configured holder budget; the
+    // evict-retry seam (TD-INDEXER-POOL-EVICT) stays the pressure valve,
+    // not the steady-state mechanism. kMain (CSA) is NOT holder-scaled:
+    // it is refcount-shared and chain-deduplicated, and its holder
+    // pressure stays soft (serving.prefix_cache.max_cached_tokens budget
+    // + evict-on-exhaustion).
+    const int v4_prefix_holders =
+        (v4 && cfg.serving.prefix_cache.enabled)
+            ? cfg.serving.prefix_cache.max_entries : 0;
+    int v4_holder_tokens = cfg.serving.max_sequence_length;
+    if (cfg._internal_prefix_cache.max_entry_tokens > 0)
+        v4_holder_tokens = std::min(
+            v4_holder_tokens, cfg._internal_prefix_cache.max_entry_tokens);
+
     for (size_t gpu_i = 0; gpu_i < budgets.size(); ++gpu_i) {
         auto& budget = budgets[gpu_i];
         GpuVramLayout gpu{};
@@ -575,8 +600,15 @@ VramLayout compute_vram_layout(const config::Config& cfg,
             const int max_req = cfg.serving.max_concurrent_requests;
             const int pages_per_seq =
                 (max_seq + indexer_k_page_size - 1) / indexer_k_page_size;
+            // + full LID sets for the prefix-holder budget (COPY-ON-FORK,
+            // INV-PREFIX-CACHE-3): holders are capped at v4_holder_tokens.
+            const int holder_pages_per_seq =
+                (v4_holder_tokens + indexer_k_page_size - 1)
+                / indexer_k_page_size;
             gpu.indexer_k_pages =
-                pages_per_seq * layout.v4.num_csa_layers * max_req;
+                pages_per_seq * layout.v4.num_csa_layers * max_req
+                + holder_pages_per_seq * layout.v4.num_csa_layers
+                      * v4_prefix_holders;
             gpu.indexer_k_bytes = align_region(
                 static_cast<int64_t>(gpu.indexer_k_pages) *
                 layout.indexer_k_bytes_per_page);
@@ -668,10 +700,18 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                 const int64_t blocks_per_seq =
                     (max_seq + v4l.logical_block_tokens - 1) /
                     v4l.logical_block_tokens;
+                // Prefix holders own FULL side-tier sets (copy-on-fork,
+                // INV-PREFIX-CACHE-3) capped at v4_holder_tokens; kMain
+                // (csa_pages) is refcount-shared and NOT holder-scaled.
+                const int64_t holder_blocks =
+                    (v4_holder_tokens + v4l.logical_block_tokens - 1) /
+                    v4l.logical_block_tokens;
                 csa_pages = static_cast<int64_t>(max_req) * blocks_per_seq *
                             v4l.num_csa_layers;
                 hca_pages = static_cast<int64_t>(max_req) * blocks_per_seq *
-                            v4l.num_hca_layers;
+                                v4l.num_hca_layers +
+                            static_cast<int64_t>(v4_prefix_holders) *
+                                holder_blocks * v4l.num_hca_layers;
                 // SWA/raw tier: window + compressor residual per layer
                 // (incl. nextn MTP layers, SWA-only).
                 int64_t swa_per_seq = 0;
@@ -684,7 +724,8 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                                    m.num_nextn_predict_layers) *
                                v4_swa_pages_per_layer(
                                    v4l, model::V4AttentionType::kSwa);
-                swa_pages = static_cast<int64_t>(max_req) * swa_per_seq;
+                swa_pages = static_cast<int64_t>(max_req + v4_prefix_holders)
+                            * swa_per_seq;
                 // Speculation pool: CSA-page-size sibling of the main pool
                 // (the page machinery requires main/spec pages equal-sized).
                 spec_pages = static_cast<int64_t>(std::floor(
@@ -744,6 +785,69 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                 scratch_bytes =
                     std::min(prefill_scratch_gb_to_bytes, max_scratch);
                 if (scratch_bytes < 0) scratch_bytes = 0;
+
+                // ── Fail-loud holder accounting (INV-PREFIX-CACHE-3) ──
+                // Say AT BOOT how many copy-on-fork prefix holders the
+                // side-tier pools actually carry beyond the in-flight
+                // working set — a user must not discover a holder-vs-pool
+                // mismatch from a mid-session CMP_ERROR (2026-08-26
+                // incident: max_entries=8 against pools carved for
+                // max_concurrent_requests=2).
+                if (v4_prefix_holders > 0) {
+                    const int64_t lid_seq_pages =
+                        static_cast<int64_t>(
+                            (max_seq + indexer_k_page_size - 1)
+                            / indexer_k_page_size) * v4l.num_csa_layers;
+                    const int64_t lid_holder_pages =
+                        static_cast<int64_t>(
+                            (v4_holder_tokens + indexer_k_page_size - 1)
+                            / indexer_k_page_size) * v4l.num_csa_layers;
+                    const int64_t hca_holder_pages =
+                        holder_blocks * v4l.num_hca_layers;
+                    auto afford = [](int64_t pool, int64_t inflight,
+                                     int64_t per_holder) {
+                        return per_holder > 0
+                                   ? std::max<int64_t>(
+                                         0, (pool - inflight) / per_holder)
+                                   : std::numeric_limits<int64_t>::max();
+                    };
+                    const int64_t afford_holders = std::min(
+                        {afford(gpu.indexer_k_pages,
+                                static_cast<int64_t>(max_req) * lid_seq_pages,
+                                lid_holder_pages),
+                         afford(hca_pages,
+                                static_cast<int64_t>(max_req) *
+                                    blocks_per_seq * v4l.num_hca_layers,
+                                hca_holder_pages),
+                         afford(swa_pages,
+                                static_cast<int64_t>(max_req) * swa_per_seq,
+                                swa_per_seq)});
+                    const double holder_mib =
+                        static_cast<double>(
+                            lid_holder_pages * v4l.indexer_bytes_per_page +
+                            hca_holder_pages * v4l.hca_bytes_per_page +
+                            swa_per_seq * v4l.swa_bytes_per_page) /
+                        (1024.0 * 1024.0);
+                    spdlog::info(
+                        "V4 side-tier pools on GPU {}: {} in-flight + {} "
+                        "prefix-holder sequence(s) at {:.1f} MiB/holder "
+                        "(LID {} + HCA {} + SWA {} pages; holders are "
+                        "COPY-ON-FORK full tier sets, TD-V4-SERVE-PREFIX / "
+                        "INV-PREFIX-CACHE-3).",
+                        gpu_i, max_req, afford_holders, holder_mib,
+                        lid_holder_pages, hca_holder_pages, swa_per_seq);
+                    if (afford_holders <
+                        static_cast<int64_t>(v4_prefix_holders))
+                        spdlog::warn(
+                            "V4 side-tier pools on GPU {} afford only {} of "
+                            "serving.prefix_cache.max_entries={} prefix "
+                            "holders (VRAM cap scaled the pools). Excess "
+                            "holders trip RETRYABLE pool exhaustion answered "
+                            "by holder eviction (TD-INDEXER-POOL-EVICT) — "
+                            "expect eviction churn; lower max_entries/"
+                            "max_sequence_length or free VRAM to fix.",
+                            gpu_i, afford_holders, v4_prefix_holders);
+                }
             }
             gpu.kv_main_bytes = align_region(
                 csa_pages * v4l.csa_bytes_per_page + scratch_bytes);
@@ -842,6 +946,27 @@ VramLayout compute_vram_layout(const config::Config& cfg,
                            kv_aligned_total - gpu.safety_margin_bytes;
         }
         if (expert_total < 0) expert_total = 0;
+
+        // Per-GPU budget table — printed BEFORE the expert-cache validation so
+        // a sizing failure always shows the full arithmetic that produced it.
+        spdlog::info(
+            "VramAllocator: GPU {} (hw id {}, {}) budget: total {:.1f} MiB = "
+            "pinned {:.1f} + margin {:.1f} + indexer_k {:.1f} + kv[main {:.1f}"
+            " spec {:.1f} hca {:.1f} swa {:.1f} scratch-in-main {:.1f}] + "
+            "expert {:.1f} (reserve {:.1f}, min {:.1f})",
+            gpu_i, gpu.gpu_id, in_tp[gpu_i] ? "TP" : "expert-only",
+            static_cast<double>(gpu.total_vram_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.pinned_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.safety_margin_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.indexer_k_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.kv_main_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.kv_speculation_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.kv_hca_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(gpu.kv_swa_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(scratch_bytes) / (1024.0 * 1024.0),
+            static_cast<double>(expert_total) / (1024.0 * 1024.0),
+            static_cast<double>(expert_reserve) / (1024.0 * 1024.0),
+            static_cast<double>(min_expert_cache) / (1024.0 * 1024.0));
 
         // Validate minimum expert cache
         if (min_expert_cache > 0 && expert_total < min_expert_cache) {

@@ -79,7 +79,7 @@ class DcpCommunicator;
 
 namespace layerstorm::model {
 struct LoadedModel;
-class PrepackedSource;
+class ExpertSlotSource;
 class PackedBufferCache;
 class GgufQuantInterface;  // GG-5b: per-projection GGUF type for fused MoE GEMMs
 }
@@ -220,7 +220,7 @@ public:
         memory::NumaManager*             numa_manager       = nullptr;
         memory::PinnedExpertArena*       pinned_arena       = nullptr;  // nullable (P-24)
         model::LoadedModel*              loaded_model       = nullptr;  // nullable
-        model::PrepackedSource*          prepacked_source   = nullptr;  // nullable (WP-3)
+        model::ExpertSlotSource*         prepacked_source   = nullptr;  // nullable (WP-3)
         model::PackedBufferCache*        packed_cache       = nullptr;  // nullable (WP-4)
         model::ExpertShape               expert_shape{};              // For lazy NVFP4 packing
         parallelism::DcpExecutor*        dcp_executor       = nullptr;  // nullable
@@ -2134,6 +2134,30 @@ private:
     bool run_moe_overlap_pass(ProgressiveMoeState& st);
     int moe_resident_overlap_enabled_ = -1;  // -1 unread, 0 off, 1 on
     bool moe_resident_overlap_enabled();
+
+    /// INV-MOE-OVERLAP null-skip extension (env LS_MOE_NULL_SKIP_DECODE,
+    /// default ON): apply the GGUF NULL-B-ptr expert skip (deps grouped GEMV
+    /// early-returns the CTA instead of K-walking the zero-weight buffer) to
+    /// the PLAIN decode finalize too (MoeWavePass::kNone at num_tokens==1),
+    /// not just the wave passes. The skipped experts' GEMM output rows are
+    /// pre-zeroed / re-zeroed inside the emitted op sequence (captured into
+    /// the FFN graph), so downstream reads identical bytes — bit-identical to
+    /// the zero-weight-buffer walk. =0 restores the legacy zero-buf behavior.
+    int moe_null_skip_decode_enabled_ = -1;  // -1 unread, 0 off, 1 on
+    bool moe_null_skip_decode_enabled();
+
+    /// LS_MOE_DECODE_WAVE_GATE (default OFF): restrict the decode resident-
+    /// overlap pass (run_moe_overlap_pass) to ranks that actually have an
+    /// in-flight missing-expert fetch. Ranks with all their routed experts
+    /// already resident gain NOTHING from the kPartial pass (their kFinal is
+    /// not DMA-gated) yet pay a full duplicated dispatch (mHC collapse + norm
+    /// + permute + graph replay + accumulate, ~220-320 us/graph exec) — the
+    /// measured ~1.4 routed-FFN graph execs/layer at decode. Filtered ranks
+    /// compute everything in the finalize (kFinal, full bitset) — pass
+    /// membership only; each permuted row is still computed exactly once, so
+    /// tokens are bit-identical (the INV-FAR-WAVE x+0 argument).
+    int moe_decode_wave_gate_enabled_ = -1;  // -1 unread, 0 off, 1 on
+    bool moe_decode_wave_gate_enabled();
 
     /// TD-FAR-STREAM-GATE (probe, env LS_FAR_STREAM_GATE, default OFF): the
     /// low-hanging HALF of the device-side fetch→finalize gate. For a DECODE

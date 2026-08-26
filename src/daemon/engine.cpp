@@ -81,6 +81,9 @@
 #include "model/weight_loader/tp_weight_sharder.h"
 #include "model/weight_loader/weight_loader.h"
 #include "model/weight_pipeline/expert_prepacker.h"
+#include "model/weight_pipeline/expert_slot_source.h"
+#include "model/weight_pipeline/live_arena_build.h"
+#include "model/weight_pipeline/live_gguf_source.h"
 #include "model/weight_pipeline/manifest.h"
 #include "model/weight_pipeline/packed_buffer_cache.h"
 #include "model/weight_pipeline/prepacked_format.h"
@@ -1353,6 +1356,14 @@ void Engine::init_modules() {
                 spdlog::info("WP-6: Skipping routed expert loading "
                              "(prepacked_dir valid)");
             }
+        } else if (cfg_->preprocessing.live_prepack) {
+            // LIVE PREPACK: routed experts are read straight from the GGUF
+            // shards by LiveGgufExpertSource (O_DIRECT) — never mmap-loaded
+            // into LoadedModel. Config validation guarantees gguf format +
+            // arena gates.
+            skip_routed_experts = true;
+            spdlog::info("live prepack: skipping routed expert loading "
+                         "(slots synthesize from the GGUF shards)");
         }
     }
 
@@ -1512,9 +1523,35 @@ void Engine::init_modules() {
         }
     }
 
-    // TD-97c: If routed experts were skipped but PrepackedSource failed to init,
+    // Step 18c-live (LIVE PREPACK): build the live GGUF slot source. Fatal on
+    // failure — with routed experts skipped there is no other expert source.
+    // The ctor is header-metadata only (no data reads); it validates every
+    // MoE layer's stacked gate/up/down triple against the slot sizing the
+    // SAME way prepack_experts does (GG-9/GG-10).
+    if (cfg_->preprocessing.live_prepack && !prepacked_source_ &&
+        loaded_model_ && !cfg_->preprocessing.legacy_weights) {
+        if (loaded_model_->gguf_shards.empty()) {
+            throw std::runtime_error(
+                "live prepack: no GGUF shards loaded (weights_format must be "
+                "gguf)");
+        }
+        live_source_ = std::make_unique<model::LiveGgufExpertSource>(
+            loaded_model_->gguf_shards, *model_cfg_, *quant_,
+            cfg_->model.n_routed_experts,
+            /*o_direct=*/cfg_->memory.pin_host_expert_pool_direct_o_direct);
+        // WP-7b parity: pinned staging pool for any staged H2D fallback.
+        if (transfer_engine_ && !backends_.skip_hardware_detection) {
+            constexpr int kPinnedPoolCount = 4;
+            transfer_engine_->init_pinned_pool(
+                static_cast<size_t>(
+                    layer_registry_->per_routed_expert_bytes()),
+                kPinnedPoolCount, dev_ptrs[0]);
+        }
+    }
+
+    // TD-97c: If routed experts were skipped but no expert source came up,
     // there is no expert data from any source — fatal error.
-    if (skip_routed_experts && !prepacked_source_) {
+    if (skip_routed_experts && !expert_source_()) {
         throw std::runtime_error(
             "PrepackedSource init failed but routed experts were not loaded "
             "(WP-6). Set preprocessing.legacy_weights=true or fix prepacked "
@@ -1529,7 +1566,7 @@ void Engine::init_modules() {
     // Step 18d: Create PackedBufferCache (WP-4).
     {
         auto cache_mode =
-            (prepacked_source_ &&
+            (expert_source_() &&
              cfg_->preprocessing.host_cache_mode == config::HostCacheMode::mmap)
             ? model::PackedBufferCache::Mode::kMmap
             : model::PackedBufferCache::Mode::kExplicit;
@@ -1559,7 +1596,7 @@ void Engine::init_modules() {
             const bool arena_gates_ok =
                 cfg_->memory.preload_expert_buffers &&
                 cache_mode == model::PackedBufferCache::Mode::kMmap &&
-                prepacked_source_ && cfg_->memory.pin_host_expert_pool &&
+                expert_source_() && cfg_->memory.pin_host_expert_pool &&
                 numa_manager_ && numa_manager_->numa_available() &&
                 !backends_.skip_hardware_detection;
             if (arena_early_.launched && !arena_gates_ok) {
@@ -1581,7 +1618,7 @@ void Engine::init_modules() {
 
         if (cfg_->memory.preload_expert_buffers) {
             if (cache_mode == model::PackedBufferCache::Mode::kMmap &&
-                prepacked_source_) {
+                expert_source_()) {
                 // P-24: when pin_host_expert_pool is on, build ONE pinned,
                 // NUMA-bound anonymous arena per GPU-attached node and register
                 // it once (Portable) — ~tens of ms/GB vs the 481-1 per-file
@@ -1601,8 +1638,8 @@ void Engine::init_modules() {
                     // O_DIRECT) so a slot holds a full slot read; the H2D still
                     // copies only the real expert bytes (expert_cache->expert_bytes).
                     // Equals per_routed_expert_bytes for legacy/unpadded data.
-                    const size_t slot_bytes = prepacked_source_
-                        ? static_cast<size_t>(prepacked_source_->slot_size_bytes())
+                    const size_t slot_bytes = expert_source_()
+                        ? static_cast<size_t>(expert_source_()->slot_size_bytes())
                         : static_cast<size_t>(
                               layer_registry_->per_routed_expert_bytes());
                     const size_t total_expert_bytes = slot_bytes
@@ -1614,7 +1651,7 @@ void Engine::init_modules() {
                     // only need the prefaulted pages). Hides the ~21 s register
                     // under the ~100 s preload.
                     const bool will_preload =
-                        prepacked_source_ &&
+                        expert_source_() &&
                         cfg_->memory.pin_host_expert_pool_preload;
                     const size_t arena_scratch = static_cast<size_t>(
                         cfg_->memory.pin_host_expert_pool_extra_scratch_bytes);
@@ -1738,11 +1775,23 @@ void Engine::init_modules() {
 
                         // Wire the persistence meta layer + adopt warm slots.
                         if (arena_cache_) {
-                            arena_cache_->set_file_identities(
-                                memory::ArenaCache::stat_expert_files(
-                                    cfg_->preprocessing.prepacked_dir,
-                                    static_cast<uint32_t>(
-                                        cfg_->model.n_routed_experts)));
+                            if (live_source_) {
+                                // LIVE PREPACK: slot content derives from the
+                                // GGUF shards — every expert shares one
+                                // combined shard-set identity (any shard
+                                // change invalidates all cached slots).
+                                arena_cache_->set_file_identities(
+                                    memory::ArenaCache::stat_source_files(
+                                        live_source_->shard_paths(),
+                                        static_cast<uint32_t>(
+                                            cfg_->model.n_routed_experts)));
+                            } else {
+                                arena_cache_->set_file_identities(
+                                    memory::ArenaCache::stat_expert_files(
+                                        cfg_->preprocessing.prepacked_dir,
+                                        static_cast<uint32_t>(
+                                            cfg_->model.n_routed_experts)));
+                            }
                             pinned_arena_->set_cache(arena_cache_.get());
                             if (warm_attach) {
                                 const size_t adopted =
@@ -1803,7 +1852,7 @@ void Engine::init_modules() {
                     // with the pinned arena for RAM. Removes the runtime dependency
                     // on the prepacked cache (a large lazy-filled arena would
                     // otherwise evict it, forcing cold loads to disk).
-                    if (pinned_arena_ && prepacked_source_ &&
+                    if (pinned_arena_ && expert_source_() &&
                         cfg_->memory.pin_host_expert_pool_preload) {
                         const auto t0 = std::chrono::steady_clock::now();
                         // Bulk preload is io_uring's win (deep queue saturates the
@@ -1815,7 +1864,8 @@ void Engine::init_modules() {
                         // runtime loader without liburing (kIoUring → kWorkerPool).
                         std::unique_ptr<memory::ArenaLoader> preload_loader;
                         memory::ArenaLoader* loader = arena_loader_.get();
-                        if (prepacked_source_->is_direct() && arena_loader_ &&
+                        if (prepacked_source_ &&
+                            prepacked_source_->is_direct() && arena_loader_ &&
                             arena_loader_->backend() !=
                                 memory::ArenaLoader::Backend::kIoUring) {
                             preload_loader = std::make_unique<memory::ArenaLoader>(
@@ -1847,7 +1897,7 @@ void Engine::init_modules() {
                                              cfg_->model.n_routed_experts); ++e) {
                                         memory::ExpertKey k{
                                             L, static_cast<uint16_t>(e)};
-                                        if (prepacked_source_->has(k))
+                                        if (expert_source_()->has(k))
                                             pkeys.push_back(k);
                                     }
                                 std::vector<memory::ArenaPlacementNode> pnodes;
@@ -1884,12 +1934,35 @@ void Engine::init_modules() {
                             try { pinned_arena_->register_all(); }
                             catch (...) { reg_err = std::current_exception(); }
                         });
-                        size_t n = pinned_arena_->preload(
-                            *prepacked_source_,
-                            static_cast<uint32_t>(cfg_->model.num_hidden_layers),
-                            static_cast<uint32_t>(cfg_->model.n_routed_experts),
-                            loader,
-                            place_map.empty() ? nullptr : &place_map);
+                        size_t n;
+                        if (live_source_) {
+                            // LIVE PREPACK: parallel GGUF-read + transform
+                            // pipeline (NUMA-pinned workers, io_uring O_DIRECT
+                            // readers) — plan/commit follow the SAME
+                            // reservation rules as preload().
+                            const auto bst = model::live_prepack_build(
+                                *pinned_arena_, *numa_manager_, *live_source_,
+                                static_cast<uint32_t>(
+                                    cfg_->model.num_hidden_layers),
+                                static_cast<uint32_t>(
+                                    cfg_->model.n_routed_experts),
+                                place_map.empty() ? nullptr : &place_map,
+                                cfg_->preprocessing.live_prepack_threads);
+                            n = bst.filled;
+                            if (bst.failed > 0)
+                                spdlog::error("live prepack: {} slot(s) "
+                                              "FAILED to build (left "
+                                              "reserved-empty)", bst.failed);
+                        } else {
+                            n = pinned_arena_->preload(
+                                *prepacked_source_,
+                                static_cast<uint32_t>(
+                                    cfg_->model.num_hidden_layers),
+                                static_cast<uint32_t>(
+                                    cfg_->model.n_routed_experts),
+                                loader,
+                                place_map.empty() ? nullptr : &place_map);
+                        }
                         reg_thread.join();
                         if (reg_err) {
                             std::string msg;
@@ -1905,9 +1978,11 @@ void Engine::init_modules() {
                             const double gb = n * (slot_bytes / 1073741824.0);
                             spdlog::info("PinnedExpertArena: preloaded {} slots "
                                          "({:.1f} GB) in {:.2f} s ({:.2f} GB/s) "
-                                         "[register overlapped]",
-                                         n, gb, secs, secs > 0 ? gb / secs : 0.0);
-                            prepacked_source_->advise_dontneed();
+                                         "[register overlapped{}]",
+                                         n, gb, secs, secs > 0 ? gb / secs : 0.0,
+                                         live_source_ ? ", LIVE PREPACK" : "");
+                            if (prepacked_source_)
+                                prepacked_source_->advise_dontneed();
                         }
                         // preload_loader (if any) torn down here — runtime uses
                         // arena_loader_ (worker-pool) for any cold-load misses.
@@ -1918,7 +1993,7 @@ void Engine::init_modules() {
                     if (!memory::ArenaPlacementPolicy::resolved_path(
                              cfg_->memory.arena_placement.freq_table)
                              .empty() &&
-                        !(pinned_arena_ && prepacked_source_ &&
+                        !(pinned_arena_ && expert_source_() &&
                           cfg_->memory.pin_host_expert_pool_preload))
                         spdlog::warn(
                             "arena placement table configured "
@@ -1927,6 +2002,16 @@ void Engine::init_modules() {
                             "path is inactive — placement NOT applied");
                 }
                 if (!pinned_arena_) {
+                    if (live_source_) {
+                        // LIVE PREPACK has no mmap/staging fallback tier: the
+                        // arena is its ONLY output. A failed arena build means
+                        // no expert source exists — fail loudly instead of
+                        // serving from nothing.
+                        throw std::runtime_error(
+                            "live prepack: pinned arena build failed and live "
+                            "prepack has no prepacked-file fallback "
+                            "(preprocessing.live_prepack requires the arena)");
+                    }
                     int n = packed_cache_->preload_mmap(*prepacked_source_);
                     spdlog::info("PackedBufferCache: preloaded {} mmap regions "
                                  "(madvise)", n);
@@ -3624,7 +3709,7 @@ void Engine::spawn_daemon_thread() {
             .pinned_arena    = pinned_arena_.get(),
             .arena_loader    = arena_loader_.get(),   // J-1 async cold load
             .loaded_model    = loaded_model_.get(),
-            .prepacked_source = prepacked_source_.get(),
+            .prepacked_source = expert_source_(),
             .packed_cache    = packed_cache_.get(),
             .snapshot        = state_snapshot_,
             .first_moe_layer = static_cast<uint32_t>(cfg_->model.first_k_dense_replace),
@@ -3695,13 +3780,14 @@ void Engine::spawn_daemon_thread() {
                 }
             }
         }
-        if (prepacked_source_) {
+        if (expert_source_()) {
             for (size_t l = 0; l < nl; ++l) {
                 // Only layers with no loaded routed bundles (WP-6 skip) take
-                // their types from the manifest; loaded bundles stay the
+                // their types from the manifest (prepacked) or the GGUF
+                // tensor directory (live prepack); loaded bundles stay the
                 // source of truth in legacy/mmap mode.
                 if (!loaded_model_->layers[l].routed_experts.empty()) continue;
-                auto t = prepacked_source_->gguf_types_for_layer(
+                auto t = expert_source_()->gguf_types_for_layer(
                     static_cast<int>(l));
                 if (!t) continue;
                 routed_layer_gguf_types[l] =
@@ -3780,7 +3866,7 @@ void Engine::spawn_daemon_thread() {
         .numa_manager       = numa_manager_.get(),
         .pinned_arena       = pinned_arena_.get(),
         .loaded_model       = loaded_model_.get(),
-        .prepacked_source   = prepacked_source_.get(),
+        .prepacked_source   = expert_source_(),
         .packed_cache       = packed_cache_.get(),
         .expert_shape       = model::ExpertShape{cfg_->model.hidden_size,
                                                  cfg_->model.moe_intermediate_size},
@@ -4091,24 +4177,38 @@ ipc::EngineH2dPathStats Engine::h2d_path_stats() const {
 // Cold boots deliberately do NOT register here: registration stays overlapped
 // with the NVMe preload at the late block (TD-INIT-OVERLAP).
 
+model::ExpertSlotSource* Engine::expert_source_() const {
+    if (prepacked_source_) return prepacked_source_.get();
+    return static_cast<model::ExpertSlotSource*>(live_source_.get());
+}
+
 void Engine::launch_arena_attach_early_() {
     namespace fs = std::filesystem;
     bool attach_enabled = cfg_->memory.arena_attach.enabled;
     if (const char* aa = std::getenv("LS_ARENA_ATTACH"); aa && *aa)
         attach_enabled = (*aa != '0');
+    // LIVE PREPACK qualifies without a prepacked_dir: slot geometry comes
+    // from the (already-resolved, step 4) expert QuantInterface instead of
+    // the manifest.
+    const bool live_ok =
+        cfg_->preprocessing.live_prepack &&
+        cfg_->preprocessing.prepacked_dir.empty() &&
+        cfg_->model.weights_format == config::WeightsFormat::gguf;
     const bool gates =
         attach_enabled &&
         cfg_->memory.preload_expert_buffers &&
         cfg_->preprocessing.host_cache_mode == config::HostCacheMode::mmap &&
         !cfg_->preprocessing.legacy_weights &&
-        !cfg_->preprocessing.prepacked_dir.empty() &&
+        (!cfg_->preprocessing.prepacked_dir.empty() || live_ok) &&
         cfg_->memory.pin_host_expert_pool &&
         numa_manager_ && numa_manager_->numa_available() &&
         !backends_.skip_hardware_detection;
     if (!gates) return;
-    std::error_code ec;
-    if (!fs::exists(model::prepacked::manifest_path(
-            cfg_->preprocessing.prepacked_dir), ec)) return;
+    if (!live_ok) {
+        std::error_code ec;
+        if (!fs::exists(model::prepacked::manifest_path(
+                cfg_->preprocessing.prepacked_dir), ec)) return;
+    }
 
     // THP policy must be set before ANY shared allocation/adopt on the worker.
     numa_manager_->set_shared_thp(cfg_->memory.pin_host_expert_pool_thp);
@@ -4129,14 +4229,30 @@ void Engine::arena_attach_early_worker_() {
     memory::ArenaBacking backing{};
     try {
         namespace fs = std::filesystem;
-        // Manifest-only parse (cheap; PrepackedSource is built later on the
-        // main thread — its slot_size_bytes must equal this stride, verified
-        // at join).
-        const auto manifest =
-            model::read_manifest(cfg_->preprocessing.prepacked_dir);
-        arena_early_.slot_bytes = static_cast<size_t>(
-            manifest.slot.stride_bytes > 0 ? manifest.slot.stride_bytes
-                                           : manifest.slot.slot_size_bytes);
+        const bool live = cfg_->preprocessing.live_prepack &&
+                          cfg_->preprocessing.prepacked_dir.empty();
+        std::string source_format;
+        if (live) {
+            // LIVE PREPACK: slot stride from the step-4 expert QuantInterface
+            // (the SAME sizing LiveGgufExpertSource resolves later — verified
+            // at join like the manifest stride).
+            const model::ExpertShape shape{cfg_->model.hidden_size,
+                                           cfg_->model.moe_intermediate_size};
+            arena_early_.slot_bytes = static_cast<size_t>(
+                model::prepacked::aligned_slot_stride(
+                    quant_->bytes_per_expert(shape)));
+            source_format = std::string{model::prepacked::kFormatVersion};
+        } else {
+            // Manifest-only parse (cheap; PrepackedSource is built later on
+            // the main thread — its slot_size_bytes must equal this stride,
+            // verified at join).
+            const auto manifest =
+                model::read_manifest(cfg_->preprocessing.prepacked_dir);
+            arena_early_.slot_bytes = static_cast<size_t>(
+                manifest.slot.stride_bytes > 0 ? manifest.slot.stride_bytes
+                                               : manifest.slot.slot_size_bytes);
+            source_format = manifest.format_version;
+        }
         if (arena_early_.slot_bytes == 0) return;  // malformed → private path
 
         // Config-stable identity (node set + share degrees from topology +
@@ -4171,9 +4287,11 @@ void Engine::arena_attach_early_worker_() {
             nodeids, cfg_->memory.pin_host_expert_pool_sizing, spill,
             arena_early_.placement_id);
         arena_early_.source_id = memory::ArenaCache::hash_source_id(
-            std::filesystem::absolute(
-                cfg_->preprocessing.prepacked_dir).string(),
-            manifest.format_version,
+            live ? std::filesystem::absolute(
+                       cfg_->model.weights_path).string() + "#live-prepack"
+                 : std::filesystem::absolute(
+                       cfg_->preprocessing.prepacked_dir).string(),
+            source_format,
             static_cast<int64_t>(arena_early_.slot_bytes));
 
         // Attach (may auto-spawn the holder).

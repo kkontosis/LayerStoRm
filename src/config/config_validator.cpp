@@ -725,6 +725,46 @@ void validate_arena_attach(const Config& cfg, ValidationResult& r) {
     }
 }
 
+// LIVE PREPACK (preprocessing.live_prepack): the arena is built directly from
+// the source GGUF shards — no prepacked files. The mode replaces the
+// prepacked path wholesale, so any co-configured prepacked machinery is a
+// config contradiction, and the arena (its only output) must be enabled.
+void validate_live_prepack(const Config& cfg, ValidationResult& r) {
+    const auto& p = cfg.preprocessing;
+    if (!p.live_prepack) return;
+    if (!p.prepacked_dir.empty()) {
+        error(r, "preprocessing.live_prepack",
+              "live_prepack=true is mutually exclusive with prepacked_dir: "
+              "live prepack builds the arena from the source GGUF; a set "
+              "prepacked_dir selects the on-disk prepacked path. Remove one.");
+    }
+    if (p.auto_preprocess) {
+        error(r, "preprocessing.live_prepack",
+              "live_prepack=true is mutually exclusive with auto_preprocess "
+              "(live prepack never writes prepacked files).");
+    }
+    if (p.legacy_weights) {
+        error(r, "preprocessing.live_prepack",
+              "live_prepack=true contradicts legacy_weights=true (legacy "
+              "forces routed experts through the raw weight load).");
+    }
+    if (cfg.model.weights_format != WeightsFormat::gguf) {
+        error(r, "preprocessing.live_prepack",
+              "live prepack supports GGUF sources only (the transform is the "
+              "verbatim k-quant block pack); safetensors NVFP4/FP8 use the "
+              "offline prepack path.");
+    }
+    if (!cfg.memory.pin_host_expert_pool ||
+        !cfg.memory.pin_host_expert_pool_preload ||
+        !cfg.memory.preload_expert_buffers) {
+        error(r, "preprocessing.live_prepack",
+              "live prepack requires memory.preload_expert_buffers + "
+              "memory.pin_host_expert_pool + pin_host_expert_pool_preload: "
+              "the pinned arena is its only output tier (there are no "
+              "prepacked files to fall back to).");
+    }
+}
+
 }  // namespace
 
 ValidationResult validate_config(const Config& cfg) {
@@ -750,6 +790,7 @@ ValidationResult validate_config(const Config& cfg) {
     validate_gating_activation(cfg, result);
     validate_v4(cfg, result);
     validate_arena_attach(cfg, result);
+    validate_live_prepack(cfg, result);
 
     return result;
 }

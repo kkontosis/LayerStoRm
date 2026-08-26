@@ -2,6 +2,8 @@
 
 #include "core/memory/arena_cache.h"
 
+#include <algorithm>
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -149,6 +151,31 @@ std::vector<ExpertFileIdentity> ArenaCache::stat_expert_files(
         // else: invalid identity — records for this expert never match/adopt.
     }
     return out;
+}
+
+std::vector<ExpertFileIdentity> ArenaCache::stat_source_files(
+        const std::vector<std::filesystem::path>& source_files,
+        uint32_t num_experts) {
+    // Combined identity over the whole source set: max mtime + summed size.
+    // Every expert shares it — any shard change invalidates all cached slots
+    // (live prepack: slot content derives from the full shard set, and the
+    // de-stacked geometry gives no cheaper per-expert stat).
+    ExpertFileIdentity combined;
+    bool all_ok = !source_files.empty();
+    for (const auto& p : source_files) {
+        struct stat st{};
+        if (::stat(p.c_str(), &st) == 0 && st.st_size > 0) {
+            const uint64_t mt =
+                static_cast<uint64_t>(st.st_mtim.tv_sec) * 1000000000ULL +
+                static_cast<uint64_t>(st.st_mtim.tv_nsec);
+            combined.mtime_ns = std::max(combined.mtime_ns, mt);
+            combined.size_bytes += static_cast<uint64_t>(st.st_size);
+        } else {
+            all_ok = false;
+        }
+    }
+    if (!all_ok) combined = ExpertFileIdentity{};  // invalid — never adopt
+    return std::vector<ExpertFileIdentity>(num_experts, combined);
 }
 
 // ── ArenaMetaSegment ─────────────────────────────────────────────────────────

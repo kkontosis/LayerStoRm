@@ -149,6 +149,39 @@ bool CommandDispatcher::moe_resident_overlap_enabled() {
     return moe_resident_overlap_enabled_ == 1;
 }
 
+// ── INV-MOE-OVERLAP null-skip extension: plain decode finalize ─────────────
+// Read once: NULL-skip non-resident experts on the kNone (single-pass) decode
+// dispatch too, instead of K-walking the zero-weight buffer on every rank.
+// Default ON; LS_MOE_NULL_SKIP_DECODE=0 restores the zero-buf behavior
+// byte-identically (coordinator A/B kill-switch).
+bool CommandDispatcher::moe_null_skip_decode_enabled() {
+    if (moe_null_skip_decode_enabled_ < 0) {
+        const char* e = std::getenv("LS_MOE_NULL_SKIP_DECODE");
+        moe_null_skip_decode_enabled_ = (e && e[0] == '0') ? 0 : 1;
+        if (!moe_null_skip_decode_enabled_)
+            spdlog::info("INV-MOE-OVERLAP: decode kNone NULL-skip DISABLED "
+                         "(LS_MOE_NULL_SKIP_DECODE=0) — zero-weight walk");
+    }
+    return moe_null_skip_decode_enabled_ == 1;
+}
+
+// ── LS_MOE_DECODE_WAVE_GATE: overlap pass only where it overlaps ───────────
+// Read once: at decode, enqueue the resident-overlap kPartial pass ONLY on
+// ranks with an in-flight missing-expert fetch (the ranks whose kFinal is
+// DMA-gated). Other ranks skip straight to the single finalize pass — same
+// rows, computed exactly once, bit-identical tokens. Default OFF pending the
+// coordinator's engine A/B (=1 enables).
+bool CommandDispatcher::moe_decode_wave_gate_enabled() {
+    if (moe_decode_wave_gate_enabled_ < 0) {
+        const char* e = std::getenv("LS_MOE_DECODE_WAVE_GATE");
+        moe_decode_wave_gate_enabled_ = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (moe_decode_wave_gate_enabled_)
+            spdlog::info("INV-MOE-OVERLAP: decode overlap pass restricted to "
+                         "fetching ranks (LS_MOE_DECODE_WAVE_GATE=1)");
+    }
+    return moe_decode_wave_gate_enabled_ == 1;
+}
+
 // ── KD-3b: Fused MoE dispatch ────────────────────────────────────────────
 
 void CommandDispatcher::publish_seam_routing(const InternalMoeParams& mp,
@@ -959,15 +992,27 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // reads alpha=0.0f → zero contribution. Non-graph path writes the shared
     // host vector + H2D into the shared routed_b_ptrs device array (as before).
     //
-    // INV-MOE-OVERLAP null-skip: for GGUF DECODE wave passes the excluded
-    // experts get a NULL pointer instead of the zero buffer — the grouped GEMV
+    // INV-MOE-OVERLAP null-skip: for GGUF DECODE passes the excluded experts
+    // get a NULL pointer instead of the zero buffer — the grouped GEMV
     // early-returns their CTAs (deps kernels honor NULL) instead of paying the
     // full latency-bound K-walk over zeros. The pass's GEMM output rows are
     // pre-zeroed in emit_routed_ffn so the skipped rows stay exact zeros
-    // (bit-identical to the zero-weight-buffer result). kNone keeps the zero
-    // buffer (byte-identical legacy path).
+    // (bit-identical to the zero-weight-buffer result). Wave passes
+    // (kPartial/kFinal) always skip; the plain kNone finalize (the common
+    // decode single pass — every rank K-walked ALL routed experts over zeros)
+    // skips too under LS_MOE_NULL_SKIP_DECODE (default ON; =0 restores the
+    // legacy zero-buf walk). The env is read once per process, so the emitted
+    // control flow is fixed per FFN-graph variant.
+    // int_strategy only: the dequant strategy runs the HOST-LOOP launcher
+    // (launch_gguf_grouped_gemm_hostloop), whose per-expert loop does NOT
+    // skip NULL B pointers — it would hand nullptr weights to the dequant
+    // GEMM. Only the device-fused grouped int kernels honor NULL (their CTAs
+    // early-return). The guard also covers the previously-latent wave-pass
+    // case under a dequant config.
     const bool wave_null_skip = use_gguf && num_tokens == 1
-        && mp.wave_pass != MoeWavePass::kNone;
+        && gguf_strategy == compute::GgufGemmStrategy::int_strategy
+        && (mp.wave_pass != MoeWavePass::kNone
+            || moe_null_skip_decode_enabled());
     void* const excluded_b = wave_null_skip
         ? nullptr : static_cast<void*>(scratch.zero_weight_buf);
     auto build_routed_b_ptrs = [&](auto proj_offset_fn, int64_t weight_bytes) {

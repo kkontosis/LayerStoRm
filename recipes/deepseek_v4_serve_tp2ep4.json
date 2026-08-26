@@ -102,32 +102,71 @@
   "hardware": {
     "gpus": [
       {
-        "id": 0,
+        "id": 2,
         "type": "rtx5090",
         "vram_gb": 30,
         "pcie_gen": 5,
         "pcie_width": 16,
-        "numa_node": 2,
         "roles": [
           "attention",
           "resident",
           "expert_streaming"
-        ]
+        ],
+        "vram_allocation_gb": {
+          "expert_streaming": 16.5,
+          "stable_zone_fraction": 0.95
+        }
       },
       {
-        "id": 1,
+        "id": 3,
         "type": "rtx5090",
         "vram_gb": 30,
         "pcie_gen": 5,
         "pcie_width": 16,
-        "numa_node": 3,
         "roles": [
-          "attention"
-        ]
+          "attention",
+          "resident",
+          "expert_streaming"
+        ],
+        "vram_allocation_gb": {
+          "expert_streaming": 16.5,
+          "stable_zone_fraction": 0.95
+        }
+      },
+      {
+        "id": 0,
+        "type": "rtx5080",
+        "vram_gb": 15,
+        "pcie_gen": 5,
+        "pcie_width": 16,
+        "roles": [
+          "expert_streaming"
+        ],
+        "vram_allocation_gb": {
+          "expert_streaming": 13.0,
+          "stable_zone_fraction": 0.95,
+          "safety_margin_gb": 1.5
+        }
+      },
+      {
+        "id": 1,
+        "type": "rtx5080",
+        "vram_gb": 15,
+        "pcie_gen": 5,
+        "pcie_width": 16,
+        "roles": [
+          "expert_streaming"
+        ],
+        "vram_allocation_gb": {
+          "expert_streaming": 13.0,
+          "stable_zone_fraction": 0.95,
+          "safety_margin_gb": 1.5
+        }
       }
     ],
     "tp_array": [
-      0
+      0,
+      1
     ],
     "system_ram_gb": 512,
     "nvme_paths": [],
@@ -231,6 +270,8 @@
       "throughput_weight": 0.4
     },
     "max_batch_size": 64,
+    "prefill_chunk_tokens": 512,
+    "decode_expert_fetch_timeout_s": 200,
     "expert_batching": {
       "enabled": true,
       "max_wait_us": 50,
@@ -245,9 +286,7 @@
     "workload_detection": {
       "ewma_alpha": 0.01,
       "shift_threshold_std_devs": 3.0
-    },
-    "prefill_chunk_tokens": 512,
-    "decode_expert_fetch_timeout_s": 200
+    }
   },
   "prefetch": {
     "prescope": {
@@ -283,7 +322,7 @@
     }
   },
   "speculation": {
-    "enabled": true,
+    "enabled": false,
     "mtp": {
       "enabled": false,
       "max_depth": 3,
@@ -354,14 +393,14 @@
       "markov_rank": 256,
       "checkpoint_path": "/srv/models/unsloth/DeepSeek-V4-Flash-0731-GGUF/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf",
       "draft_gpus": [
-        1
+        2
       ],
       "draft_weights_quant": "bf16",
       "confidence_enabled": true
     }
   },
   "parallelism": {
-    "tensor_parallelism": 1,
+    "tensor_parallelism": 2,
     "expert_affinity": {
       "mode": "soft",
       "initial_assignment": "round_robin",
@@ -400,17 +439,25 @@
     "attention_backend": "csa_hca"
   },
   "serving": {
-    "host": "127.0.0.1",
+    "host": "0.0.0.0",
     "port": 8000,
     "max_concurrent_requests": 2,
     "max_sequence_length": 32768,
-    "tokenizer_path": "auto"
+    "tokenizer_path": "auto",
+    "prefix_cache": {
+      "enabled": true,
+      "max_cached_tokens": 98304,
+      "max_entries": 8
+    }
+  },
+  "_internal-prefix_cache": {
+    "max_entry_tokens": 32768
   },
   "preprocessing": {
     "live_prepack": true
   },
   "gpu_loader": {
     "enabled": true,
-    "calibration_path": "gpu_loader_calibration_v4_tp1.json"
+    "calibration_path": "gpu_loader_calibration_v4_ep4x4.json"
   }
 }

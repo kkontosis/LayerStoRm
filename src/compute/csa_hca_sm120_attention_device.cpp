@@ -37,6 +37,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -382,6 +384,95 @@ public:
         return {meta_d, splits_d};
     }
 
+    // Sparse decode arm: host-side replica of the deps get_mla_metadata
+    // scheduler for the CONSTANT-input decode case (uniform topk > 0,
+    // fixed rows/nsp) — the device kernel is a pure integer function of
+    // (rows, topk, nsp) there, so its output is computed once on the host
+    // (bit-identical integers), uploaded once, and reused. Removes a
+    // ~4 us on-stream kernel per CSA layer per token.
+    // Kill switch: LS_V4_META_CACHE=0 restores the per-call device kernel.
+    static bool meta_cache_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("LS_V4_META_CACHE");
+            return !(e && e[0] == '0');
+        }();
+        return on;
+    }
+
+    std::pair<const int*, const int*> sparse_meta(int rows, int topk,
+                                                  int nsp) {
+        const uint64_t key = (static_cast<uint64_t>(rows) << 40) |
+                             (static_cast<uint64_t>(topk) << 8) |
+                             static_cast<uint64_t>(nsp);
+        auto it = sparse_meta_cache_.find(key);
+        if (it != sparse_meta_cache_.end()) return it->second;
+
+        // Exact integer replica of deps smxx/get_mla_metadata.cu with
+        // topk > 0 (uniform), block_size_n = 64, fixed_overhead = 1.
+        const int block_size_n = 64;
+        const int fixed_overhead = 1;
+        const int last_block_idx = (std::max(topk - 1, 0)) / block_size_n;
+        const int num_blocks = last_block_idx + 1;
+        const int total_num_blocks = rows * (num_blocks + fixed_overhead);
+        const int payload =
+            (total_num_blocks + nsp - 1) / nsp + fixed_overhead;
+
+        std::vector<int> meta(static_cast<size_t>(nsp) *
+                                  TileSchedulerMetaDataSize,
+                              0);
+        std::vector<int> splits(static_cast<size_t>(rows) + 1, 0);
+        int now_idx = 0, now_block = 0, now_n_split = 0, cum = 0;
+        for (int i = 0; i < nsp; ++i) {
+            int* m = meta.data() + static_cast<size_t>(i) *
+                                       TileSchedulerMetaDataSize;
+            m[0] = now_idx;
+            m[1] = now_block;  // first_block_idx is 0 for topk mode
+            m[4] = now_n_split;
+            int remain = payload;
+            while (now_idx < rows) {
+                int rem_blocks = num_blocks - now_block;
+                if (remain >= rem_blocks + fixed_overhead) {
+                    cum += now_n_split + 1;
+                    splits[now_idx + 1] = cum;
+                    remain -= rem_blocks + fixed_overhead;
+                    ++now_idx;
+                    now_block = 0;
+                    now_n_split = 0;
+                } else {
+                    if (remain - fixed_overhead > 0) {
+                        now_block += remain - fixed_overhead;
+                        ++now_n_split;
+                        remain = 0;
+                    }
+                    break;
+                }
+            }
+            m[2] = now_block > 0 ? now_idx : now_idx - 1;
+            m[3] = now_block > 0 ? now_block : last_block_idx + 1;
+        }
+        if (now_idx != rows || now_block != 0 || now_n_split != 0) {
+            throw std::runtime_error(
+                "csa_hca sparse_meta: host scheduler replica did not "
+                "consume all work (rows=" + std::to_string(rows) +
+                " topk=" + std::to_string(topk) +
+                " nsp=" + std::to_string(nsp) + ")");
+        }
+
+        int* meta_d = static_cast<int*>(
+            device_.device_alloc(meta.size() * sizeof(int)));
+        int* splits_d = static_cast<int*>(
+            device_.device_alloc(splits.size() * sizeof(int)));
+        if (!meta_d || !splits_d) {
+            throw std::runtime_error(
+                "CsaHcaSm120AttentionDevice: sparse metadata alloc failed");
+        }
+        device_.memcpy_h2d(meta_d, meta.data(), meta.size() * sizeof(int));
+        device_.memcpy_h2d(splits_d, splits.data(),
+                           splits.size() * sizeof(int));
+        sparse_meta_cache_[key] = {meta_d, splits_d};
+        return {meta_d, splits_d};
+    }
+
     // ── Attention (decode + prefill-as-decode) ──────────────────────────────
 
     void attention(const V4AttentionArgs& a) {
@@ -412,6 +503,10 @@ public:
             sched = meta.first;
             splits = meta.second;
             nsp = 1;
+        } else if (meta_cache_enabled()) {
+            const auto meta = sparse_meta(a.rows, a.topk, nsp);
+            sched = meta.first;
+            splits = meta.second;
         } else {
             GetMlaMetadataParams mp{};
             mp.seqlens_k_ptr = nullptr;  // unread when topk >= 0
@@ -687,6 +782,11 @@ private:
             device_.device_free(v.second);
         }
         swa_meta_cache_.clear();
+        for (auto& [k, v] : sparse_meta_cache_) {
+            device_.device_free(v.first);
+            device_.device_free(v.second);
+        }
+        sparse_meta_cache_.clear();
         staging_ = nullptr;
         o_accum_ = lse_accum_ = scores_scratch_ = topk_scores_scratch_ = nullptr;
         topk_effk_scratch_ = nullptr;
@@ -851,6 +951,7 @@ private:
     float* topk_scores_scratch_ = nullptr;  // [rows, topk]
     int* topk_effk_scratch_ = nullptr;       // [rows]
     std::unordered_map<int, std::pair<int*, int*>> swa_meta_cache_;
+    std::unordered_map<uint64_t, std::pair<int*, int*>> sparse_meta_cache_;
     int staged_capacity_ = 0;
     int attn_rows_capacity_ = 0;
 

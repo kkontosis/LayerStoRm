@@ -230,6 +230,31 @@ protected:
         // Shrink the demand-driven V4 KV pools (default max_concurrent 32
         // over-provisions all three side tiers for a one-seq golden).
         j["serving"]["max_concurrent_requests"] = 2;
+        // LIVE PREPACK arena arm (V4_LIVE_ARENA=1): boot the goldens on a
+        // LIVE-built PRIVATE pinned arena — slots synthesized straight from
+        // the GGUF shards (INV-LIVE-PREPACK-IDENTITY) instead of the
+        // streaming path. attach stays OFF (golden boots never touch the
+        // holder). Full-set coverage on a 1-GPU boot needs cross-node spill
+        // (the ~147 GB routed set exceeds one node's fraction_total cap).
+        if (const char* la = std::getenv("V4_LIVE_ARENA"); la && *la == '1') {
+            j["preprocessing"]["live_prepack"] = true;
+            j["memory"]["preload_expert_buffers"] = true;
+            j["memory"]["pin_host_expert_pool"] = true;
+            j["memory"]["pin_host_expert_pool_preload"] = true;
+            j["memory"]["pin_host_expert_pool_direct_load"] = true;
+            j["memory"]["pin_host_expert_pool_direct_o_direct"] = true;
+            j["memory"]["pin_host_expert_pool_sizing"] = {
+                {"mode", "fraction_total"}, {"value", 0.85}};
+            j["memory"]["cross_node_spill"] = {
+                {"enabled", true},
+                {"nodes", nlohmann::json::array(
+                              {{{"node", 1}, {"weight", 2}},
+                               {{"node", 2}, {"weight", 1}},
+                               {{"node", 3}, {"weight", 1}}})},
+                {"sizing_mode", "fraction_total"},
+                {"sizing_value", 0.5}};
+            j["memory"]["arena_attach"]["enabled"] = false;
+        }
         // Debug lever: V4_GG_STRATEGY=int|dequant overrides the expert GEMM
         // route (kernel-family bisection).
         if (const char* s = std::getenv("V4_GG_STRATEGY"))

@@ -146,6 +146,12 @@ public:
     /// The data-blob alignment (general.alignment, default 32).
     uint64_t alignment() const { return alignment_; }
 
+    /// Absolute byte offset of the data blob within the file. A tensor's
+    /// absolute FILE offset is data_blob_offset() + entry.data_offset — the
+    /// live-prepack O_DIRECT readers use this to pread tensor ranges without
+    /// touching the mmap.
+    uint64_t data_blob_offset() const { return data_blob_offset_; }
+
     /// The opened file path (for error messages).
     const std::filesystem::path& path() const { return path_; }
 

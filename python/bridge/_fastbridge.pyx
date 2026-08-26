@@ -106,7 +106,8 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
 
     Returns None when empty, else the Cmp tuple
     (cmp_type, cmd_seq, gpu_idx, status, cmd_type, layer_idx,
-     host_buf_offset, data_bytes, top1_prob, entropy, err_msg).
+     host_buf_offset, data_bytes, top1_prob, entropy, err_msg,
+     err_category).
     """
     cdef uint64_t cons = (<volatile uint64_t*> (header_addr + 64))[0]
     cdef uint64_t prod = (<volatile uint64_t*> header_addr)[0]
@@ -118,11 +119,13 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
     cdef uint32_t gpu_idx = (<uint32_t*> (src + 8))[0]
     cdef uint32_t status = (<uint32_t*> (src + 12))[0]
     cdef uint32_t cmd_type = 0, layer_idx = 0, hbo = 0, dbytes = 0
+    cdef uint32_t err_cat = 0
     cdef float top1 = 0.0, ent = 0.0
     cdef bytes msg_b
     cdef object err_msg = ""
     if cmp_type == CMP_ERROR:
-        # error payload: message char[80] at +20
+        # error payload: error_category u32 at +16, message char[80] at +20
+        err_cat = (<uint32_t*> (src + 16))[0]
         msg_b = (<char*> (src + 20))[:80]
         err_msg = msg_b.split(b"\0")[0].decode("utf-8", "replace")
     else:
@@ -135,7 +138,7 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
     # Consume AFTER the copy-out (release on TSO).
     (<volatile uint64_t*> (header_addr + 64))[0] = cons + 1
     return (cmp_type, cmd_seq, gpu_idx, status, cmd_type, layer_idx,
-            hbo, dbytes, top1, ent, err_msg)
+            hbo, dbytes, top1, ent, err_msg, err_cat)
 
 
 def write_u32(uintptr_t addr, list values):
@@ -463,7 +466,7 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
     interest arrives; CMP_CHECKPOINT completions are consumed + skipped
     inside the loop. Returns one of:
       ('ok', cmd_seq, status, cmd_type, layer, hbo, dbytes, top1, entropy)
-      ('err', cmd_seq, msg)                       CMP_ERROR (any seq)
+      ('err', cmd_seq, msg, error_category)       CMP_ERROR (any seq)
       ('dspark', <cmp_poll 11-tuple>)             cmd_seq == dspark_seq != 0
       ('other', <cmp_poll 11-tuple>)              unexpected type/seq
       ('timeout',)
@@ -475,6 +478,7 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
     cdef uintptr_t src
     cdef uint32_t cmp_type, cmd_seq, gpu_idx, status
     cdef uint32_t cmd_type, layer_idx, hbo, dbytes
+    cdef uint32_t err_cat
     cdef float top1, ent
     cdef bytes msg_b
     cdef int timed_out
@@ -512,10 +516,14 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
             (<volatile uint64_t*> (hdr + 64))[0] = cons + 1
             continue
         if cmp_type == _CMP_ERROR:
+            # error_category u32 at +16 (retryable-exhaustion dispatch
+            # matches on it — the 80-byte message can truncate keywords).
+            err_cat = (<uint32_t*> (src + 16))[0]
             msg_b = (<char*> (src + 20))[:80]
             (<volatile uint64_t*> (hdr + 64))[0] = cons + 1
             return ("err", cmd_seq,
-                    msg_b.split(b"\0")[0].decode("utf-8", "replace"))
+                    msg_b.split(b"\0")[0].decode("utf-8", "replace"),
+                    err_cat)
         gpu_idx = (<uint32_t*> (src + 8))[0]
         status = (<uint32_t*> (src + 12))[0]
         cmd_type = (<uint32_t*> (src + 16))[0]
