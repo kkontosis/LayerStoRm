@@ -44,9 +44,9 @@
 
 ## Tested configurations
 
-| Config | GPUs | Host RAM | Interconnect |
-|---|---|---|---|
-| **#1** | 2× RTX 5090 + 2× RTX 5080 | 512 GB (NUMA-placed) + 64 GB HBM | PCIe 5.0 |
+| Config | GPUs | Host RAM | Interconnect | Total VRAM |
+|---|---|---|---|---|
+| **#1** | 2× RTX 5090 + 2× RTX 5080 | 512 GB (NUMA-placed) + 64 GB HBM | PCIe 5.0 | 96 GB |
 
 ## Measured performance
 
@@ -84,12 +84,14 @@ cd LayerStoRm
 **Build:**
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
-  -Dpybind11_DIR="$(.venv/bin/python -m pybind11 --cmakedir)"
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-.venv/bin/python python/bridge/build_fastbridge.py   # optional Cython hot path (faster)
 ```
+
+CMake finds `nvcc`, the `.venv` interpreter and pybind11 on its own, and builds
+the Cython fast bridge as part of the normal build. Override any of them with
+`-DCMAKE_CUDA_COMPILER=…`, `-DPYTHON_EXECUTABLE=…`, `-Dpybind11_DIR=…` if you
+need to.
 
 **Get a model** (GGUF weights + the model's HF tokenizer/metadata files, downloaded **next to the weights** — the engine resolves the tokenizer, chat template and generation config from the weights directory first; repo `test-data/` is only a loudly-logged fallback):
 

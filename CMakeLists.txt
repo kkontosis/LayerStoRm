@@ -53,9 +53,13 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-# When building Python modules (shared libs), all linked code needs -fPIC.
-if(LAYERSTORM_BUILD_PYTHON)
-  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# The in-tree venv that scripts/setup.sh creates is the default interpreter, so
+# the documented build line needs no -DPYTHON_EXECUTABLE. An explicit value
+# (or an already-cached one) always wins.
+if(NOT PYTHON_EXECUTABLE AND EXISTS "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+  set(PYTHON_EXECUTABLE "${CMAKE_SOURCE_DIR}/.venv/bin/python"
+      CACHE FILEPATH "Python interpreter (defaulted to the in-tree .venv)")
+  message(STATUS "Python interpreter defaulted to: ${PYTHON_EXECUTABLE}")
 endif()
 
 # ── Options ───────────────────────────────────────────────────────────────────
@@ -63,6 +67,16 @@ option(LAYERSTORM_BUILD_TESTS      "Build unit/integration tests"   ON)
 option(LAYERSTORM_BUILD_PYTHON     "Build pybind11 Python module"   ON)
 option(LAYERSTORM_BUILD_BENCHMARKS "Build benchmark executables"    ON)
 option(LAYERSTORM_USE_NUMA         "Enable libnuma support"         ON)
+
+# When building Python modules (shared libs), all linked code needs -fPIC.
+# MUST come AFTER option(LAYERSTORM_BUILD_PYTHON) — testing the variable
+# before its option() is declared reads EMPTY on a clean configure, so PIC
+# was silently skipped and the .so link failed with "relocation R_X86_64_PC32
+# ... can not be used when making a shared object". A re-configure of an
+# existing build dir hid the bug: the option was already in the cache.
+if(LAYERSTORM_BUILD_PYTHON)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 # TD-NUMA-HBM-BANKS (#111): detect CPU-less HBM/device-memory NUMA nodes
 # (sysfs HMAT + libnuma) and expose them as loader-calibration banks with a
 # footprint capped to the node's free memory. Detection is read-only sysfs —
@@ -164,8 +178,62 @@ if(NOT spdlog_FOUND)
 endif()
 
 # ── Optional: pybind11 (only if building Python bindings) ────────────────────
+# pybind11 ships its own CMake package inside the Python environment, so a
+# bare find_package() cannot see a venv-local install. When pybind11_DIR was
+# not given, ask the interpreter we were pointed at — that is exactly what
+# `python -m pybind11 --cmakedir` reports — instead of making every caller
+# paste it on the command line.  An explicit -Dpybind11_DIR always wins.
 if(LAYERSTORM_BUILD_PYTHON)
+  if(NOT pybind11_DIR)
+    set(_ls_py "${PYTHON_EXECUTABLE}")
+    if(NOT _ls_py)
+      set(_ls_py "${Python_EXECUTABLE}")
+    endif()
+    if(NOT _ls_py AND EXISTS "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+      set(_ls_py "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+    endif()
+    if(NOT _ls_py AND EXISTS "${CMAKE_BINARY_DIR}/../.venv/bin/python")
+      set(_ls_py "${CMAKE_BINARY_DIR}/../.venv/bin/python")
+    endif()
+    if(_ls_py)
+      execute_process(
+        COMMAND "${_ls_py}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE _ls_pybind_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _ls_pybind_rc
+        ERROR_QUIET)
+      if(_ls_pybind_rc EQUAL 0 AND IS_DIRECTORY "${_ls_pybind_dir}")
+        set(pybind11_DIR "${_ls_pybind_dir}"
+            CACHE PATH "pybind11 CMake dir (autodetected from ${_ls_py})")
+        message(STATUS "pybind11 autodetected: ${pybind11_DIR}")
+      endif()
+    endif()
+  endif()
   find_package(pybind11 REQUIRED)
+endif()
+
+# ── Cython fast bridge (built by default with the Python bindings) ───────────
+# python/bridge/build_fastbridge.py compiles _fastbridge.pyx in place. The
+# bridge works without it (pure-ctypes fallback), but it removes the per-command
+# ctypes overhead on the ~320 ring round-trips of every decode step, so it is
+# part of the normal build rather than a step the README asks you to remember.
+# Skipped with a message when Cython is absent — never a hard build failure.
+if(LAYERSTORM_BUILD_PYTHON AND PYTHON_EXECUTABLE)
+  execute_process(
+    COMMAND "${PYTHON_EXECUTABLE}" -c "import Cython, setuptools"
+    RESULT_VARIABLE _ls_cython_rc ERROR_QUIET OUTPUT_QUIET)
+  if(_ls_cython_rc EQUAL 0)
+    add_custom_target(layerstorm_fastbridge ALL
+      COMMAND "${PYTHON_EXECUTABLE}"
+              "${CMAKE_SOURCE_DIR}/python/bridge/build_fastbridge.py"
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      COMMENT "Building Cython fast bridge (python/bridge/_fastbridge)"
+      VERBATIM)
+  else()
+    message(STATUS
+      "Cython fast bridge SKIPPED (no Cython/setuptools in ${PYTHON_EXECUTABLE}) "
+      "— the bridge falls back to pure ctypes; install cython setuptools to enable")
+  endif()
 endif()
 
 # ── Optional: GTest (only if building tests) ─────────────────────────────────
