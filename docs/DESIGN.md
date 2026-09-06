@@ -78,7 +78,7 @@ Only the C++ daemon touches CUDA, and it does so only while executing commands t
 
 **Signals cross the boundary as data, never control.** The daemon publishes state (residency bitmaps, expert statistics, cycle counters) under fine-grained seqlock transactions and yields periodically (`sched_yield` every 16 transactions) so the Python reader always finds even seqlock windows. Routing information rides in a sideband region, never inside completion structs.
 
-**Conflicts between subsystems are resolved by explicit contracts.** The spec's conflict analysis (spec/IMPLEMENTATION_GUIDE.md §0) governs interactions such as: speculation depth is capped by current expert residency (never speculate deeper than the verification can serve); every subsystem must tolerate variable active-expert counts (adaptive top-K); expert duplication across GPUs is optional caching and never duplicates compute (§6.5); layer-skipping backs off before expert reduction when quality calibration demands it.
+**Conflicts between subsystems are resolved by explicit contracts.** The project's conflict analysis (internal implementation guide §0, not shipped) governs interactions such as: speculation depth is capped by current expert residency (never speculate deeper than the verification can serve); every subsystem must tolerate variable active-expert counts (adaptive top-K); expert duplication across GPUs is optional caching and never duplicates compute (§6.5); layer-skipping backs off before expert reduction when quality calibration demands it.
 
 **No raw CUDA outside designated translation units.** All allocation, copies, streams and events go through the `DeviceBackend`/`AttentionDevice`/`ExpertDevice` interfaces; only concrete backend `.cpp`/`.cu` files may include CUDA headers. A build target (`layerstorm_no_cuda_check`) enforces this, which keeps every scheduling and policy component unit-testable on CPU — including the placement solver and the eviction policy.
 
@@ -292,7 +292,7 @@ Every module the orchestrator touches has a one-directional contract:
 
 The orchestrator's schedulable unit for expert work is **one full MoE layer**: a single `FETCH_AND_RUN_MOE` command carries the layer's entire routed expert list, and the daemon runs a self-contained state machine — lock the resident experts, start H2D for every missing one (placement chosen by the solver, §7), run the grouped FFN on the resident subset immediately, re-run as arrivals land, finalize with the deterministic EP combine and residual. Transfers are *not* decomposed into independently scheduled micro-transfers, and experts are atomic transfer units (the `SubComponent` readiness bits exist but the engine always marks all at once).
 
-The rationale is quantitative. At decode, one expert's transfer (~0.5–1.3 ms) exceeds its FFN compute by roughly three orders of magnitude (sub-µs GEMV per projection at batch 1). Splitting an expert's three projections into pipelined sub-transfers cannot create bandwidth — the total bytes and hence the total time are identical — and the compute overlapped is negligible; the project's analysis (spec/FINE_GRAINED_TRANSFER.md) rejected sub-expert pipelining on these grounds. What *does* matter is inter-expert and inter-layer overlap, and the layer-granular command gives the daemon exactly the visibility it needs for that: the full demand set up front (so the placement solver can balance the whole group across GPUs), plus freedom to start compute before the last transfer lands.
+The rationale is quantitative. At decode, one expert's transfer (~0.5–1.3 ms) exceeds its FFN compute by roughly three orders of magnitude (sub-µs GEMV per projection at batch 1). Splitting an expert's three projections into pipelined sub-transfers cannot create bandwidth — the total bytes and hence the total time are identical — and the compute overlapped is negligible; the project's analysis (internal design note, not shipped) rejected sub-expert pipelining on these grounds. What *does* matter is inter-expert and inter-layer overlap, and the layer-granular command gives the daemon exactly the visibility it needs for that: the full demand set up front (so the placement solver can balance the whole group across GPUs), plus freedom to start compute before the last transfer lands.
 
 Consequences elsewhere: the transfer pipeline optimizes for whole-expert DMAs at a fixed size (slot allocators, stride-aligned prepacked slots, per-expert dedup keys), and the placement solver's cost model (§7) is defined per layer over the layer's expert group — its makespan terms would be meaningless if the schedule interleaved fractional experts from many layers.
 
@@ -312,7 +312,7 @@ The naive placement is `gpu_idx = expert_idx % tp` — a fixed hash, blind to ca
 
 Formally: per layer, assign each of the `N` routed experts (N ≤ 8 for top-8 models) to one of `M` devices (2–4 GPUs, possibly a CPU expert device), given `B` NUMA banks holding the host copies — a variant of unrelated-machines makespan scheduling (`R||Cmax`) with additive assignment costs and a convex per-device eviction load. The decision variable is the assignment vector `j[1..N] → {1..M}`; `G_j` is the group on device `j`, `c_j = |G_j|`.
 
-### 7.2 The objective (spec/GPU_LOADER_MODEL.md is authoritative for this math)
+### 7.2 The objective (docs/I8_PLACEMENT_MODEL.md is authoritative for this math)
 
 ```
 T(j[·]) = prep + max(device_makespan, bank_egress) + recon
@@ -492,7 +492,7 @@ The deterministic offline simulator (§7.6) reproduces engine tok/s within ~2% f
 
 ## 11. Specified designs, not yet implemented
 
-The three designs below are **specified but absent from the current implementation** (their full specifications live in `spec/FUTURE.md` F9–F11). They are documented here at enabling depth because each completes an identified gap in the shipped system. Nothing in this section should be read as an existing feature.
+The three designs below are **specified but absent from the current implementation** (their full specifications live in the internal future-work spec, F9–F11). They are documented here at enabling depth because each completes an identified gap in the shipped system. Nothing in this section should be read as an existing feature.
 
 ### 11.1 Per-device kernel-strategy solver (F9)
 

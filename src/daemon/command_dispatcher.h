@@ -1185,7 +1185,8 @@ private:
     void handle_fetch_and_run_moe_big(const ipc::Command& cmd);
     /// Shared body of the two FETCH_AND_RUN handlers (`big` selects the
     /// TD-PREFILL-MOE-BIG extensions; the payloads are layout-compatible).
-    void handle_fetch_and_run_moe_impl(const ipc::Command& cmd, bool big);
+    void handle_fetch_and_run_moe_impl(const ipc::Command& cmd, bool big,
+                                       bool spec_verify = false);
     // E_CMD_REEF_ROUTE — REEF placement/eviction solve over the sideband
     // (dispatch_reef.cpp; CPU-only). E_CMD_FAR_FORWARD_LAYER — fused
     // attention + routed FETCH layer (same TU).
@@ -2241,6 +2242,13 @@ private:
         bool     big = false;
         int      chunk_tokens = 0;
 
+        // P-29 step 13 / P-32 stage 1: this MoE was synthesized by a
+        // spec_verify FAR command (R<=8 rows of ONE sequence, teacher-
+        // forced). The IPC payload carries no such bit — the flag rides
+        // the internal delegation only (handle_far_forward_layer →
+        // handle_fetch_and_run_moe_impl).
+        bool     spec_verify = false;
+
         // Expert tracking
         std::vector<ExpertRequest> experts;
 
@@ -2500,13 +2508,35 @@ private:
     bool far_prologue_preissue_enabled();
     uint32_t far_prologue_layer_ = 0xffffffffu;  // layer with live pre-issue
     uint32_t far_prologue_gpu_mask_ = 0;  // gpu positions primed (collapse+norm)
+    // P-32 stage 1: the primed collapse+norm covers exactly num_seqs rows —
+    // a consumer at a different row count must re-emit (rows past the primed
+    // set would silently skip their norm). 0 = nothing primed.
+    uint32_t far_prologue_num_seqs_ = 0;
     bool far_prologue_bcast_done_ = false;  // EP-XTP broadcast pre-issued
     bool preissue_far_moe_prologue(uint32_t layer_idx, uint32_t num_seqs,
                                    uint32_t gpu_idx);
     void clear_far_prologue() {
         far_prologue_layer_ = 0xffffffffu;
         far_prologue_gpu_mask_ = 0;
+        far_prologue_num_seqs_ = 0;
         far_prologue_bcast_done_ = false;
+    }
+    // P-32 stage 1 (LS_SPEC_VERIFY_FETCH_HIDE, default ON): extend the three
+    // B=1 fetch-hiding fast paths (prologue pre-issue, resident-overlap
+    // split, gated-final device barrier) to decode-shaped spec_verify
+    // commands at num_seqs<=8. Stage-0 measured verify's exposed expert H2D
+    // at 0.917 ms/layer vs 0.000 plain BECAUSE all three were num_seqs==1
+    // gated. Only ever consulted on spec_verify commands (speculation.method
+    // = mtp arms), so default boots are byte-identical either way; =0
+    // restores the phase-B exposed-H2D verify byte-identically.
+    int spec_verify_fetch_hide_enabled_ = -1;  // -1 unread, 0 off, 1 on
+    bool spec_verify_fetch_hide_enabled();
+    // Decode-shaped predicate the three fast paths share: plain B=1 decode,
+    // or a spec_verify R<=8 row block under LS_SPEC_VERIFY_FETCH_HIDE.
+    bool far_hide_shape(const ProgressiveMoeState& st) {
+        if (st.num_seqs == 1) return true;
+        return st.spec_verify && st.num_seqs <= 8
+               && spec_verify_fetch_hide_enabled();
     }
     uint64_t gated_final_engaged_ = 0;        // fetch layers device-gated
     uint64_t gated_final_fb_unissued_ = 0;    // wave split → host path

@@ -30,6 +30,7 @@ from cli.serve import (
     build_stack,
     derive_speculation,
     load_config,
+    main,
     resolve_options,
     resolve_tokenizer_dir,
 )
@@ -47,9 +48,27 @@ _TEST_CONFIG = str(
 
 class TestArgParsing:
 
-    def test_config_required(self):
-        with pytest.raises(SystemExit):
-            build_arg_parser().parse_args([])
+    def test_config_is_no_longer_argparse_required_but_main_refuses(self):
+        """P-31: --config stopped being argparse-required because
+        `--autoconfig --model <weights>` derives one.  The requirement did
+        not disappear, it MOVED: main() refuses (exit 2, logged) when
+        neither path is given, and refuses the autoconfig-only flags
+        without --autoconfig rather than ignoring them."""
+        args = build_arg_parser().parse_args([])
+        assert args.config == "" and args.model == ""
+        assert args.accuracy is None and args.prefer is None
+        assert main([]) == 2                                # neither path
+        assert main(["--model", "/w/m.gguf"]) == 2          # needs --autoconfig
+        assert main(["--config", "c.json", "--accuracy", "high"]) == 2
+        assert main(["--config", "c.json", "--prefer", "capacity"]) == 2
+
+    def test_autoconfig_levers_are_parsed(self):
+        args = build_arg_parser().parse_args([
+            "--autoconfig", "--model", "/w/m.gguf",
+            "--accuracy", "compact", "--prefer", "speed"])
+        assert (args.model, args.accuracy, args.prefer) == \
+            ("/w/m.gguf", "compact", "speed")
+        assert args.autoconfig is True
 
     def test_defaults(self):
         args = build_arg_parser().parse_args(["--config", "c.json"])

@@ -9,6 +9,35 @@ cmake_minimum_required(VERSION 3.25)
 # 120f everywhere without needing -DCMAKE_CUDA_ARCHITECTURES. (RTX 5090 = SM_120.)
 set(CMAKE_CUDA_ARCHITECTURES "120f")
 
+# CUDA compiler autodetect — must also run BEFORE project() enables CUDA.
+# When neither -DCMAKE_CUDA_COMPILER nor the CUDACXX env var names a
+# compiler, probe the standard locations (nvcc on PATH, then
+# /usr/local/cuda*/bin/nvcc) and report the pick; error with instructions
+# otherwise, instead of CMake's opaque "No CMAKE_CUDA_COMPILER could be
+# found". Explicit CUDACXX / -DCMAKE_CUDA_COMPILER always wins (see
+# docs/BUILDING.md, "If CUDA is not your system default").
+if(NOT CMAKE_CUDA_COMPILER AND "$ENV{CUDACXX}" STREQUAL "")
+  find_program(LAYERSTORM_NVCC nvcc)
+  if(NOT LAYERSTORM_NVCC)
+    file(GLOB _layerstorm_nvcc_candidates "/usr/local/cuda*/bin/nvcc")
+    if(_layerstorm_nvcc_candidates)
+      list(SORT _layerstorm_nvcc_candidates COMPARE NATURAL ORDER DESCENDING)
+      list(GET _layerstorm_nvcc_candidates 0 LAYERSTORM_NVCC)
+    endif()
+  endif()
+  if(LAYERSTORM_NVCC)
+    set(CMAKE_CUDA_COMPILER "${LAYERSTORM_NVCC}"
+        CACHE FILEPATH "CUDA compiler (autodetected; set CUDACXX or -DCMAKE_CUDA_COMPILER to override)")
+    message(STATUS "CUDA compiler autodetected: ${LAYERSTORM_NVCC}")
+  else()
+    message(FATAL_ERROR
+      "No CUDA compiler found: nvcc is not on PATH and no /usr/local/cuda*/bin/nvcc exists.\n"
+      "Install the CUDA Toolkit (>= 12.8) or point the build at one, e.g.\n"
+      "  export CUDACXX=/usr/local/cuda-13.1/bin/nvcc\n"
+      "See docs/BUILDING.md, section 'If CUDA is not your system default'.")
+  endif()
+endif()
+
 project(layerstorm LANGUAGES CXX CUDA)
 
 # ── Standards ─────────────────────────────────────────────────────────────────

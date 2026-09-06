@@ -440,12 +440,26 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     // there — no recompute — provided that result belongs to THIS step
     // (seqlen match). If no full layer has produced this step (degenerate
     // all-shared config), it falls through and recomputes as if full (always
-    // correct). The MTP layer (layer == num_hidden_layers ≥ mask size) is
-    // shared by construction — matching GLM-5.2's
+    // correct). The legacy MTP layer (layer == num_hidden_layers ≥ mask
+    // size) is shared by construction — matching GLM-5.2's
     // index_share_for_mtp_iteration=true.
-    const bool is_full = opts_.indexer_full_layers.empty()
-        || (layer < static_cast<int>(opts_.indexer_full_layers.size())
-            && opts_.indexer_full_layers[layer]);
+    //
+    // P-32 stage 0: a layer that COMPUTES its own indexer is NEVER shared,
+    // regardless of the per-hidden-layer full mask — the glm5_next MTP
+    // layer (45) sits past the 45-entry mask and used to fall into the
+    // shared branch: when its (seq,pos,epoch) step key collided with the
+    // trunk's row-0 key (probe/catch-up rows at the trunk position), it
+    // silently consumed the trunk layer-44 top-k with the WRONG weights'
+    // selection AND skipped its own indexer-K append below while
+    // stage_step had already advanced mtp_indexer_cov — permanent silent
+    // holes in the MTP indexer-K store that its own chain rows then
+    // scored over. computes_indexer(45) is true for glm5_next
+    // (model_config.cpp), so past-mask layers gate on the 46-entry
+    // computes mask. Scoped to past-mask layers ONLY: legacy layer 0 is
+    // computing-but-shared by design (computes = full ∪ {0}) and must
+    // keep its reuse branch byte-identically.
+    const bool is_full = indexer_reuse_layer_is_full(
+        opts_.indexer_full_layers, indexer_layer_computes_, layer);
     // Sparse requires DISPATCHER BLESSING: a nonzero step key proves the
     // coverage guard ran for this step (contiguous appends, pinned storage
     // mode). Without it — non-dispatcher callers, or any path that skipped
@@ -1252,9 +1266,12 @@ bool DcpExecutor::produce_sparse_indices_prefill(
     // step key; otherwise it falls through and recomputes as if full (only
     // possible when it owns storage — layer 0; a storage-less shared layer
     // fails the resolution below → that layer's chunk stays dense).
-    const bool is_full = opts_.indexer_full_layers.empty()
-        || (layer < static_cast<int>(opts_.indexer_full_layers.size())
-            && opts_.indexer_full_layers[layer]);
+    // P-32 stage 0: past-mask computing layers are never shared (twin of
+    // the decode producer's gate — the glm5_next MTP layer owns its own
+    // indexer and must compute + append, not reuse the trunk selection;
+    // legacy layer 0 keeps its in-mask shared branch byte-identically).
+    const bool is_full = indexer_reuse_layer_is_full(
+        opts_.indexer_full_layers, indexer_layer_computes_, layer);
     const uint64_t step_key = params.indexer_step_key;
     // TD-PREFILL-SUPERCHUNK: reuse keys + persistent top-k rows are per
     // ROW-RANGE — sub-chunk k of a superchunk owns rows

@@ -1,7 +1,7 @@
 # Development
 
 Environment setup (venv before CMake, Node.js, non-default CUDA) is covered in
-the README's [Building](README.md#building) section. This file assumes it is
+[docs/BUILDING.md](docs/BUILDING.md) (or `./scripts/setup.sh`). This file assumes it is
 done.
 
 ## Build

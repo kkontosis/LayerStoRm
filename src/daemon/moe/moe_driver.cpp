@@ -440,6 +440,7 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // ranks only), or outside the pre-issued layer.
     const bool prologue_primed = !mp.prime_cpu_input_only
         && far_prologue_layer_ == mp.layer_idx
+        && far_prologue_num_seqs_ == mp.num_seqs
         && gpu < 32
         && ((far_prologue_gpu_mask_ >> (gpu & 31)) & 1u) != 0;
 

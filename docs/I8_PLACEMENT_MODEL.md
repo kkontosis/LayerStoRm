@@ -1,7 +1,7 @@
 # The I8 placement model
 
 The cost model the expert-placement solver minimizes, in full. Original work;
-the summary equation lives in the [README](../README.md#the-i8-placement-model).
+the summary equation lives in [INTERNALS.md](INTERNALS.md#the-i8-placement-model-ours).
 
 
 Every MoE layer poses the same question: the router picked `N` experts, some

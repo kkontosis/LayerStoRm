@@ -109,9 +109,16 @@ ENGINE_CONSTRAINTS: tuple[ConstraintRow, ...] = (
             "now escalates to ON for CAPACITY when the untiered pool "
             "cannot hold the conc x max_seq ask (conc-ask-exceeds-"
             "untiered-pool; INV-KVT-16 windowed admission) — exactly the "
-            ">=256k regime this row deferred. Delete this row and the "
-            "solver weighs tiering by bytes again with no escalation "
-            "machinery in the way."),
+            ">=256k regime this row deferred. THE PRICE IS NOW MEASURED "
+            "(P-31 step 1, first live glm5_next+kv_tiering boot, 1M/conc2 "
+            "derived recipe, single legs): decode 8k repeat 24.44-24.59 "
+            "vs the untiered champion's 27.0-27.4 (~-10%), 24k repeat "
+            "22.9-23.1 vs ~26.5-27.2 (~-13%), fresh prefill 159.0 tok/s "
+            "@27k/S=2048 vs 189 untiered@S=2048 (~-16%) — the escalation "
+            "buys 2x1M admissibility at that cost, which is why OFF stays "
+            "the default wherever the untiered pool affords the ask. "
+            "Delete this row and the solver weighs tiering by bytes again "
+            "with no escalation machinery in the way."),
         ticket="",
         scope="glm5_next",
         site="spec/SPEC_UPDATES.md:668 (GF3.9, 2026-08-30)",

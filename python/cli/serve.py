@@ -636,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"serving.max_concurrent_requests={args.max_concurrent}")
         autoconfig_pins = parse_pin_args(pin_args)
 
+    derived_this_boot = False
     if args.autoconfig and args.model and not args.config:
         # derive-from-weights route: CPU-only, artifacts beside the
         # weights reused; the derived recipe is then served like any
@@ -652,9 +653,10 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("autoconfig: derived %s from --model %s — serving it",
                     out, args.model)
         args.config = out
-        args.autoconfig = False   # derivation done; do not re-derive below
-                                  # (a pin-less re-derive would clobber the
-                                  # pinned recipe)
+        args.autoconfig = False
+        derived_this_boot = True  # derivation done; the enabled-in-config
+                                  # branch below must not run a redundant
+                                  # second derivation this boot
 
     try:
         config = load_config(args.config)
@@ -675,7 +677,8 @@ def main(argv: list[str] | None = None) -> int:
     # the --config file (a derived recipe refreshing itself). Booting a
     # file other than the one on the command line silently invalidated
     # A/B bisect arms.
-    if args.autoconfig or (config.get("autoconfig") or {}).get("enabled"):
+    if (args.autoconfig or (config.get("autoconfig") or {}).get("enabled")) \
+            and not derived_this_boot:
         from autoconfig.cli import default_output_path, run as autoconfig_run
         out = ((config.get("autoconfig") or {}).get("output_path")
                or default_output_path(args.config))

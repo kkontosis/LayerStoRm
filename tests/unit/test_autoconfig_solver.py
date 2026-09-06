@@ -545,11 +545,26 @@ class TestPreferenceKnob:
         assert "~8-9% of served prefill" in e.because
         assert "local-indexer-prefill-cost" in e.refs
 
-    def test_capacity_spends_the_priced_option_to_protect_the_ask(self, tmp_path):
-        """The mirror image, on the arch that carries a second priced axis:
-        `balanced` sheds concurrency at TP=1 rather than pay for TP; with
-        prefer=capacity the box buys TP=2 (~0.5-2% of the decode wall) and
-        keeps the user's 2 x 204800."""
+    def test_tiering_escalation_preserves_the_ask_under_every_preference(
+            self, tmp_path):
+        """RETIRED SCENARIO, replaced in place (P-31 step 1).
+
+        This test used to pin the mirror image of the one above: on this
+        glm5_next box `balanced`/`speed` shed concurrency at TP=1 while
+        `capacity` bought TP=2 (~0.5-2% of the decode wall) to keep the
+        whole 2 x 204800 ask.  That untiered "fit" was a LIE the engine
+        would have refused at admission time — the untiered kMain pool
+        held ONE max-length request's whole-life demand, not TWO
+        (`conc-ask-exceeds-untiered-pool`, §2.2's own definition of the
+        ask).  With the conc-admission check in place the box needs a
+        capacity lever here, and the THIRD E1 axis (KV tiering, P-31 gap
+        2, INV-KVT-16 windowed admission) rescues the ask BEFORE any TP is
+        bought — so every preference converges on the same recipe and the
+        knob has nothing to differentiate.  Preference differentiation is
+        still pinned by the GLM-5.2 indexer-price test above; what this
+        one now pins is that the escalation is preference-INDEPENDENT (the
+        never-refuse property, on the new axis) and that it KEEPS the ask
+        whole instead of degrading it."""
         if not os.path.exists(GLM5NEXT_CONFIG):
             pytest.skip("glm5_next reference config absent")
         with open(GLM5NEXT_CONFIG) as f:
@@ -558,34 +573,34 @@ class TestPreferenceKnob:
         for i, p in enumerate(PREFERENCES):
             proc, sysd = build_fake_tree(str(tmp_path / f"cap{i}"))
             hw = detect_hardware(proc_root=proc, sys_root=sysd)
+            # 24 GiB of non-expert pinned weight: the untiered pool no
+            # longer holds 2 x 204800 (at 22 it still does and tiering
+            # stays off; at 25 nothing holds the ask and the ladder sheds)
             sv = Solver(hw, shape, {"model": shape.raw},
                         Levers(0.02, 409600, p), expert_slot_bytes=SLOT_BYTES,
-                        non_expert_pinned_bytes=25 * (1 << 30))
+                        non_expert_pinned_bytes=24 * (1 << 30))
             out[p] = sv.solve()
-        for p in ("balanced", "speed"):
-            assert out[p].recipe["parallelism"]["tensor_parallelism"] == 1
-            assert out[p].recipe["serving"]["max_concurrent_requests"] == 1
-            # 204800 (the full per-request ask): turboquant_mla's 258 B
-            # NoPE rows (vs snapmla's 516 B, 2.0x) buy the whole context —
-            # under the deleted `glm5next-tq-backend-unwired` snapmla era
-            # this was 102400.  The BEHAVIOUR under test is the ordering,
-            # not the number — hence the assertion below reads it back.
-            assert out[p].recipe["serving"]["max_sequence_length"] == 204800
-            assert out[p].degradations
-        cap = out["capacity"]
-        assert cap.recipe["parallelism"]["tensor_parallelism"] == 2
-        assert cap.recipe["serving"]["max_concurrent_requests"] == 2
-        assert cap.recipe["serving"]["max_sequence_length"] == 204800
-        assert cap.degradations == []
-        e = cap.explanations.get("autoconfig.prefer")
-        assert e is not None and e.value == "capacity"
-        assert "spends every priced slowdown before it touches" in e.because
-        assert "escalated to TP=2 early because prefer=capacity" in e.because
-        assert "~0.5-2% of the decode wall" in e.because
-        assert "glm5next-tp1-default" in e.refs
-        # and it says what balanced would have served instead
-        bal = out["balanced"].recipe["serving"]["max_sequence_length"]
-        assert f"where `balanced` serves 1 x {bal}" in e.because
+        for p, res in out.items():
+            r = res.recipe
+            # the ask is KEPT WHOLE — no TP bought, no concurrency shed,
+            # no context halved
+            assert r["parallelism"]["tensor_parallelism"] == 1, p
+            assert r["serving"]["max_concurrent_requests"] == 2, p
+            assert r["serving"]["max_sequence_length"] == 204800, p
+            assert res.degradations == [], p
+            assert r["memory"]["kv_tiering"]["enabled"] is True, p
+            assert r["memory"]["kv_tiering"]["tiered_prefill"] is True, p
+            e = res.explanations.get("memory.kv_tiering.enabled")
+            assert e is not None and e.kind == "searched", p
+            assert "ESCALATED from the measured glm5_next OFF default " \
+                   "for CAPACITY" in e.because, p
+            assert "INV-KVT-16" in e.refs, p
+            assert "glm5next-tiering-default-off" in e.refs, p
+            # all three preferences converge, so the lever stays SILENT
+            assert res.explanations.get("autoconfig.prefer") is None, p
+        recipes = [json.dumps(res.recipe, sort_keys=True)
+                   for res in out.values()]
+        assert len(set(recipes)) == 1
 
     # ---- the explanation contract -----------------------------------------
 
@@ -699,48 +714,64 @@ class TestGlm5NextTensorParallel:
 
 @pytest.mark.skipif(not os.path.exists(GLM5NEXT_CONFIG),
                     reason="glm5_next reference config absent")
-class TestGlm5NextAttentionBackendIsTurboquant:
-    """TD-GLM5-TQ-BACKEND-UNWIRED RESOLVED (2026-09-01): glm5_next serves
-    turboquant_mla end-to-end (tp=1 live verification + GLM53_TQ=1 golden
-    arm), so the temporary `glm5next-tq-backend-unwired` engine-gate row is
-    DELETED and the derivation is back on the family template.  The earlier
-    "TQ generates worse" evidence was the EP4 combine defect
-    (TD-GLM53-EP4-DEGENERATE-GENERATION), not TQ.  The row-lookup MECHANISM
-    in Solver.attention_backend() stays: re-introducing an engine-gate row
-    with that id must flip the derivation back to snapmla (the data-flip
-    direction is pinned below, the TD-KVT-LOCAL-INDEXER-UNBLOCK pattern)."""
+class TestGlm5NextAttentionBackendIsSnapmla:
+    """THE CHAMPION SWITCHED (P-29 step 14, 2026-09-05): on the fixed
+    post-OQ-8 binary snapmla+FP8-decode beats turboquant_mla+split-KV on
+    BOTH axes at the 8k anchor — 24.10/24.21/24.04 vs 23.67/23.80/23.74
+    tok/s repeat medians AND TF-NLL 1.7897 vs 1.8016 (-0.0118 +- 0.0060
+    nats) — so the pre-committed OQ-6/OQ-7 decision rule made snapmla the
+    family template (P-31 step 1 sync).  turboquant_mla stays SERVEABLE
+    (verified live tp=1, TD-GLM5-TQ-BACKEND-UNWIRED resolved) and is the
+    `compact` accuracy tier: at the NoPE geometry its rows cost half
+    (258 vs 516 B/row), which buys context when KV bytes bind.
 
-    def _solver(self, tmp_path, name="tqbox"):
+    The row-lookup MECHANISM in Solver.attention_backend() stays: an
+    engine-gate row with the `glm5next-tq-backend-unwired` id takes TQ off
+    the MENU (it can no longer move the standard derivation, which already
+    IS snapmla — what it moves is `compact`).  That direction is pinned
+    below, the TD-KVT-LOCAL-INDEXER-UNBLOCK pattern."""
+
+    def _solver(self, tmp_path, name="tqbox", accuracy="standard"):
         with open(GLM5NEXT_CONFIG) as f:
             shape = ModelShape.from_model_section(json.load(f)["model"])
         proc, sysd = build_fake_tree(str(tmp_path / name))
         hw = detect_hardware(proc_root=proc, sys_root=sysd)
-        return Solver(hw, shape, {"model": shape.raw}, Levers(0.02, 51200),
+        return Solver(hw, shape, {"model": shape.raw},
+                      Levers(0.02, 51200, "balanced", accuracy),
                       expert_slot_bytes=SLOT_BYTES,
                       non_expert_pinned_bytes=10 * (1 << 30))
 
-    def test_derives_turboquant_with_this_geometry_byte_argument(self, tmp_path):
+    def test_derives_snapmla_with_the_measured_champion_switch(self, tmp_path):
         sv = self._solver(tmp_path)
         res = sv.solve()
-        assert res.recipe["compute"]["attention_backend"] == "turboquant_mla"
+        assert res.recipe["compute"]["attention_backend"] == "snapmla"
         e = sv.ex.get("compute.attention_backend")
         assert e.kind == "measured"
-        # glm5_next NoPE geometry: 258 vs 516 B/row (2.0x) — the numbers are
+        # the champion A/B is quoted on BOTH axes, not asserted
+        assert "24.10" in e.because
+        assert "1.7897" in e.because and "1.8016" in e.because
+        assert any("mla-tq-vs-snapmla-accuracy" in r for r in e.refs)
+        assert any("glm53_flash" in r for r in e.refs)
+        # glm5_next NoPE geometry: 516 vs 258 B/row (2.0x) — the numbers are
         # COMPUTED from the shape, never quoted from GLM-5.2's 386/644 row
-        assert "258 B" in e.because
         assert "516 B" in e.because
+        assert "258 B" in e.because
         assert "386" not in e.because
-        assert any("TD-GLM5-TQ-BACKEND-UNWIRED" in r for r in e.refs)
 
     def test_the_whole_byte_model_follows_the_served_backend(self, tmp_path):
         sv = self._solver(tmp_path)
-        assert sv.attention_backend() == "turboquant_mla"
+        assert sv.attention_backend() == "snapmla"
 
-    def test_reintroducing_the_gate_row_moves_the_derivation_back(
+    def test_reintroducing_the_gate_row_takes_tq_off_every_tier(
             self, tmp_path, monkeypatch):
-        # The registry stays DATA: if TQ regresses, adding the engine-gate
-        # row back (same id) must flip glm5_next to snapmla with no code
-        # change — and the explain sheet must say TEMPORARY again.
+        # The registry stays DATA. The gate row can no longer "move the
+        # derivation back" — `standard` already IS snapmla — so what it
+        # pins now is the MENU: with the row present even `compact`, the
+        # tier whose whole job is to floor at the KV-cheap end, lands on
+        # snapmla; without it, compact derives turboquant_mla.
+        cold = self._solver(tmp_path, name="tqcompact", accuracy="compact")
+        assert cold.solve().recipe["compute"]["attention_backend"] \
+            == "turboquant_mla"
         row = ec.ConstraintRow(
             id="glm5next-tq-backend-unwired",
             kind="engine_gate",
@@ -751,14 +782,14 @@ class TestGlm5NextAttentionBackendIsTurboquant:
             site="test reintroduction")
         monkeypatch.setattr(ec, "ENGINE_CONSTRAINTS",
                             ec.ENGINE_CONSTRAINTS + (row,))
-        sv = self._solver(tmp_path, name="tqbox2")
-        res = sv.solve()
-        assert res.recipe["compute"]["attention_backend"] == "snapmla"
-        e = sv.ex.get("compute.attention_backend")
-        assert e.kind == "template"
-        assert "glm5next-tq-backend-unwired" in e.refs
-        # and the byte model follows the gate, not the template
-        assert sv.attention_backend() == "snapmla"
+        for tier in ("standard", "compact"):
+            sv = self._solver(tmp_path, name="tqbox2" + tier, accuracy=tier)
+            res = sv.solve()
+            assert res.recipe["compute"]["attention_backend"] == "snapmla", tier
+            # and the byte model follows the menu, not the tier
+            assert sv.attention_backend() == "snapmla", tier
+            # a tier that cannot change an outcome stays silent
+            assert res.explanations.get("autoconfig.accuracy") is None, tier
 
     def test_the_row_is_gone(self):
         # the resolved ticket retired its row IN THE SLICE THAT RESOLVED IT
@@ -987,42 +1018,60 @@ class TestAccuracyLever:
 
     @pytest.mark.skipif(not os.path.exists(GLM5NEXT_CONFIG),
                         reason="glm5_next reference config absent")
-    def test_high_floors_glm5next_at_snapmla_and_names_both_prices(
+    def test_compact_floors_glm5next_at_turboquant_and_names_both_prices(
             self, tmp_path):
-        """accuracy=high on glm5_next: the backend moves to the all-FP8
-        KV path and BOTH sides of the trade are named — the measured
-        accuracy basis (registry row) and the computed 258->516 B/row
-        capacity price."""
-        sv = self._glm5(tmp_path, Levers(0.02, 51200, "balanced", "high"))
+        """Since the P-29 step-14 champion switch the family template IS
+        the accurate end (snapmla), so the tier that still MOVES the
+        backend on glm5_next is `compact`: it floors at the 4-bit codec
+        and BOTH sides of the trade are named — the measured accuracy
+        basis (registry row) and the computed 516->258 B/row capacity
+        gain.  `high` now equals `standard` and must therefore be
+        SILENT."""
+        sv = self._glm5(tmp_path, Levers(0.02, 51200, "balanced", "compact"))
         res = sv.solve()
-        assert res.recipe["compute"]["attention_backend"] == "snapmla"
+        assert res.recipe["compute"]["attention_backend"] == "turboquant_mla"
         e = res.explanations.get("compute.attention_backend")
         assert e is not None and e.kind == "measured"
-        assert "accuracy=high" in e.because
+        assert "accuracy=compact" in e.because
         assert "516 B/row" in e.because and "258 B/row" in e.because
         assert any("mla-tq-vs-snapmla-accuracy" in r for r in e.refs)
         a = res.explanations.get("autoconfig.accuracy")
-        assert a is not None and a.value == "high"
-        assert "`turboquant_mla` -> `snapmla`" in a.because
+        assert a is not None and a.value == "compact"
+        assert "`snapmla` -> `turboquant_mla`" in a.because
         assert "never a weight" in a.because
+        # the tier that no longer changes anything says nothing
+        hi = self._glm5(tmp_path / "hi",
+                        Levers(0.02, 51200, "balanced", "high")).solve()
+        assert hi.recipe["compute"]["attention_backend"] == "snapmla"
+        assert hi.explanations.get("autoconfig.accuracy") is None
+        assert "autoconfig.accuracy" not in hi.explanations.render_markdown()
 
     @pytest.mark.skipif(not os.path.exists(GLM5NEXT_CONFIG),
                         reason="glm5_next reference config absent")
-    def test_high_pays_its_capacity_price_through_the_ordinary_fit(
+    def test_compact_buys_its_context_back_through_the_ordinary_fit(
             self, tmp_path):
-        """The 2.0x KV rows halve what the same ask serves: the standard
-        tier's 409600-token ask serves 1 x 204800 under TQ (the
-        TD-GLM5-TQ-BACKEND-UNWIRED capacity fixture); accuracy=high pays
-        for snapmla rows with exactly half the context — through the
-        NORMAL E1 degradation ladder, not through any accuracy-specific
-        arithmetic."""
-        std = self._glm5(tmp_path / "s", Levers(0.02, 409600)).solve()
-        assert std.recipe["serving"]["max_sequence_length"] == 204800
-        hi = self._glm5(tmp_path / "h",
-                        Levers(0.02, 409600, "balanced", "high")).solve()
-        assert hi.recipe["compute"]["attention_backend"] == "snapmla"
-        assert hi.recipe["serving"]["max_sequence_length"] == 102400
-        assert hi.degradations
+        """The 2.0x KV rows are now the DEFAULT cost: on this box the
+        standard tier's snapmla rows (516 B) cannot hold the 2 x 409600
+        ask and the ordinary E1 ladder sheds it down to 1 x 102400;
+        accuracy=compact's turboquant_mla rows (258 B) keep the ask
+        whole.  The direction is what matters (compact >= standard
+        context) and it flows through the NORMAL degradation ladder, not
+        through any accuracy-specific arithmetic."""
+        std = self._glm5(tmp_path / "s", Levers(0.02, 819200)).solve()
+        assert std.recipe["compute"]["attention_backend"] == "snapmla"
+        assert std.recipe["serving"]["max_concurrent_requests"] == 1
+        assert std.recipe["serving"]["max_sequence_length"] == 102400
+        assert std.degradations
+        cmp_ = self._glm5(tmp_path / "c",
+                          Levers(0.02, 819200, "balanced", "compact")).solve()
+        assert cmp_.recipe["compute"]["attention_backend"] == "turboquant_mla"
+        assert cmp_.recipe["serving"]["max_concurrent_requests"] == 2
+        assert cmp_.recipe["serving"]["max_sequence_length"] == 409600
+        assert cmp_.degradations == []
+        assert (cmp_.recipe["serving"]["max_concurrent_requests"]
+                * cmp_.recipe["serving"]["max_sequence_length"]
+                > std.recipe["serving"]["max_concurrent_requests"]
+                * std.recipe["serving"]["max_sequence_length"])
 
     def test_compact_is_silent_where_it_changes_nothing(self, tmp_path,
                                                         champion):
@@ -1091,7 +1140,7 @@ class TestAccuracyLever:
         leaves the MENU: every tier lands on snapmla and the lever goes
         silent (no tier can change an outcome the menu no longer offers).
         The pre-lever data-flip test (TestGlm5NextAttentionBackendIs-
-        Turboquant) still pins the standard tier's direction."""
+        Snapmla) still pins the standard tier's direction."""
         row = ec.ConstraintRow(
             id="glm5next-tq-backend-unwired", kind="engine_gate",
             scope="glm5_next", statement="test reintroduction", ticket="T")
@@ -1111,13 +1160,16 @@ class TestAccuracyLever:
         """The delete-a-row property stays meaningful: without the measured
         accuracy row the tier still floors (the precision ordering is
         structural) but the explain HONESTLY downgrades to heuristic and
-        says the trade is unpriced."""
+        says the trade is unpriced.  Read on `compact` — since the P-29
+        step-14 champion switch that is the tier that still MOVES the
+        glm5_next backend."""
         monkeypatch.setattr(ec, "ENGINE_CONSTRAINTS",
                             tuple(r for r in ec.ENGINE_CONSTRAINTS
                                   if r.id != "mla-tq-vs-snapmla-accuracy"))
-        sv = self._glm5(tmp_path, Levers(0.02, 51200, "balanced", "high"))
+        sv = self._glm5(tmp_path, Levers(0.02, 51200, "balanced", "compact"))
         res = sv.solve()
-        assert res.recipe["compute"]["attention_backend"] == "snapmla"
+        # the FLOOR stands (structural per-element precision ordering)
+        assert res.recipe["compute"]["attention_backend"] == "turboquant_mla"
         e = res.explanations.get("compute.attention_backend")
         assert e is not None and e.kind == "heuristic"
         assert "unpriced" in e.because
@@ -1433,14 +1485,30 @@ class TestPinnedConstraints:
             self, tmp_path):
         """On this glm5 box the unpinned ladder drops the draft FIRST and
         keeps the ask whole. Pinning dspark removes that axis: the draft
-        SURVIVES and the fit sheds the ask instead."""
-        res0 = self._glm5_draft(tmp_path / "u", 2097152, 14).solve()
+        SURVIVES and the fit sheds the ask instead.
+
+        P-31: memory.kv_tiering.enabled=false is pinned in BOTH arms.  KV
+        tiering became an E1 axis (gap 2) and it is tried BEFORE the draft
+        is shed, so with the axis live this box keeps draft AND ask (the
+        assertion below the pin proves it) and there is no draft-vs-
+        capacity trade left to test.  Collapsing the axis restores the
+        two-lever world this contract is about; the escalation itself is
+        pinned by TestConcAdmissionEscalation."""
+        rescued = self._glm5_draft(tmp_path / "r", 409600, 15).solve()
+        assert rescued.recipe["speculation"]["method"] == "dspark" \
+            and rescued.degradations == [], \
+            "setup: with the tiering axis live the box keeps draft AND ask"
+        off = {"memory.kv_tiering.enabled": False}
+        res0 = _with_pins(self._glm5_draft(tmp_path / "u", 409600, 15),
+                          dict(off)).solve()
         assert any("draft dropped" in d for d in res0.degradations), \
             "setup: the unpinned ladder must be the draft-dropping one"
-        sv = _with_pins(self._glm5_draft(tmp_path / "p", 2097152, 14),
-                        {"speculation.method": "dspark"})
+        assert res0.recipe["serving"]["max_concurrent_requests"] == 2
+        sv = _with_pins(self._glm5_draft(tmp_path / "p", 409600, 15),
+                        dict(off, **{"speculation.method": "dspark"}))
         res = sv.solve()
         assert res.recipe["speculation"]["method"] == "dspark"
+        assert res.recipe["memory"]["kv_tiering"]["enabled"] is False
         assert any("concurrency" in d for d in res.degradations)
         assert not any("draft dropped" in d for d in res.degradations)
 
@@ -1477,15 +1545,23 @@ class TestPinnedConstraints:
         """A glm5 shape where the reduce branch genuinely fires: no prefix
         entries (the state pool share stops over-provisioning the pool
         against one request) and a 2 x 1M ask (probe-verified: unpinned,
-        this reduces max_seq at the DEFAULT speculation fraction)."""
+        this reduces max_seq at the DEFAULT speculation fraction).
+
+        P-31: the reduce loop and its pinned refusal live on the UNTIERED
+        path — tiering (INV-KVT-16 windowed admission) moves whole-life
+        residency off the device pool, which is exactly what the
+        single-request admissibility ceiling measures, so with the axis
+        live the 2 x 1M ask simply escalates and never reaches the
+        ceiling.  The tiering pin collapses that axis in BOTH arms."""
         with open(GLM5NEXT_CONFIG) as f:
             shape = ModelShape.from_model_section(json.load(f)["model"])
         proc, sysd = build_fake_tree(str(tmp_path / name))
         hw = detect_hardware(proc_root=proc, sys_root=sysd)
-        return Solver(hw, shape, {"model": shape.raw}, Levers(0.02, 2097152),
-                      AutoconfigKnobs(prefix_cache_max_entries=0),
-                      expert_slot_bytes=SLOT_BYTES,
-                      non_expert_pinned_bytes=22 * (1 << 30))
+        sv = Solver(hw, shape, {"model": shape.raw}, Levers(0.02, 2097152),
+                    AutoconfigKnobs(prefix_cache_max_entries=0),
+                    expert_slot_bytes=SLOT_BYTES,
+                    non_expert_pinned_bytes=18 * (1 << 30))
+        return _with_pins(sv, {"memory.kv_tiering.enabled": False})
 
     def test_pinned_max_seq_refuses_at_the_admissibility_ceiling(
             self, tmp_path):
@@ -1494,8 +1570,9 @@ class TestPinnedConstraints:
         res = self._glm5_adm(tmp_path, "u").solve()
         assert any("admissibility ceiling" in d for d in res.degradations), \
             "setup must reach the reduce branch"
-        sv = _with_pins(self._glm5_adm(tmp_path, "p"),
-                        {"serving.max_sequence_length": 1048576})
+        sv = self._glm5_adm(tmp_path, "p")
+        sv.pins = _pins({"memory.kv_tiering.enabled": False,
+                         "serving.max_sequence_length": 1048576})
         with pytest.raises(Infeasible) as ei:
             sv.solve()
         assert ei.value.constraint_id == "pinned-max-seq-not-admissible"
@@ -1546,13 +1623,32 @@ class TestEmittedFieldHygiene:
             e = res.explanations.get(f"serving.{key}")
             assert e is not None and e.kind == "template", key
             assert "TD-AUTOCONFIG-NO-SERVING-SURFACE" in e.refs
-        # the GF3.15 superchunk win, requested (the engine derives the
-        # effective capacity elastically)
-        assert r["compute"]["prefill_superchunk_tokens"] == 512
+        # the GF3.15 superchunk win is no longer a copied 512: P-31 gap 1
+        # DERIVES the largest stride that fits the engine's own per-device-
+        # class MoE-big fit arithmetic (TD-AUTOCONFIG-STRIDE-NOT-DERIVED)
+        assert r["compute"]["prefill_superchunk_tokens"] == 2048
         e = res.explanations.get("compute.prefill_superchunk_tokens")
-        assert e is not None and e.kind == "template"
-        assert "35.9" in e.because and "38.1" in e.because
-        # the GF3 schedule width, with a row
+        assert e is not None and e.kind == "searched"
+        assert "TD-AUTOCONFIG-STRIDE-NOT-DERIVED" in e.refs
+        assert "max-stride-that-fits" in e.because
+        # this box has expert hosts beyond the TP group (EP), where the
+        # orchestrator clamps the served stride to the moe_big knob: the
+        # two must move together or the emitted stride is inert
+        assert r["compute"]["moe_big_chunk_tokens"] == 2048
+        e = res.explanations.get("compute.moe_big_chunk_tokens")
+        assert e is not None and e.kind == "closed_form"
+        assert "TD-MOE-EP-XTP-WAVES" in e.refs
+        # the attention-host fit headroom is emitted ONLY when the derived
+        # value exceeds the engine's 1024 MiB default; at this (25600-token)
+        # ask the post-check allocations still fit it, so the field must be
+        # ABSENT rather than restate a default (the hygiene contract).  The
+        # long-context arm that DOES raise it is pinned in
+        # tests/unit/test_autoconfig_longctx.py
+        assert "moe_big_fit_headroom_mb" not in r["compute"]
+        assert res.explanations.get("compute.moe_big_fit_headroom_mb") is None
+        # the GF3 schedule width, with a row: the family template's 512
+        # stands here because its dev_block_tables fit the budget at this
+        # max_sequence_length (the 1M reduction is pinned in the longctx file)
         assert r["orchestrator"]["max_batch_size"] == 512
         e = res.explanations.get("orchestrator.max_batch_size")
         assert e is not None and e.kind == "template"

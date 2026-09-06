@@ -221,7 +221,7 @@ class ModelObject(BaseModel):
     id: str
     object: str = "model"
     created: int = 0
-    owned_by: str = "layerstorm"
+    owned_by: str = "LayerStoRm"
 
 
 class ModelList(BaseModel):

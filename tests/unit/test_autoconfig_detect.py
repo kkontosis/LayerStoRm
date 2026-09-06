@@ -467,7 +467,9 @@ class TestEngineConstraints:
 # ------------------------------------------------------------- gguf meta
 
 def _gguf_kv(f, key, value):
-    """One metadata KV. Types: str(8), u32(4), f32(6), bool(7), i32(5)."""
+    """One metadata KV. Types: str(8), u32(4), f32(6), bool(7), i32(5),
+    array(9) of u32 or f32 (a float element anywhere makes it an f32
+    array — glm5next publishes swiglu_clamp_exp that way)."""
     kb = key.encode()
     f.write(struct.pack("<Q", len(kb)))
     f.write(kb)
@@ -485,12 +487,14 @@ def _gguf_kv(f, key, value):
         f.write(struct.pack("<I", 8))
         f.write(struct.pack("<Q", len(vb)))
         f.write(vb)
-    elif isinstance(value, list):   # array of u32
+    elif isinstance(value, list):   # array of u32 (or f32)
+        floats = any(isinstance(v, float) for v in value)
         f.write(struct.pack("<I", 9))
-        f.write(struct.pack("<I", 4))
+        f.write(struct.pack("<I", 6 if floats else 4))
         f.write(struct.pack("<Q", len(value)))
         for v in value:
-            f.write(struct.pack("<I", int(v)))
+            f.write(struct.pack("<f", float(v)) if floats
+                    else struct.pack("<I", int(v)))
     else:
         raise TypeError(type(value))
 

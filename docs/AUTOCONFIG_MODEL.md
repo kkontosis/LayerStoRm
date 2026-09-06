@@ -1,8 +1,110 @@
 # AUTOCONFIG — hardware-fit config derivation (TD-AUTOCONFIG-HARDWARE-FIT)
 
-Write the objective down, then solve it (prior art: docs/I8_PLACEMENT_MODEL.md,
-spec/GPU_LOADER_MODEL.md). The code in `python/autoconfig/` is a transcription
+Write the objective down, then solve it (prior art:
+docs/I8_PLACEMENT_MODEL.md). The code in `python/autoconfig/` is a transcription
 of this document; code comments cite sections back here as `AUTOCONFIG §n`.
+
+## 0. The single call (P-31, boot-verified 2026-09-06)
+
+Autoconfig's production form is ONE serve command from the weights alone —
+no `--config`, no pins, no hand deltas:
+
+    .venv/bin/python python/cli/serve.py --autoconfig \
+        --model /srv/models/unsloth/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
+        --max-sequence-length 1048576 --max-concurrent 2
+
+This derived, on the reference box, the full glm5_next long-context recipe:
+`snapmla` / tp2 / kv_tiering ON (capacity escalation) / `S = N = 2048`
+(prefill superchunk = MoE-big chunk, the EP diagonal) / `max_batch_size 128`
+/ TP `safety_margin_gb` 4.5 / `moe_big_fit_headroom_mb` 2426 / expert carve
+18.0 GiB per 5090 + 11.5 GiB per 5080 — every field explained in the
+sidecar, and BOOT-VERIFIED as the first live glm5_next + kv_tiering boot
+(P-31 step 1; measured, internal ledger).
+
+**Serving-shape flags become solver pins.** Under `--autoconfig`,
+`--max-sequence-length` and `--max-concurrent` are not mere HTTP-surface
+overrides: serve.py converts them into HARD pins
+(`serving.max_sequence_length=…`, `serving.max_concurrent_requests=…`,
+via `autoconfig.pins.parse_pin_args` — §2.5 semantics: the axis is removed
+from the search lattice, and an infeasible pin REFUSES naming itself).
+As plain ServeOptions overrides they would change the HTTP limits but not
+the engine sizing, which reads `serving.*` from the config file.
+
+**The user levers, by surface** (everything else is solved for):
+
+- `serve.py --autoconfig`: `--model` (derive from the weights; measured
+  artifacts beside them are reused; the derive is CPU-only),
+  `--accuracy compact|standard|high|superior` (§2.4), `--prefer
+  speed|balanced|capacity` (§2.3), `--max-sequence-length` /
+  `--max-concurrent` (pinned as above), `--autoconfig-redetect`
+  (re-derive despite a matching fingerprint), and optionally `--config`
+  (a base recipe carrying extras into the derivation).
+- `python/cli/autoconfigure.py` (the measured pipeline, §10): the same
+  `--prefer` / `--accuracy` plus `--vram-expert-ratio` (§2.1; unset =
+  fill every expert host to capacity — P-31 folding (b)),
+  `--active-context` (§2.2), `--pin` (repeatable, file or
+  `dotted.path=value`, §2.5), `--redetect`, and the artifact-scoped flags
+  (`--calibration`, `--trained`, `--placement-table`, `--reset`,
+  `--skip-training`, `--skip-placement`, `--name`/`--prefix`, …).
+
+**Measured on the derived recipe** (single legs, not banked bands; P-31
+step 1): decode 8k repeat median **24.52 tok/s**; fresh prefill
+**159.0 tok/s** at a clean 27k prompt (+34% vs the S=512 hand champion's
+118.5 @24k); TTFT after a late (~97%) divergence **26.2 s** (KDA
+checkpoint restore); conc-2 serves overlapping request pairs; **1M context
+is admitted but unmeasured** — the engine's boot log states windowed
+admission (INV-KVT-16) serves past the single-request pool ceiling
+(243,968), and no 1M prefill has been run.
+
+**The kv-tiering price is measured** and lives in the
+`glm5next-tiering-default-off` registry row: vs the untiered champion,
+decode ~−10% @8k (24.4–24.6 vs 27.0–27.4) and ~−13% @24k (22.9–23.1 vs
+~26.5–27.2), fresh prefill −16% (159.0 vs 189 untiered @S=2048) — the
+tiered_prefill tax. That price buys the 2×1M admissibility. **Untiered
+stays the default below the capacity bound**: the E1 lattice escalates
+tiering ON only when the untiered pool cannot hold the conc × max_seq ask
+(`conc-ask-exceeds-untiered-pool`); a 2×100k ask derives untiered.
+Consequently the 200k hand champion (untiered, ~27.0–27.4 tok/s @8k)
+remains the FASTER decode arm and coexists with the derived 1M recipe —
+autoconfig is the default path, the champion recipe is the tuned-arm
+example, and neither replaces the other.
+
+**Why derivation beats hand-editing a recipe.** The hand-promoted
+`recipes/glm53flash_serve.json` (P-29) is now BEHIND the derivation: it
+keeps S=512 (leaving the measured +54–62% fresh-prefill win of S=2048 on
+the table) and it under-reserves the max_seq-scaled post-check
+allocations — at 1M its `moe_big_fit_headroom_mb` is silently
+under-provisioned, so that recipe would have died at the block-table
+alloc instead of booting (P-31 diff: S 512→2048 + derived headroom 2426,
+margin 3.75→4.5, expert 18.5→18.0 — the honest price of both; everything
+else byte-equal). A hand edit satisfies the fields you look at; the
+derivation re-charges every coupled term and explains each one.
+
+**The four P-31 gaps, all CLOSED** (details §5b; ticket tracked in the
+internal planning notes, not shipped):
+
+1. TD-AUTOCONFIG-STRIDE-NOT-DERIVED — `prefill_superchunk_tokens` was a
+   family-template constant (512); now derived as max-S-that-fits on the
+   engine's own per-device-class MoE-big fit arithmetic (speed axis).
+2. TD-AUTOCONFIG-LONGCTX-RUNTIME-SCRATCH — max_seq/max_batch-scaled
+   runtime allocations (block tables, prefill KV staging, RoPE tables,
+   KVT union staging, …) are now charged in `sizing.py`; derived
+   long-context recipes boot.
+3. TD-AUTOCONFIG-NO-GLM5NEXT-PROFILE — an ArchProfile for GGUF arch
+   `glm5next` exists (layer_types from the `attention.head_count_kv`
+   array, linear_attn_config, index_kpool, …), so `--model` alone is
+   enough for GLM-5.3-class weights.
+4. `orchestrator.max_batch_size` — was a stale template copy (512; 5.75
+   GiB/rank of block tables at 1M); now derived as the largest schedule
+   width whose block tables fit the runtime-scratch budget (128 here).
+
+**Accuracy-ladder default flip (filed user decision, P-31 step 1):**
+the `standard` tier now derives **snapmla** for glm5_next (template sync
+to the P-29 step-14 champion switch — on the fixed binary snapmla wins
+BOTH axes: 24.10 vs 23.74 tok/s 8k repeat median, TF-NLL 1.7897 vs
+1.8016). `turboquant_mla` remains serveable as the `compact` tier.
+Revert = one line in `templates.py` `FAMILY["glm5_next"]`; the decision
+is filed in the internal campaign log (P-31 OPEN QUESTIONS).
 
 ## 1. Contract
 
@@ -16,7 +118,7 @@ of this document; code comments cite sections back here as `AUTOCONFIG §n`.
   fingerprint (§7) inside its own `autoconfig` section. On boot with
   `--autoconfig`, an existing output recipe whose fingerprint matches the
   live box is reused verbatim; re-derivation happens only on fingerprint
-  change or explicit `--redetect`.
+  change or explicit `--redetect` (serve.py: `--autoconfig-redetect`).
 - **Every derived number is explainable** (§8): the solver emits one line per
   derived field naming the constraint that produced it, extending the boot-log
   pattern of `vram_allocator.cpp` (indexer pool / V4 side tiers).
@@ -150,7 +252,7 @@ Properties the implementation owes (mirroring `prefer`):
 
 1. *`standard` is the shipped derivation, byte for byte* — recipe, explain
    table, warnings, degradations and refusal text
-   (scratchpad/accuracy_lever/NOOP_PROOF.txt pins the cross-tree diff; the
+   (an internal cross-tree no-op proof pins the diff; the
    unit suite pins the in-tree property).
 2. *The sidecar names the tier exactly when it changed the derived backend*
    (`autoconfig.accuracy` row + a tier-aware `compute.attention_backend`
@@ -167,7 +269,7 @@ Properties the implementation owes (mirroring `prefer`):
 
 ### 2.5 `--pin` — hard constraints, not a lever (TD-AUTOCONFIG-PINNED-CONSTRAINTS)
 
-Full design: spec/plans/AUTOCONFIG_PINNED_CONSTRAINTS.md. A pin is a THIRD
+Full design in the internal planning notes (not shipped). A pin is a THIRD
 input class: the base config is an IDENTITY source the derivation overwrites
 (`base_from_source` starts from `dict(base_config)`); a lever is an ASK the
 E1 ladder may degrade; **a pin is neither — a hard constraint that survives
@@ -205,8 +307,8 @@ backend removes the numerics axis from `accuracy`'s scope — `standard`
 (the no-preference tier) never conflicts, an explicit tier whose floor picks
 a different backend refuses (`pin-conflicts-accuracy-floor`, the `superior`
 refuses-rather-than-approximates precedent), agreement is silent. Default
-path byte-identity proven the `prefer` way:
-scratchpad/pinned_constraints/NOOP_PROOF.txt (12 scenarios, empty diff).
+path byte-identity proven the `prefer` way by an internal no-op proof
+(12 scenarios, empty diff).
 
 ## 3. Inputs — the HardwareDescriptor and ModelShape
 
@@ -244,15 +346,18 @@ quant formats.
 rules that a future commit deletes. Each registry row carries `id`,
 `statement`, `ticket` (the TD whose resolution removes or changes it), and the
 solver effect. Deleting a row re-derives the config without touching solver
-logic. Initial rows:
+logic. Selected rows (`engine_constraints.py` is authoritative and has
+grown past this table):
 
 | id | statement | ticket |
 |---|---|---|
 | ~~`local-indexer-disables-tiering`~~ | DELETED 2026-08-30 — the dcp≥2 replicated-only `KvTieringManager` gate was a merge artifact; tiering is indexer-mode-agnostic (INV-KVT-20). Its replacement is the priced row below | TD-KVT-LOCAL-INDEXER-UNBLOCK (resolved) |
 | `local-indexer-prefill-cost` | `dcp_indexer_mode: local` halves the per-rank indexer-K share (84→42 slabs, 87.1→43.5 MiB at max_seq 25600) and costs ~8-9% of served prefill (per-chunk-row cross-rank merge, per layer, B=64 rows); decode in-noise, token-identical. The mode is a CAPACITY decision with a known price | — (re-measure to change; evidence bound in the row) |
-| `mla-tq-vs-snapmla-accuracy` | `turboquant_mla` is measurably less accurate than `snapmla`: teacher-forced dNLL +0.0282±0.0063 nats/token on glm5_next (ppl 6.542 vs 6.360; flips low-margin; gap flat to 7k ctx) for 0.50x KV bytes/row. Orders the `accuracy` lever's MLA ladder | — (re-measure with scratchpad/accuracy_lever/tf_nll.py; evidence bound + falsifiers in the row) |
+| `mla-tq-vs-snapmla-accuracy` | `turboquant_mla` is measurably less accurate than `snapmla`: teacher-forced dNLL +0.0282±0.0063 nats/token on glm5_next (ppl 6.542 vs 6.360; flips low-margin; gap flat to 7k ctx) for 0.50x KV bytes/row. Orders the `accuracy` lever's MLA ladder | — (re-measure with the internal teacher-forced NLL harness; evidence bound + falsifiers in the row) |
 | `v4-no-sharded-kv` | deepseek_v4 rejects `dcp_kv_mode: sharded` | TD-V4-DCP-KV |
 | `dspark-ctx-cap` | draft stops helping above `draft_context_capacity_tokens` (default 8192); over-cap prompts route to the plain arm | TD-DSPARK-CTX-POLICY |
+| `glm5next-tiering-default-off` | glm5_next KV tiering ships default OFF (8.8× less KV/token than GLM-5.2 — it buys nothing at champion context); the E1 lattice escalates it ON for CAPACITY when the untiered pool cannot hold the conc × max_seq ask. The price is MEASURED (P-31 step 1): decode ~−10% @8k / −13% @24k, fresh prefill −16% vs untiered | — (measured; numbers live in the row) |
+| `glm5next-tp1-default` | glm5_next decodes at TP=1 by default (KDA kernel latency-floored); for deep-context asks ≥ 262144 the TP plan orders the head-divisible ceiling FIRST — attention is the measured majority (60.4–73%) of the champion-scale fresh-prefill wall (P-30) | — (measured) |
 | `kda-state-fixed-carve` | glm5_next KDA state is a fixed per-request carve, `slots = max_concurrent + prefix_entries`, not lendable | TD-KDA-STATE-MAPPED-SLABS |
 | `kv-pool-counts-all-layers` | the ENGINE sizes the KV pool over ALL layers even on hybrids; the solver must model the engine as it is, while reporting the waste | TD-KV-POOL-SIZED-OVER-ALL-LAYERS |
 | `tp-gpus-must-be-flagship` | every TP GPU must be the box's top attention class (INV-0.5: rtx5090) | — (validator rule) |
@@ -431,7 +536,10 @@ with file:line cites) and the plan in `Solver._longctx_plan`:
   branch refuses `conc-ask-exceeds-untiered-pool` when the pool cannot
   hold conc × one request's whole-life demand (§2.2's own definition of
   the ask), and the lattice escalates to tiering (INV-KVT-16 windowed
-  admission) before any other axis moves.
+  admission) before any other axis moves. The escalation's price is
+  measured (§0; `glm5next-tiering-default-off` row): ~−10–13% decode,
+  −16% fresh prefill — which is exactly why OFF stays the default
+  candidate wherever the untiered pool affords the ask.
 - **TP plan orders the ceiling first for asks ≥ 262144 tokens** on
   glm5_next: attention is the measured majority of the large-prefill wall
   (P-30 steps 1-4; 60.4-73%, stride-invariant) and head-sharding is the
@@ -490,7 +598,7 @@ registry/measurement that justifies it), or `unexplained` (a solver bug until
 proven a discovery). The unit suite pins the classification so a regression
 in the solver surfaces as new `unexplained` rows.
 
-## 10. The auto-run pipeline (spec/AUTO_RUN.md)
+## 10. The auto-run pipeline
 
 §1-§9 describe the DERIVATION. This section describes the one command a user
 actually runs, which wraps it:
@@ -505,9 +613,13 @@ HuggingFace `config.json` when one is present, or (advanced) a base recipe via
 `index_topk_freq`/`index_skip_topk_offset` (IndexShare geometry: at
 `index_topk_freq <= 0` the engine treats every layer as a full indexer layer,
 79 instead of 21 on GLM-5.2) and the rope interleave flags — so a per-
-architecture PROFILE supplies them, as cited data (spec/LLM-MODELS-INFO.md),
+architecture PROFILE supplies them, as cited data (internal model reference),
 in the spirit of `engine_constraints.py`. An unknown architecture is a
-refusal, not a guess. Prepack discovery is by manifest identity
+refusal, not a guess. Profiles exist for the bring-up archs including GGUF
+`glm5next` (P-31 closed TD-AUTOCONFIG-NO-GLM5NEXT-PROFILE: layer_types from
+the `attention.head_count_kv` array, linear_attn_config, index_kpool,
+hc_*, swiglu_limit), so `--model` alone is enough for GLM-5.3-class
+weights. Prepack discovery is by manifest identity
 (`source_model_path`), never by name; the tokenizer must be a real path
 because serve's `auto` only searches the weights dir and GGUF-embedded
 tokenizers are not extracted (TD-SERVE-GGUF-TOKENIZER).

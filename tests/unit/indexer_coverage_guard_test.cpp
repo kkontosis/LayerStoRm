@@ -1042,3 +1042,61 @@ TEST_F(IndexerCoverageGuardTest, DraftDecodeStepStillGapsCoverage) {
     EXPECT_EQ(dispatcher_->indexer_coverage(18).first, kModeDead)
         << "the harness must detect the silent-dense transition";
 }
+
+// ── P-32 stage 0: IndexShare reuse-gate classification ──────────────────────
+// Locks the fix for the glm5_next MTP-layer misclassification: layer 45 sits
+// PAST the 45-entry per-hidden-layer full mask, and the pre-fix gate
+// classified every past-mask layer "shared". With its (seq,pos,epoch) step
+// key colliding with the trunk's row (probe/catch-up rows dispatched at the
+// trunk position), the MTP layer silently consumed the trunk layer-44 top-k
+// — the WRONG weights' selection — and skipped its own indexer-K append
+// while stage_step had already advanced mtp_indexer_cov: permanent silent
+// holes in the MTP indexer-K store that its own chain rows then scored
+// over. The rule now: in-mask layers follow the full mask verbatim
+// (legacy layer 0 stays computing-but-SHARED); past-mask layers are full
+// iff the computes mask says they own an indexer (glm5_next MTP: yes;
+// legacy MTP: no — shared by construction, index_share_for_mtp_iteration).
+TEST(IndexerReuseLayerIsFull, Glm5NextMtpLayerComputesLegacyMtpShared) {
+    using lpar::DcpExecutor;
+
+    // glm5_next shape: 45 hidden layers (11 sparse-MLA full, 34 KDA), MTP
+    // layer 45 past the mask with its own indexer (computes[45] = 1).
+    std::vector<uint8_t> g5_full(45, 0);
+    for (int l = 3; l < 45; l += 4) g5_full[l] = 1;  // {3,7,...,43}
+    std::vector<uint8_t> g5_computes(46, 0);
+    for (int l = 3; l < 45; l += 4) g5_computes[l] = 1;
+    g5_computes[45] = 1;
+    EXPECT_TRUE(DcpExecutor::indexer_reuse_layer_is_full(
+        g5_full, g5_computes, 43));
+    EXPECT_FALSE(DcpExecutor::indexer_reuse_layer_is_full(
+        g5_full, g5_computes, 0));  // KDA layer: by-mask (no indexer at all)
+    // THE REGRESSION: pre-fix this returned false and the MTP layer's
+    // producer took the reuse early-return on a trunk key collision.
+    EXPECT_TRUE(DcpExecutor::indexer_reuse_layer_is_full(
+        g5_full, g5_computes, 45));
+    // Past both masks: shared (never full without a computes entry).
+    EXPECT_FALSE(DcpExecutor::indexer_reuse_layer_is_full(
+        g5_full, g5_computes, 46));
+
+    // Legacy IndexShare shape (GLM-5.2-like): layer 0 computing-but-SHARED
+    // in-mask — the mask verdict must win (scoping lock: the fix must not
+    // flip legacy layer 0 to full), and the legacy MTP layer past the mask
+    // never computes → stays shared by construction.
+    std::vector<uint8_t> legacy_full(79, 0);
+    for (int l = 3; l < 79; l += 4) legacy_full[l] = 1;
+    std::vector<uint8_t> legacy_computes(79, 0);
+    for (int l = 3; l < 79; l += 4) legacy_computes[l] = 1;
+    legacy_computes[0] = 1;  // full ∪ {layer 0}
+    EXPECT_FALSE(DcpExecutor::indexer_reuse_layer_is_full(
+        legacy_full, legacy_computes, 0))
+        << "legacy layer 0 is computing-but-shared; the mask verdict wins";
+    EXPECT_FALSE(DcpExecutor::indexer_reuse_layer_is_full(
+        legacy_full, legacy_computes, 79))
+        << "legacy MTP layer: shared by construction "
+           "(index_share_for_mtp_iteration)";
+
+    // Empty full mask: every layer full (GGUF default).
+    EXPECT_TRUE(DcpExecutor::indexer_reuse_layer_is_full(
+        {}, legacy_computes, 5));
+    EXPECT_TRUE(DcpExecutor::indexer_reuse_layer_is_full({}, {}, 100));
+}

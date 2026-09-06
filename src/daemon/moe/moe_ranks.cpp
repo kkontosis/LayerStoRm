@@ -122,6 +122,7 @@ bool CommandDispatcher::preissue_far_moe_prologue(uint32_t layer_idx,
     // normalized_hidden directly.
     far_prologue_layer_    = layer_idx;
     far_prologue_gpu_mask_ = mask;
+    far_prologue_num_seqs_ = num_seqs;
     if (do_bcast && !ep_xtp_gpus_.empty()) {
         InternalMoeParams mpb{};
         mpb.layer_idx = layer_idx;
@@ -953,6 +954,7 @@ bool CommandDispatcher::ep_xtp_broadcast(const InternalMoeParams& mp_template,
     // identical bytes; skipping only removes the duplicate).
     const bool prologue_primed =
         far_prologue_layer_ == mp_template.layer_idx
+        && far_prologue_num_seqs_ == mp_template.num_seqs
         && ((far_prologue_gpu_mask_ >> (src & 31)) & 1u) != 0
         && src < 32;
     if (norm_w && ss.normalized_hidden) {

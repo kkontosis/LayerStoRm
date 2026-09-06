@@ -119,8 +119,19 @@ void CommandDispatcher::handle_fetch_and_run_moe(const ipc::Command& cmd) {
 // The BIG payload is a layout-compatible prefix extension of the legacy one
 // (common initial sequence), so both are read through cmd.fetch_and_run_moe;
 // only chunk_tokens is BIG-specific.
+// P-32 stage 1: LS_SPEC_VERIFY_FETCH_HIDE — see command_dispatcher.h. Only
+// consulted on spec_verify-synthesized commands; default boots never read it.
+bool CommandDispatcher::spec_verify_fetch_hide_enabled() {
+    if (spec_verify_fetch_hide_enabled_ < 0) {
+        const char* e = std::getenv("LS_SPEC_VERIFY_FETCH_HIDE");
+        spec_verify_fetch_hide_enabled_ = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    return spec_verify_fetch_hide_enabled_ == 1;
+}
+
 void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
-                                                      bool big) {
+                                                      bool big,
+                                                      bool spec_verify) {
     const auto& p = cmd.fetch_and_run_moe;
     perf_trace::record(perf_trace::kMoeEnter,
                        static_cast<uint16_t>(cmd.gpu_idx), cmd.cmd_seq,
@@ -189,13 +200,15 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     state.big = big;
     state.chunk_tokens = big
         ? static_cast<int>(cmd.fetch_and_run_moe_big.chunk_tokens) : 0;
+    state.spec_verify = spec_verify;
 
     // P-29 step 16 (LS_FAR_PROLOGUE_PREISSUE): the FAR pre-issue already
     // broadcast rank0's normalized hidden + top-K to the EP-XTP ranks for
     // this layer — the overlap pass and the finalize must not re-broadcast
     // (same skip contract as the overlap pass' own broadcast).
     state.xtp_broadcast_done = far_prologue_bcast_done_
-        && far_prologue_layer_ == p.layer_idx;
+        && far_prologue_layer_ == p.layer_idx
+        && far_prologue_num_seqs_ == p.num_seqs;
 
     // Read sideband expert list.
     const auto* entries = reinterpret_cast<const ipc::ExpertPrefetchEntry*>(
@@ -608,7 +621,7 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     // GEMMs run concurrently with the fetch instead of gated behind it. The
     // finalize then computes only the just-fetched remainder (kFinal).
     if (state.phase == ProgressiveMoePhase::kWaitingExperts
-        && !state.big && state.num_seqs == 1
+        && !state.big && far_hide_shape(state)
         && deps_.cuda_kernels_enabled && moe_resident_overlap_enabled()) {
         run_moe_overlap_pass(state);
     }
@@ -628,7 +641,7 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     // kernels, same order); only the enqueue time changes. Any commit
     // precondition failure → false → byte-identical host-poll path continues.
     if (state.phase == ProgressiveMoePhase::kWaitingExperts
-        && !state.big && state.num_seqs == 1
+        && !state.big && far_hide_shape(state)
         && deps_.cuda_kernels_enabled && moe_gated_final_enabled()
         && far_stream_gate_commit(state, "LS_FAR_GATED_FINAL")) {
         state.phase = ProgressiveMoePhase::kFinalize;
@@ -899,9 +912,13 @@ bool CommandDispatcher::moe_gated_final_enabled() {
 
 bool CommandDispatcher::far_stream_gate_commit(ProgressiveMoeState& st,
                                                const char* tag) {
-    // DECODE only (B==1). Prefill / batched paths keep the host-driven
-    // progressive machine (waves + deadline/partial escapes) untouched.
-    if (st.num_seqs != 1) return false;
+    // DECODE-shaped only: plain B==1, or (P-32 stage 1) a spec_verify R<=8
+    // row block under LS_SPEC_VERIFY_FETCH_HIDE. Prefill / batched paths
+    // keep the host-driven progressive machine (waves + deadline/partial
+    // escapes) untouched. The commit body below is shape-agnostic — it
+    // touches barriers, ELM/cache state and er.is_arrived only; nothing in
+    // it assumes one row.
+    if (!far_hide_shape(st)) return false;
     if (!deps_.cuda_kernels_enabled || !deps_.stream_manager
         || !deps_.transfer_engine || !deps_.elm || !deps_.expert_cache) {
         ++gated_final_fb_other_;
@@ -1249,7 +1266,7 @@ bool CommandDispatcher::run_moe_overlap_pass(ProgressiveMoeState& st) {
     if (!deps_.cuda_kernels_enabled || !deps_.live_config
         || !deps_.stream_manager || !deps_.expert_cache)
         return false;
-    if (st.num_seqs != 1 || st.big) return false;
+    if (!far_hide_shape(st) || st.big) return false;
     const int n_experts = deps_.live_config->model.n_routed_experts;
     if (n_experts <= 0) return false;
 

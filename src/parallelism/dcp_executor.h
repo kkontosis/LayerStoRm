@@ -455,6 +455,28 @@ struct AttentionExecParams {
 
 class DcpExecutor {
 public:
+    /// P-32 stage 0: IndexShare reuse-gate classification (pure; both
+    /// sparse-indices producers call this). A layer covered by the
+    /// per-hidden-layer full mask follows it; a PAST-MASK layer (MTP) is
+    /// full iff it computes its own indexer. glm5_next's MTP layer (45)
+    /// carries its OWN indexer tensors + coverage (computes mask true) —
+    /// classifying it shared let a step-key collision with the trunk's
+    /// row silently consume the trunk layer-44 top-k (wrong weights'
+    /// selection) and skip the layer-45 indexer-K append its coverage
+    /// had already committed. Legacy MTP layers (computes false) stay
+    /// shared by construction; legacy layer 0 (computing-but-shared,
+    /// in-mask) keeps its mask verdict byte-identically. Empty full mask
+    /// → every layer full (GGUF default / llama.cpp reference).
+    static bool indexer_reuse_layer_is_full(
+            const std::vector<uint8_t>& full_mask,
+            const std::vector<uint8_t>& computes_mask, int layer) {
+        if (full_mask.empty()) return true;
+        if (layer < static_cast<int>(full_mask.size()))
+            return full_mask[layer] != 0;
+        return layer < static_cast<int>(computes_mask.size())
+            && computes_mask[layer] != 0;
+    }
+
     struct Options {
         int dcp_size = 1;                          ///< parallelism.tensor_parallelism
         std::vector<config::GpuRef> gpus;       ///< TP GPU configs (INV-4.18)

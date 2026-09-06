@@ -203,6 +203,138 @@ class TestModelProbe:
             "GLM-5.2-speculator.dspark"
 
 
+# A GLM-5.3-Flash-shaped (glm5next) metadata block, cut down to 14 hidden
+# layers + 1 MTP so the per-layer array is readable by hand.  Values are the
+# real ones (spec/GLM-5.3-FLASH-MODELINFO.md §8b lists exactly which keys
+# the GGUF publishes) — and deliberately NO rope.freq_base: this family is
+# NoPE (rope.dimension_count 0) and the GGUF carries no rope key at all.
+GLM5NEXT_KV = {
+    "general.architecture": "glm5next",
+    "general.name": "GLM-5.3-Flash",
+    "glm5next.block_count": 15,             # 14 hidden + 1 MTP
+    "glm5next.nextn_predict_layers": 1,
+    "glm5next.context_length": 1048576,
+    "glm5next.embedding_length": 4096,
+    "glm5next.feed_forward_length": 12288,
+    "glm5next.attention.head_count": 64,
+    # PER-LAYER array (this is what layer_types is read from), MTP included
+    "glm5next.attention.head_count_kv": [0, 0, 0, 1] * 3 + [0, 1] + [1],
+    "glm5next.attention.layer_norm_rms_epsilon": 1e-05,
+    "glm5next.attention.q_lora_rank": 1536,
+    "glm5next.attention.kv_lora_rank": 512,
+    "glm5next.attention.key_length_mla": 256,
+    "glm5next.attention.value_length_mla": 256,
+    "glm5next.rope.dimension_count": 0,     # NoPE
+    "glm5next.leading_dense_block_count": 3,
+    "glm5next.vocab_size": 154880,
+    "glm5next.expert_count": 288,
+    "glm5next.expert_used_count": 8,
+    "glm5next.expert_shared_count": 1,
+    "glm5next.expert_group_count": 1,
+    "glm5next.expert_group_used_count": 1,
+    "glm5next.expert_gating_func": 2,
+    "glm5next.expert_feed_forward_length": 2048,
+    "glm5next.expert_weights_scale": 2.5,
+    "glm5next.expert_weights_norm": True,
+    "glm5next.attention.indexer.head_count": 32,
+    "glm5next.attention.indexer.key_length": 128,
+    "glm5next.attention.indexer.top_k": 2048,
+    "glm5next.attention.indexer.kpool": 4,
+    "glm5next.kda.head_dim": 128,
+    "glm5next.kda.gate_lower_bound": -5.0,
+    "glm5next.ssm.conv_kernel": 4,
+    "glm5next.hyper_connection.count": 4,
+    "glm5next.hyper_connection.sinkhorn_iterations": 20,
+    "glm5next.hyper_connection.epsilon": 1e-06,
+    "glm5next.swiglu_clamp_exp": [10.0] * 14,
+}
+
+
+def make_glm5next_dir(tmp_path, name="GLM-5.3-Flash-GGUF-Q4_K_XL", kv=None):
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"
+    write_fake_gguf(str(p), EXPERT_TENSORS,
+                    kv if kv is not None else GLM5NEXT_KV)
+    return str(d), str(p)
+
+
+class TestGlm5NextArchProfile:
+    """P-31: the glm5_next (GLM-5.3-Flash) GGUF route.  This family is the
+    reason the probe grew a hybrid branch — layer_types is not a GGUF key,
+    it is ENCODED in the per-layer attention.head_count_kv array, and
+    getting it wrong hands the engine a uniform-attention model that
+    neither loads nor serves.  The rest of the branch reads the KDA/indexer
+    /hyper-connection geometry the profile cannot assert."""
+
+    def test_the_hybrid_model_section_is_read_from_the_metadata(self, tmp_path):
+        d, _ = make_glm5next_dir(tmp_path)
+        src = modelprobe.probe_model(d, str(tmp_path))
+        m = src.model_section
+        assert src.source == "gguf-metadata"
+        assert m["architecture"] == "glm5_next"
+        assert (m["num_hidden_layers"], m["num_nextn_predict_layers"]) == (14, 1)
+        # layer_types synthesised from the per-layer array and TRUNCATED to
+        # num_hidden_layers (the array covers the MTP block too)
+        assert m["layer_types"] == (
+            ["linear_attention"] * 3 + ["deepseek_sparse_attention"]) * 3             + ["linear_attention", "deepseek_sparse_attention"]
+        assert len(m["layer_types"]) == 14
+        # MLA-side geometry: NoPE, so the whole key length is the nope part
+        assert (m["qk_nope_head_dim"], m["qk_rope_head_dim"]) == (256, 0)
+        assert (m["kv_lora_rank"], m["v_head_dim"]) == (512, 256)
+        assert m["num_key_value_heads"] == 64      # not GGUF's per-layer array
+        # KDA side: num_heads has NO GGUF key and equals head_count here
+        assert m["linear_attn_config"] == {
+            "num_heads": 64, "head_dim": 128,
+            "short_conv_kernel_size": 4, "gate_lower_bound": -5.0}
+        # indexer k-pooling (4 keys per pooled entry) and the hybrid extras
+        assert m["index_kpool"] == 4
+        assert (m["index_topk"], m["index_n_heads"], m["index_head_dim"])             == (2048, 32, 128)
+        assert (m["hc_mult"], m["hc_sinkhorn_iters"]) == (4, 20)
+        assert m["hc_eps"] == pytest.approx(1e-06)
+        assert m["swiglu_limit"] == 10.0
+        # what the profile supplies because no GGUF key exists
+        assert m["moe_layer_freq"] == 1
+        assert m["index_kpool_compress"] is True
+        assert m["index_kpool_always_select_tail"] is True
+        assert m["mla_use_nope"] is True
+        assert m["indexer_rope_interleave"] is True
+        assert any("head_count_kv" in s for s in src.provenance)
+
+    def test_no_rope_theta_is_emitted_for_a_nope_family(self, tmp_path):
+        """schema positive_float: emitting rope_theta=0.0 (the only value a
+        NoPE GGUF could yield) fails validation, so the key must be ABSENT
+        rather than defaulted."""
+        d, _ = make_glm5next_dir(tmp_path)
+        m = modelprobe.probe_model(d, str(tmp_path)).model_section
+        assert "rope_theta" not in m
+        # and a family that DOES publish one still gets it
+        d2, _ = make_model_dir(tmp_path)
+        assert modelprobe.probe_model(d2, str(tmp_path))             .model_section["rope_theta"] == 8000000.0
+
+    def test_tokenizer_falls_back_to_a_test_data_dir_by_display_name(
+            self, tmp_path):
+        """P-31: weights under /srv/models have no useful sibling dirs, so
+        the last resort is a repo test-data dir whose sanitised name is the
+        model's own display name (serve refuses to boot on 'auto' with a
+        GGUF-only box, TD-SERVE-GGUF-TOKENIZER)."""
+        weights = tmp_path / "srv" / "models"
+        weights.mkdir(parents=True)
+        d, shard = make_glm5next_dir(weights)
+        repo = tmp_path / "repo"
+        tok = repo / "test-data" / "GLM-5.3-Flash"
+        tok.mkdir(parents=True)
+        (tok / "tokenizer.json").write_text("{}")
+        assert modelprobe.find_tokenizer_dir(shard) == ""
+        assert modelprobe.find_tokenizer_dir(
+            shard, str(repo), "GLM-5.3-Flash") == str(tok)
+        # the name is matched sanitised, not literally
+        assert modelprobe.find_tokenizer_dir(
+            shard, str(repo), "glm-5.3-flash") == str(tok)
+        assert modelprobe.find_tokenizer_dir(
+            shard, str(repo), "GLM-5.2") == ""
+
+
 class TestArtifactNaming:
     def _opts(self, tmp_path, **kw):
         d, _ = make_model_dir(tmp_path)

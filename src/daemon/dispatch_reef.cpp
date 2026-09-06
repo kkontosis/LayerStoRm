@@ -526,7 +526,17 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
     // finalize path re-emits byte-identically. Non-qualifying commands
     // clear any stale pre-issue so a later dispatch of the same layer at a
     // different shape can never consume a 1-row primed buffer.
-    if (is_moe && !p.spec_verify && p.num_seqs == 1 && !p.is_prefill
+    // P-32 stage 1 (LS_SPEC_VERIFY_FETCH_HIDE): spec_verify commands are
+    // decode-shaped R<=8 row blocks whose prime pass is shape-parametric
+    // (pmp.num_seqs rides through; the C-6 early kick already proves
+    // prime_cpu_input_only at M>1). The primed row count is published
+    // (far_prologue_num_seqs_) and both consumers match on it, so a primed
+    // set can never be consumed at a different shape.
+    const bool prologue_shape_ok =
+        p.num_seqs == 1
+        || (p.spec_verify && p.num_seqs <= 8
+            && spec_verify_fetch_hide_enabled());
+    if (is_moe && prologue_shape_ok && !p.is_prefill
         && deps_.cuda_kernels_enabled && far_prologue_preissue_enabled()) {
         preissue_far_moe_prologue(p.layer_idx, p.num_seqs, cmd.gpu_idx);
     } else {
@@ -714,7 +724,8 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
     fc.fetch_and_run_moe.timeout_us     = p.timeout_us;
     fc.fetch_and_run_moe.moe_mode       = 0;
     fc.fetch_and_run_moe.have_evict_map = have_evict_map ? 1 : 0;
-    handle_fetch_and_run_moe_impl(fc, /*big=*/false);
+    handle_fetch_and_run_moe_impl(fc, /*big=*/false,
+                                  /*spec_verify=*/p.spec_verify != 0);
 }
 
 }  // namespace layerstorm::daemon
