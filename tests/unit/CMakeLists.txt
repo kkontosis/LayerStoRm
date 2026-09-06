@@ -154,6 +154,11 @@ if(UNIT_TEST_SOURCES)
     # split-KV decode at the GLM5N NoPE geometry).
     ":SnapmlaBudgetDecodeGather.*"
     ":SnapmlaBudgetDecodeSparseFp8.*"
+    # P-32 stage 1 batched spec_verify sparse decode (s_q = R) row-isolation
+    # suites — snapmla_sparse_verify_test.cu (one s_q=R launch vs R s_q=1
+    # launches, byte for byte, at the production strides).
+    ":SnapMlaSparseVerifyR3.*"
+    ":SnapMlaSparseVerifyR6H32.*"
     ":PrefillDenseCausal.*"
     ":PrefillDenseLongCtx.*"
     ":PrefillLseUnits.*"

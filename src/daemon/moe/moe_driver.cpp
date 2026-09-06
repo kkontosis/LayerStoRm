@@ -1221,7 +1221,15 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // GEMM. Only the device-fused grouped int kernels honor NULL (their CTAs
     // early-return). The guard also covers the previously-latent wave-pass
     // case under a dequant config.
-    const bool wave_null_skip = use_gguf && num_tokens == 1
+    // P-32 stage 1: the skip extends to decode-shaped M<=8 (the batched
+    // spec_verify MoE — the only producer of 2<=M<=8 on this route). The
+    // early-return is per-CTA and M-independent; the device-fused grouped
+    // int kernels honor NULL at every M, and the pass's output rows are
+    // pre-zeroed exactly as at M==1 (bit-identical to the zero-buf walk).
+    // Measured: at M=3 every rank K-walked the zero buffer for ~283 of 288
+    // routed entries per projection — the single largest GPU term of the
+    // verify sweep (grouped mmvq 38% of the decode-window GPU profile).
+    const bool wave_null_skip = use_gguf && num_tokens <= 8
         && gguf_strategy == compute::GgufGemmStrategy::int_strategy
         && (mp.wave_pass != MoeWavePass::kNone
             || moe_null_skip_decode_enabled());

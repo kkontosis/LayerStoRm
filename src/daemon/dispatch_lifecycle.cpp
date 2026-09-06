@@ -1490,7 +1490,16 @@ void CommandDispatcher::handle_seq_fork(const ipc::Command& cmd) {
         // truncating forks reset it to the prefix like the trunk (the
         // MTP store lags the trunk, so min() is the honest frontier).
         mtp_indexer_cov = src_mtp_cov;
-        if (mtp_indexer_cov.next_pos > prefix_len)
+        // P-32 stage 1 BUG FIX (TD-MTP-COV-FROZEN-FORK): the clamp must
+        // mirror the trunk clone's `if (truncated)` guard. A FROZEN
+        // registration fork carries prefix_len == 0 (full refcount share —
+        // `truncated` is false), and the unconditional step-13 clamp zeroed
+        // every holder's MTP coverage: each prefix-hit child then dispatched
+        // its first MTP row at pos == prefix_len against next_pos == 0, was
+        // classified a GAP, and went PERMANENTLY dense on the MTP layer
+        // (measured: indexer_dense_steps=481/leg on every prefix-hit spec
+        // leg; dense MTP draft steps cost mean 5.2 ms vs 2.0 sparse at 8k).
+        if (truncated && mtp_indexer_cov.next_pos > prefix_len)
             mtp_indexer_cov.next_pos = prefix_len;
         mtp_indexer_cov.epoch = dst_cov.epoch;
         kv_pages = std::move(dst_handles);

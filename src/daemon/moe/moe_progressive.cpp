@@ -129,6 +129,15 @@ bool CommandDispatcher::spec_verify_fetch_hide_enabled() {
     return spec_verify_fetch_hide_enabled_ == 1;
 }
 
+// P-32 stage 1: LS_SPEC_VERIFY_BATCHED — see command_dispatcher.h.
+bool CommandDispatcher::spec_verify_batched_enabled() {
+    if (spec_verify_batched_enabled_ < 0) {
+        const char* e = std::getenv("LS_SPEC_VERIFY_BATCHED");
+        spec_verify_batched_enabled_ = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    return spec_verify_batched_enabled_ == 1;
+}
+
 void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
                                                       bool big,
                                                       bool spec_verify) {

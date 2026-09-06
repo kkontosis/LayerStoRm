@@ -356,6 +356,15 @@ struct AttentionExecParams {
     bool use_graph = false;         ///< true = decode with captured graphs
     bool is_sparse = false;         ///< true = DSA sparse attention
 
+    // P-32 stage 1 (LS_SPEC_VERIFY_BATCHED): this decode-shaped step is a
+    // batched spec_verify row block — batch_size (2..8) CONSECUTIVE
+    // positions of ONE sequence, teacher-forced (all rows' K appended by the
+    // common prefix before any attention). The nongraph sparse consumer
+    // routes it to AttentionDevice::sparse_verify_attention (s_q=R single
+    // launch) with a per-row batch-of-1 fallback — never the flat batched
+    // call (whose staging law is single-row/multi-seq shaped).
+    bool spec_verify_batched = false;
+
     // Chunked prefill (0 = full sequence)
     int chunk_start = 0;
     int chunk_len = 0;
@@ -419,12 +428,29 @@ struct AttentionExecParams {
         /// for the decode kernels' base + slots[b] * stride indirection.
         /// Per-rank INDEPENDENT (GF3.8 S4 finding). nullptr on prefill.
         const int* slots_host = nullptr;
+        /// P-32 stage 1 (seq_rows): per-row KDA anchor D2D plan for this
+        /// rank — after row j's recurrence update, the executor enqueues
+        /// memcpy_d2d_async(anchor_dst[j], anchor_src[j], anchor_unit_bytes)
+        /// on the kAttention stream (stream order = "right after row j's
+        /// state update", exactly the per-row command loop's semantics).
+        /// nullptr arrays or nullptr entries = no anchor for that row.
+        const void* const* anchor_src = nullptr;  ///< [batch] or nullptr
+        void* const* anchor_dst = nullptr;        ///< [batch] or nullptr
     };
     struct KdaStep {
         int linear_ordinal = -1;       ///< dense KDA layer ordinal [0, 34)
         bool decode = false;           ///< fused decode step vs chunked scan
         const KdaStepRank* ranks = nullptr;  ///< [num_ranks]
         int num_ranks = 0;             ///< must equal dcp_size
+        /// P-32 stage 1 (batched spec_verify on KDA layers): the batch rows
+        /// are ONE sequence at consecutive positions. Projections/o_norm/
+        /// o_proj/allreduce stay batched over B (weights read ONCE); the
+        /// conv + recurrence kernels run SEQUENTIALLY per row (batch=1
+        /// launches at row offsets on one stream — stream order carries the
+        /// state, so row j+1 reads exactly row j's update; bit-identical
+        /// per row to the per-row command loop, same kernel bodies).
+        bool seq_rows = false;
+        size_t anchor_unit_bytes = 0;  ///< whole per-layer unit (incl rings)
     };
     const KdaStep* kda = nullptr;
 

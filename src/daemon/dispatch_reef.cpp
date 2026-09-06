@@ -411,6 +411,120 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
 
         bool ok = true;
         const char* why = nullptr;
+        // P-32 stage 1 (LS_SPEC_VERIFY_BATCHED, default ON): sparse-MLA
+        // layers (incl. MTP layer 45) run the R rows as ONE batched
+        // decode-shaped dispatch — descriptors be[0..R-1] already carry the
+        // rows, the common prefix appends ALL rows' KV/indexer keys first
+        // (teacher-forced append-then-attend), the producer scores each row
+        // against its own causal bound (selection bit-identical to the
+        // per-row loop, INV-DSA-BATCH), and the nongraph consumer routes to
+        // the device's s_q=R arm (per-row sub-dispatch fallback). KDA layers
+        // KEEP the per-row loop below: the recurrent state admits one step
+        // per dispatch and the chunked scan is bit-exact only at 64-cuts
+        // (INV-KDA-CARRY) — sequence-ness is inherent, not a cost (the
+        // kernels are 5-7 us/layer).
+        // KDA layers join the batched dispatch when the anchor plan can be
+        // expressed (mapped state; carve mode falls back to the per-row
+        // loop — kda_anchor_copy_layer refuses per-layer spans there too).
+        auto* pa_units = deps_.page_allocator;
+        const int kda_units_n = pa_units
+            ? std::max(1, pa_units->kda_units_per_rank()) : 1;
+        const bool linear_batchable =
+            !is_linear || p.kda_snap_mask == 0 || kda_units_n > 1;
+        if (R > 1 && spec_verify_batched_enabled() && linear_batchable) {
+            bool plan_ok = true;
+            clear_spec_kda_anchor_plan();
+            // Per-row KDA anchor bookkeeping (linear layers): identical to
+            // the per-row loop — lazy claim + invalidate at the FIRST
+            // linear layer, D2D planned per masked row (the executor
+            // enqueues it right after that row's state update), commit at
+            // the LAST linear layer (post-dispatch below).
+            if (is_linear && st && p.kda_snap_mask) {
+                const size_t units = static_cast<size_t>(kda_units_n);
+                const size_t ranks = units > 0
+                    ? st->kda_state.size() / units : 0;
+                spec_kda_anchor_plan_.assign(ranks, {});
+                spec_kda_anchor_unit_bytes_ = static_cast<size_t>(
+                    pa_units->kda_unit_bytes());
+                for (uint32_t j = 0; j < R && plan_ok; ++j) {
+                    if (!((p.kda_snap_mask >> j) & 1)) continue;
+                    const uint32_t anchor_pos = saved[j].token_pos + 1;
+                    const int slot = (anchor_pos % kp == 0) ? 0 : 1;
+                    if (st->kda_anchors.slots[slot].empty()
+                        && linear_ord == 0) {
+                        std::string aerr;
+                        if (!claim_kda_state(saved[0].seq_id,
+                                             static_cast<int>(cmd.gpu_idx),
+                                             st->kda_anchors.slots[slot],
+                                             aerr)) {
+                            st->kda_anchors.slots[slot].clear();
+                            spdlog::warn(
+                                "spec_verify: KDA anchor slot {} claim "
+                                "failed for seq {} ({}) — snapshot skipped",
+                                slot, saved[0].seq_id, aerr);
+                        }
+                    }
+                    if (st->kda_anchors.slots[slot].empty()) continue;
+                    if (st->kda_anchors.slots[slot].size()
+                        != st->kda_state.size()) {
+                        plan_ok = false;
+                        why = "spec_verify: KDA anchor slot layout "
+                              "mismatch";
+                        break;
+                    }
+                    if (linear_ord == 0)
+                        st->kda_anchors.pos[slot] =
+                            SequenceState::KdaAnchors::kNone;
+                    for (size_t r2 = 0; r2 < ranks; ++r2) {
+                        const size_t u = r2 * units
+                            + static_cast<size_t>(linear_ord);
+                        void* srcp = st->kda_state[u].gpu_ptr;
+                        void* dstp =
+                            st->kda_anchors.slots[slot][u].gpu_ptr;
+                        if (!srcp || !dstp) {
+                            plan_ok = false;
+                            why = "spec_verify: KDA anchor copy pointers "
+                                  "missing";
+                            break;
+                        }
+                        spec_kda_anchor_plan_[r2].src[j] = srcp;
+                        spec_kda_anchor_plan_[r2].dst[j] = dstp;
+                    }
+                }
+            }
+            if (!plan_ok) {
+                ok = false;
+            } else {
+                ipc::Command ac{};
+                ac.cmd_type = ipc::D_B_CMD_RUN_ATTENTION;
+                ac.cmd_seq  = cmd.cmd_seq;
+                ac.gpu_idx  = cmd.gpu_idx;
+                ac.run_attention.layer_idx    = p.layer_idx;
+                ac.run_attention.num_seqs     = R;
+                ac.run_attention.is_prefill   = 0;
+                ac.run_attention.chunk_start  = 0;
+                ac.run_attention.chunk_len    = 0;
+                ac.run_attention.emit_gating  = is_moe ? 1 : 0;
+                ac.run_attention.store_gating = is_moe ? 1 : 0;
+                ac.run_attention.row_offset   = 0;
+                ac.run_attention.spec_flags   = 1 | 2;  // export rows [0,R); batched verify
+                if (!dispatch_fused_attention(ac)) ok = false;
+                // Anchor position commit at the LAST linear layer — the
+                // per-row loop's exact rule (the anchor becomes valid only
+                // once every linear layer's copy is enqueued).
+                if (ok && is_linear && st && p.kda_snap_mask
+                    && linear_ord == linear_total - 1) {
+                    for (uint32_t j = 0; j < R; ++j) {
+                        if (!((p.kda_snap_mask >> j) & 1)) continue;
+                        const uint32_t anchor_pos = saved[j].token_pos + 1;
+                        const int slot = (anchor_pos % kp == 0) ? 0 : 1;
+                        if (!st->kda_anchors.slots[slot].empty())
+                            st->kda_anchors.pos[slot] = anchor_pos;
+                    }
+                }
+            }
+            clear_spec_kda_anchor_plan();
+        } else {
         for (uint32_t j = 0; j < R && ok; ++j) {
             be[0] = saved[j];
             ipc::Command ac{};
@@ -472,6 +586,7 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
                         st->kda_anchors.pos[slot] = anchor_pos;
                 }
             }
+        }
         }
         be[0] = saved[0];  // restore the descriptor region
         if (!ok) {

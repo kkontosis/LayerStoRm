@@ -766,6 +766,33 @@ public:
         void* out, float* lse,
         int layer_idx, void* stream) = 0;
 
+    /// P-32 stage 1 — batched spec_verify sparse decode (the "B=R verify"
+    /// arm). Contract: batch_size (2..8) query rows are CONSECUTIVE positions
+    /// of ONE sequence (teacher-forced verify — every row's K is already
+    /// appended); row b attends ONLY its own DSA selection (sparse_indices +
+    /// b*topk, topk_lengths[b]) bounded by its own causal prefix
+    /// host_seqlens_k[b] (HOST array, ascending, host_seqlens_k[B-1] ==
+    /// seq_len_kv); block table row B-1 covers the union prefix. Output/lse
+    /// land at row slices exactly as batch_size per-row calls would write
+    /// them. MUST be bit-identical per row to the same rows issued as
+    /// per-row batch-of-1 sparse decode calls on this device (the
+    /// INV-DSA-BATCH discipline: same kernel bodies per row, never a
+    /// re-implementation). Return false when this device has no batched
+    /// arm for the shape — the caller then falls back to the per-row
+    /// sub-dispatch loop (always correct, byte-identical to the retired
+    /// per-command loop). Default: no batched arm.
+    virtual bool sparse_verify_attention(
+        const void* /*q_compressed*/, int /*batch_size*/, int /*seq_len_kv*/,
+        const int* /*host_seqlens_k*/, const int* /*seqlens_k*/,
+        const int* /*block_tables*/, int /*max_blocks_per_seq*/,
+        void* /*kv_cache*/, int64_t /*cache_stride_block*/,
+        int /*cache_stride_row*/, int /*page_size*/,
+        const int* /*sparse_indices*/, const int* /*topk_lengths*/,
+        int /*topk*/, void* /*out*/, float* /*lse*/,
+        int /*layer_idx*/, void* /*stream*/) {
+        return false;
+    }
+
     // ── Decode graph ops ────────────────────────────────────────────────────
 
     /// Update decode graph runner's fixed buffers with per-step data.

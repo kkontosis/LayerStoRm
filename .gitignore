@@ -42,3 +42,6 @@ scratchpad/gf3_speed_saga/step17/trace17_on.csv
 scratchpad/gf3_speed_saga/step17/*.npz
 scratchpad/gf3_speed_saga/p30s1/*.csv
 .toolchain/
+scratchpad/gf3_speed_saga/p32s1/*.trace.csv
+scratchpad/gf3_speed_saga/p32s1/*.nsys-rep
+scratchpad/gf3_speed_saga/p32s1/*.sqlite

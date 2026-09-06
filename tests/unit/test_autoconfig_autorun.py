@@ -665,7 +665,11 @@ class TestRealModelMatchesTheChampion:
             champion = json.load(f)["model"]
         assert src.model_section == champion
         assert src.prepacked_dir == "test-data/GLM-5.2-prepacked"
-        assert src.tokenizer_path == "test-data/GLM-5.2"
+        # P-34: the weights dir wins when it carries tokenizer files (this
+        # box symlinks them beside the weights); a bare checkout resolves
+        # the name-prefix sibling test-data/GLM-5.2 instead.
+        assert src.tokenizer_path in ("test-data/GLM-5.2-GGUF-Q4_K_XL",
+                                      "test-data/GLM-5.2")
 
 
 class TestPlacementFit:

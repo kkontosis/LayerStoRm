@@ -481,6 +481,16 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
         }
     }
 
+    // P-32 stage 1 TEMP PROBE (LS_SPEC_DISPATCH_PROF=1): host section
+    // timing of spec-batched dispatches — kv_meta / stage / execute.
+    static const bool spec_prof = [] {
+        const char* e = std::getenv("LS_SPEC_DISPATCH_PROF");
+        return e && *e && *e != '0';
+    }();
+    const bool prof_this = spec_prof && (p.spec_flags & 2) && p.num_seqs > 1;
+    std::chrono::steady_clock::time_point pt0, pt1, pt2, pt3;
+    if (prof_this) pt0 = std::chrono::steady_clock::now();
+
     const auto kv_meta_res = build_kv_metadata(batch_size, dcp_size);
     if (kv_meta_res == KvMetaResult::kFailed) {
         // TD-GOLDEN-KV-EXHAUST: never run attention with a missing slot
@@ -611,6 +621,10 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
     }
     params.batch_row_offset  = static_cast<int>(p.row_offset);
     params.superchunk        = p.superchunk;  // SC: V4 layer-sweep replays
+    // P-32 stage 1: spec_flags bit1 = batched spec_verify row block (the
+    // handler emits it only for MLA layers under LS_SPEC_VERIFY_BATCHED).
+    params.spec_verify_batched =
+        (p.spec_flags & 2) != 0 && p.is_prefill == 0 && p.num_seqs > 1;
     params.cache_stride_block = deps_.kv_cache_stride_block;
     params.cache_stride_row  = deps_.kv_cache_stride_row;
     params.page_size         = deps_.kv_page_size;
@@ -649,12 +663,15 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
     // TD-51h RESOLVED: is_sparse remains false until sparse_indices are populated
     // by DSA indexer infrastructure. Dense prefill is correct for all layers until then.
 
+    if (prof_this) pt1 = std::chrono::steady_clock::now();
+
     // Phase B: arch step staging — MLA: the DSA indexer coverage state
     // machine + paged indexer-K provisioning + chunk-descriptor synthesis
     // (arch_mla.cpp); V4: the chunk-descriptor copy (arch_deepseek_v4.cpp).
     if (!arch.stage_step(p, params, batch_size, layer, dcp_size,
                          kv_meta_ok))
         return false;
+    if (prof_this) pt2 = std::chrono::steady_clock::now();
 
     // Per-entry host lengths (kv-meta staging). Replicated: rank rows are
     // identical, rank 0 suffices. Sharded (KVS-2): rank rows hold LOCAL
@@ -674,6 +691,23 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
     // (arch_mla.cpp). Errors surface as command completions.
     if (!arch.execute(p, params, batch_size, layer, dcp_size, kv_meta_ok))
         return false;
+    if (prof_this) {
+        pt3 = std::chrono::steady_clock::now();
+        static uint64_t n_ = 0, us_meta_ = 0, us_stage_ = 0, us_exec_ = 0;
+        auto us = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+                    .count());
+        };
+        us_meta_ += us(pt0, pt1);
+        us_stage_ += us(pt1, pt2);
+        us_exec_ += us(pt2, pt3);
+        if (++n_ % 512 == 0)
+            spdlog::info("[spec-prof] n={} kv_meta {:.1f}us stage {:.1f}us "
+                         "exec {:.1f}us (means/dispatch)",
+                         n_, double(us_meta_) / n_, double(us_stage_) / n_,
+                         double(us_exec_) / n_);
+    }
 
     if (attn_prof_this) {
         attn_prof_post_exec_ = std::chrono::steady_clock::now();

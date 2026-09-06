@@ -2531,6 +2531,29 @@ private:
     // restores the phase-B exposed-H2D verify byte-identically.
     int spec_verify_fetch_hide_enabled_ = -1;  // -1 unread, 0 off, 1 on
     bool spec_verify_fetch_hide_enabled();
+    // P-32 stage 1 (LS_SPEC_VERIFY_BATCHED, default ON): sparse-MLA verify
+    // layers run their R rows as ONE batched dispatch (s_q=R device arm or
+    // per-row sub-dispatch fallback) instead of R per-row commands. Only
+    // consulted on spec_verify FAR commands; =0 restores the phase-B
+    // per-row command loop byte-identically.
+    int spec_verify_batched_enabled_ = -1;  // -1 unread, 0 off, 1 on
+    bool spec_verify_batched_enabled();
+    // P-32 stage 1: per-command KDA anchor plan for a batched spec_verify
+    // dispatch on a LINEAR layer — staged by handle_far_forward_layer
+    // (claim/invalidate bookkeeping stays host-side there, mirroring the
+    // per-row loop), consumed by ArchGlm5Next::stage_step into KdaStepRank
+    // (the executor enqueues the D2Ds between the per-row recurrence
+    // updates). Cleared after every spec_verify dispatch.
+    struct SpecKdaAnchorRank {
+        std::array<const void*, 8> src{};
+        std::array<void*, 8> dst{};
+    };
+    std::vector<SpecKdaAnchorRank> spec_kda_anchor_plan_;  // [dcp ranks]
+    size_t spec_kda_anchor_unit_bytes_ = 0;
+    void clear_spec_kda_anchor_plan() {
+        spec_kda_anchor_plan_.clear();
+        spec_kda_anchor_unit_bytes_ = 0;
+    }
     // Decode-shaped predicate the three fast paths share: plain B=1 decode,
     // or a spec_verify R<=8 row block under LS_SPEC_VERIFY_FETCH_HIDE.
     bool far_hide_shape(const ProgressiveMoeState& st) {

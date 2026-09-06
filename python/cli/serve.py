@@ -57,12 +57,13 @@ from orchestrator.dspark_draft import DsparkDraftConfig  # noqa: E402
 from orchestrator.orchestrator import Orchestrator  # noqa: E402
 from server.http_server import LayerStoRmServer  # noqa: E402
 from tokenizer import ChatTemplateRenderer, TokenizerWrapper  # noqa: E402
+from tokenizer import locator  # noqa: E402
 
 log = logging.getLogger("layerstorm.serve")
 
-# Files whose presence marks a usable HuggingFace tokenizer directory.
-_TOKENIZER_MARKERS = ("tokenizer.json", "tokenizer_config.json",
-                      "tokenizer.model")
+# Files whose presence marks a usable HuggingFace tokenizer directory
+# (canonical list + shared search precedence live in tokenizer.locator).
+_TOKENIZER_MARKERS = locator.TOKENIZER_MARKERS
 
 
 # ---------------------------------------------------------------------------
@@ -296,12 +297,15 @@ def resolve_options(config: dict, args: argparse.Namespace) -> ServeOptions:
 
 def resolve_tokenizer_dir(
     weights_path: str | Path, tokenizer_path: str = "auto",
+    model_name: str = "", repo_root: str | Path = "",
 ) -> Path:
     """Resolve the HuggingFace tokenizer directory for a model.
 
-    Explicit ``tokenizer_path`` (anything but "auto") wins.  "auto" looks
-    for tokenizer files in the weights directory (or, for single-file
-    weights such as GGUF, in the file's parent directory).
+    P-34 step 1 precedence (tokenizer.locator is the shared search):
+    explicit ``tokenizer_path`` (anything but "auto") always wins; "auto"
+    looks in the weights directory (or a single-file checkpoint's parent),
+    then at name-prefix siblings beside the weights, and — FALLBACK ONLY,
+    logged loudly — at repo ``test-data/`` dirs matching ``model_name``.
     """
     if tokenizer_path and tokenizer_path != "auto":
         p = Path(tokenizer_path)
@@ -310,15 +314,75 @@ def resolve_tokenizer_dir(
                 f"serving.tokenizer_path does not exist: {p}")
         return p
 
+    root = str(repo_root) if repo_root else str(
+        Path(__file__).resolve().parents[2])
+    found, tier = locator.locate_tokenizer_dir(
+        str(weights_path), model_name=model_name, repo_root=root)
+    if found:
+        if tier == locator.TIER_TEST_DATA:
+            log.warning(
+                "TOKENIZER FALLBACK: no tokenizer files beside the weights "
+                "(%s) — falling back to repo test-data at %s. This works on "
+                "this checkout only; place the HF tokenizer files "
+                "(tokenizer.json, tokenizer_config.json, ...) next to the "
+                "weights or set serving.tokenizer_path.",
+                weights_path, found)
+        elif tier == locator.TIER_SIBLING:
+            log.info("tokenizer resolved from weights sibling %s", found)
+        return Path(found)
     w = Path(weights_path)
     candidate = w if w.is_dir() else w.parent
-    if any((candidate / m).is_file() for m in _TOKENIZER_MARKERS):
-        return candidate
     raise FileNotFoundError(
         f"no HuggingFace tokenizer files ({', '.join(_TOKENIZER_MARKERS)}) "
-        f"found in {candidate} — set serving.tokenizer_path in the config "
-        "(GGUF-embedded tokenizers are not extracted; "
-        "see TD-SERVE-GGUF-TOKENIZER)")
+        f"found in {candidate}, its name-prefix siblings, or repo "
+        f"test-data/ — put the tokenizer files next to the weights or set "
+        "serving.tokenizer_path (GGUF-embedded tokenizers are not "
+        "extracted; see TD-SERVE-GGUF-TOKENIZER)")
+
+
+def _has_chat_template(d: Path) -> bool:
+    """A directory can carry the chat template as a .jinja file OR
+    embedded in tokenizer_config.json (ChatTemplateRenderer reads both)."""
+    if (d / "chat_template.jinja").is_file():
+        return True
+    try:
+        with open(d / "tokenizer_config.json") as f:
+            return bool(json.load(f).get("chat_template"))
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_asset_dir(
+    filename: str, tok_dir: Path, weights_path: str | Path,
+    model_name: str = "", repo_root: str | Path = "",
+    present=None,
+) -> Path:
+    """P-34: every model-metadata asset (chat_template.jinja,
+    generation_config.json, ...) follows the SAME precedence as the
+    tokenizer.  The resolved tokenizer dir wins when it already carries
+    the asset (an explicit serving.tokenizer_path keeps its assets
+    together); otherwise search beside the weights, with repo test-data/
+    as a loudly-logged fallback.  Returns the directory to read the asset
+    from — tok_dir when the asset exists nowhere (consumers handle
+    absence themselves)."""
+    check = present if present is not None else (
+        lambda d: (Path(d) / filename).is_file())
+    if check(tok_dir):
+        return Path(tok_dir)
+    root = str(repo_root) if repo_root else str(
+        Path(__file__).resolve().parents[2])
+    d, tier = locator._search_chain(
+        str(weights_path), lambda x: check(Path(x)),
+        model_name=model_name, repo_root=root)
+    if not d:
+        return Path(tok_dir)
+    if tier == locator.TIER_TEST_DATA:
+        log.warning(
+            "METADATA FALLBACK: %s not found beside the weights (%s) — "
+            "using repo test-data at %s. This works on this checkout "
+            "only; place the file next to the weights.",
+            filename, weights_path, d)
+    return Path(d)
 
 
 def read_sampling_defaults(
@@ -462,13 +526,20 @@ def build_stack(
     # ── Tokenizer + chat template (before engine start: fail fast) ──────
     sampling_defaults: dict = {}
     if tokenizer is None:
-        tok_dir = resolve_tokenizer_dir(weights_path, opts.tokenizer_path)
+        tok_dir = resolve_tokenizer_dir(
+            weights_path, opts.tokenizer_path, model_name=opts.model_name)
         log.info("loading tokenizer from %s", tok_dir)
         tokenizer = TokenizerWrapper(str(tok_dir))
         if chat_template is None:
-            chat_template = ChatTemplateRenderer(tok_dir)
+            ct_dir = resolve_asset_dir(
+                "chat_template.jinja", tok_dir, weights_path,
+                model_name=opts.model_name, present=_has_chat_template)
+            chat_template = ChatTemplateRenderer(ct_dir)
+        gc_dir = resolve_asset_dir(
+            "generation_config.json", tok_dir, weights_path,
+            model_name=opts.model_name)
         sampling_defaults = read_sampling_defaults(
-            tok_dir, opts.tokenizer_mode)
+            gc_dir, opts.tokenizer_mode)
         if sampling_defaults:
             log.info("sampling defaults (%s, generation_config.json): %s",
                      opts.tokenizer_mode, sampling_defaults)

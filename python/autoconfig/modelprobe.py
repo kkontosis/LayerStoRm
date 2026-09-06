@@ -29,14 +29,20 @@ from __future__ import annotations
 
 import glob as _glob
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
 
+from tokenizer.locator import (TIER_TEST_DATA, TOKENIZER_MARKERS,
+                               locate_tokenizer_dir)
+
 from . import gguf_meta
 from .explain import Infeasible
 
-TOKENIZER_MARKERS = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")
+_log = logging.getLogger("layerstorm.autoconfig")
+
+# TOKENIZER_MARKERS is re-exported from tokenizer.locator (shared, P-34).
 
 
 @dataclass(frozen=True)
@@ -158,41 +164,17 @@ def first_shard(path: str) -> str:
 
 def find_tokenizer_dir(weights_abs: str, repo_root: str = "",
                        display_name: str = "") -> str:
-    """serve.py resolve_tokenizer_dir("auto") only looks in the WEIGHTS dir
-    and GGUF-embedded tokenizers are not extracted (TD-SERVE-GGUF-TOKENIZER),
-    so a GGUF-only box needs a real path or serve refuses to boot. Look in
-    the weights dir, then at siblings whose name is a prefix of the weights
-    dir name (test-data/GLM-5.2-GGUF-Q4_K_XL -> test-data/GLM-5.2), then —
-    P-31: weights living OUTSIDE the repo (e.g. /srv/models) have no useful
-    siblings — at repo test-data dirs whose sanitised name matches the
-    model's own display name (test-data/GLM-5.3-Flash <-> 'glm-5.3-flash')."""
-    wdir = weights_abs if os.path.isdir(weights_abs) else os.path.dirname(weights_abs)
-    if any(os.path.isfile(os.path.join(wdir, m)) for m in TOKENIZER_MARKERS):
-        return wdir
-    parent, base = os.path.dirname(wdir), os.path.basename(wdir)
-    best = ""
-    for sib in sorted(_glob.glob(os.path.join(parent, "*"))):
-        if not os.path.isdir(sib) or os.path.abspath(sib) == os.path.abspath(wdir):
-            continue
-        name = os.path.basename(sib)
-        if not base.startswith(name):
-            continue
-        if any(os.path.isfile(os.path.join(sib, m)) for m in TOKENIZER_MARKERS):
-            if len(name) > len(os.path.basename(best or "")):
-                best = sib
-    if best or not (repo_root and display_name):
-        return best
-    want = _sanitise(display_name)
-    for cand in sorted(_glob.glob(os.path.join(os.path.abspath(repo_root),
-                                               "test-data", "*"))):
-        if not os.path.isdir(cand):
-            continue
-        if _sanitise(os.path.basename(cand)) != want:
-            continue
-        if any(os.path.isfile(os.path.join(cand, m))
-               for m in TOKENIZER_MARKERS):
-            return cand
-    return ""
+    """serve.py resolve_tokenizer_dir("auto") prefers the WEIGHTS dir and
+    GGUF-embedded tokenizers are not extracted (TD-SERVE-GGUF-TOKENIZER),
+    so a GGUF-only box needs a real path or serve refuses to boot.  The
+    search (P-34: ONE precedence, shared with serve via tokenizer.locator):
+    weights dir, then name-prefix siblings beside the weights
+    (test-data/GLM-5.2-GGUF-Q4_K_XL -> test-data/GLM-5.2), then — FALLBACK
+    ONLY, surfaced loudly by probe_model — repo test-data dirs whose
+    sanitised name matches the model's display name (P-31: weights living
+    OUTSIDE the repo, e.g. /srv/models, have no useful siblings)."""
+    return locate_tokenizer_dir(weights_abs, model_name=display_name,
+                                repo_root=repo_root)[0]
 
 
 def find_prepacked_dir(weights_abs: str, repo_root: str) -> str:
@@ -396,6 +378,17 @@ _HF_DROP = {
 
 
 def _hf_model_section(hf: dict):
+    descended = False
+    if isinstance(hf.get("text_config"), dict):
+        # Multimodal HF config (e.g. GLM-5.3-Flash): the text tower IS the
+        # model we serve; geometry lives in text_config while the engine's
+        # architecture name is the top-level family model_type
+        # ("glm5_next", not "glm5_next_text").  P-34: a config.json placed
+        # beside GGUF weights must yield a correct section.
+        tc = dict(hf["text_config"])
+        if hf.get("model_type"):
+            tc["model_type"] = hf["model_type"]
+        hf, descended = tc, True
     m = {}
     for k, v in hf.items():
         if k in _HF_DROP:
@@ -412,7 +405,10 @@ def _hf_model_section(hf: dict):
     ordered.update(m)
     return ordered, ["HuggingFace config.json (field names match ours per "
                      "the config convention; only model_type/scoring_func "
-                     "are renamed)"]
+                     "are renamed)"
+                     + (" — multimodal config: text_config is the model, "
+                        "top-level model_type is the architecture"
+                        if descended else "")]
 
 
 # ------------------------------------------------------------------ probe
@@ -440,6 +436,16 @@ def probe_model(model_path: str, repo_root: str = ".", *,
         else abs_path.endswith(".gguf")
     prov = []
 
+    def _hf_has_geometry(cfg) -> bool:
+        """A config.json beside GGUF weights is only authoritative for the
+        model SECTION when it actually carries the geometry — tokenizer
+        checkouts often ship a stub (model_type + vocab + token ids, e.g.
+        the V4-Flash weights dir).  A stub must not shadow GGUF metadata
+        (P-34)."""
+        tc = cfg.get("text_config") if isinstance(
+            cfg.get("text_config"), dict) else cfg
+        return "num_hidden_layers" in tc
+
     if gguf_here:
         weights_abs = first_shard(abs_path)
         weights_format = "gguf"
@@ -450,10 +456,14 @@ def probe_model(model_path: str, repo_root: str = ".", *,
         if base_model_section:
             section, prov = dict(base_model_section), ["base recipe model section"]
             source = "base-recipe"
-        elif hf is not None:
+        elif hf is not None and _hf_has_geometry(hf):
             section, prov = _hf_model_section(hf)
             source = "hf-config"
         else:
+            if hf is not None:
+                prov.append("config.json beside the weights lacks model "
+                            "geometry (stub) — ignored for the model "
+                            "section, using GGUF metadata")
             profile = profile_for(arch)
             if profile is None:
                 raise Infeasible(
@@ -497,12 +507,26 @@ def probe_model(model_path: str, repo_root: str = ".", *,
                     "matches these weights)")
     live_prepack = (not prep) and weights_format == "gguf"
 
-    tok = tokenizer or find_tokenizer_dir(weights_abs, repo_root, display)
+    tok, tok_tier = (tokenizer, "explicit") if tokenizer else \
+        locate_tokenizer_dir(weights_abs, model_name=display,
+                             repo_root=repo_root)
     tok_out = _rel_to(tok, repo_root) if tok else "auto"
-    if tok:
-        prov.append("tokenizer dir " + tok_out + " (serve's 'auto' only "
-                    "searches the weights dir and GGUF tokenizers are not "
-                    "extracted — TD-SERVE-GGUF-TOKENIZER)")
+    if tok and tok_tier == TIER_TEST_DATA:
+        # P-34: a repo test dir satisfying a production derivation is a
+        # works-on-this-checkout-only arrangement — allowed, but LOUD.
+        _log.warning(
+            "TOKENIZER FALLBACK: no tokenizer files beside the weights "
+            "(%s) — using repo test-data at %s. Place the HF tokenizer "
+            "files next to the weights (or pass --tokenizer) to make the "
+            "recipe portable.", weights_abs, tok)
+        prov.append("tokenizer dir " + tok_out + " — FALLBACK from repo "
+                    "test-data/ (nothing found beside the weights; put the "
+                    "HF tokenizer files next to the weights or pass "
+                    "--tokenizer — TD-SERVE-GGUF-TOKENIZER)")
+    elif tok:
+        prov.append("tokenizer dir " + tok_out + " (found beside the "
+                    "weights; GGUF tokenizers are not extracted — "
+                    "TD-SERVE-GGUF-TOKENIZER)")
 
     return ModelSource(
         model_section=section,

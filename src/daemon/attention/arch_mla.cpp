@@ -31,6 +31,7 @@
 #include <atomic>   // S4: throttled contract-violation logs (paged indexer)
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -2312,7 +2313,78 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                 r, params.layer_idx, B, params.sparse_indices[r],
                 params.topk_lengths[r], indexer_step_fresh_, stream, &utv);
         }
-        if (tiered_union) {
+        // P-32 stage 1 (LS_SPEC_VERIFY_BATCHED): batched spec_verify row
+        // block — B consecutive positions of ONE sequence, teacher-forced
+        // (all K appended by the common prefix). NEVER the flat batched
+        // call below (its staging law is single-row/multi-seq shaped).
+        // Try the device's single-launch s_q=B arm; a device without one
+        // (TQ; snapmla with FP8 route off) runs the per-row batch-of-1
+        // sub-dispatch loop — the exact kernels the per-row command loop
+        // ran, bit-identical by construction (mixed_rows precedent).
+        // Excluded when tiering staged this step (kv_tiering is B==1-scoped
+        // at decode, so this cannot trigger today — belt and braces) or a
+        // mixed sparse/dense cohort needs the INV-DSA-ROWMIX split.
+        const bool verify_batched = params.spec_verify_batched && B > 1
+            && !chunk_rows && !mixed_rows && params.is_sparse
+            && !params.kv_tiering
+            && params.sparse_indices && params.topk_lengths;
+        if (verify_batched) {
+            // Per-row causal bounds: rows are consecutive, so bound_b =
+            // union_len - (B-1) + b (host_seqlens_k when present must agree
+            // — derived either way so decode-shaped steps without a host
+            // mirror stay correct).
+            std::array<int, 8> vbounds{};
+            for (int b = 0; b < B && b < 8; ++b)
+                vbounds[static_cast<size_t>(b)] =
+                    params.host_seqlens_k
+                        ? params.host_seqlens_k[b]
+                        : seq_len_kv - (B - 1) + b;
+            const bool dev_batched = attn->sparse_verify_attention(
+                q_attn[r], B, seq_len_kv, vbounds.data(),
+                params.seqlens_k ? params.seqlens_k[r] : nullptr,
+                params.block_tables ? params.block_tables[r] : nullptr,
+                params.max_blocks_per_seq,
+                params.kv_cache_ptrs ? params.kv_cache_ptrs[r] : nullptr,
+                params.cache_stride_block, params.cache_stride_row,
+                params.page_size, params.sparse_indices[r],
+                params.topk_lengths[r], opts_.index_topk_rows(),
+                prefill_out_[r], prefill_lse_[r], params.layer_idx, stream);
+            if (!dev_batched) {
+                const int KV = opts_.kv_lora_rank + opts_.qk_rope_head_dim;
+                const size_t q_row_b   =
+                    static_cast<size_t>(attn_num_heads_) * KV * 2;   // BF16
+                const size_t out_row_b =
+                    static_cast<size_t>(attn_num_heads_)
+                    * opts_.kv_lora_rank * 2;
+                for (int b = 0; b < B; ++b) {
+                    attn->prefill_attention(
+                        static_cast<const char*>(q_attn[r]) + b * q_row_b,
+                        /*batch_size=*/1,
+                        vbounds[static_cast<size_t>(b)],
+                        params.seqlens_k ? params.seqlens_k[r] + b : nullptr,
+                        params.block_tables
+                            ? params.block_tables[r]
+                                  + static_cast<size_t>(b)
+                                        * params.max_blocks_per_seq
+                            : nullptr,
+                        params.max_blocks_per_seq,
+                        params.kv_cache_ptrs ? params.kv_cache_ptrs[r]
+                                             : nullptr,
+                        params.cache_stride_block, params.cache_stride_row,
+                        params.page_size,
+                        /*is_sparse=*/true, /*chunk_causal=*/false,
+                        params.sparse_indices[r]
+                            + static_cast<size_t>(b)
+                                  * opts_.index_topk_rows(),
+                        params.topk_lengths[r] + b,
+                        opts_.index_topk_rows(),
+                        static_cast<char*>(prefill_out_[r]) + b * out_row_b,
+                        prefill_lse_[r]
+                            + static_cast<size_t>(b) * attn_num_heads_,
+                        params.layer_idx, stream);
+                }
+            }
+        } else if (tiered_union) {
             attn->prefill_attention(
                 q_attn[r], B, utv.seq_len_kv,
                 utv.seqlens_k, utv.block_tables, utv.max_blocks_per_seq,
@@ -3101,6 +3173,17 @@ bool ArchMla::stage_step(
                     d_.ensure_indexer_pages(be[b].seq_id, pos, b, dcp_size);
                 if (ipr == IndexerPageResult::kOk) {
                     cov.mode = IndexerSeqMode::kPaged;
+                    // P-32 stage 1 (batched spec_verify cohorts): advance
+                    // the frontier IMMEDIATELY, inside the per-row walk —
+                    // exactly what the per-row COMMAND loop did (each row's
+                    // own dispatch bumped before the next row classified).
+                    // The old split (classify all rows, then bump in a
+                    // second loop) read every row against the UN-bumped
+                    // frontier: row 1 of a same-seq consecutive cohort
+                    // classified as a GAP -> permanent kDead dense. B==1
+                    // and multi-seq cohorts are byte-identical either way
+                    // (each row's seq has its own cov).
+                    if (pos == cov.next_pos) ++cov.next_pos;
                 } else if (ipr == IndexerPageResult::kExhausted
                            && indexer_exhaustion_fatal(be[b].seq_id)) {
                     raise_indexer_exhausted();  // leave cov.mode intact
@@ -3148,13 +3231,8 @@ bool ArchMla::stage_step(
                 // already).
                 params.indexer_step_key = key ? key : 1;
                 d_.last_indexer_step_key_ = params.indexer_step_key;
-                for (int b = 0; b < batch_size; ++b) {
-                    if (d_.indexer_row_dense_[b]) continue;
-                    auto& seq_st2 = d_.sequences_[be[b].seq_id];
-                    auto& cov = mtp_cov_layer ? seq_st2.mtp_indexer_cov
-                                              : seq_st2.indexer_cov;
-                    if (be[b].token_pos == cov.next_pos) ++cov.next_pos;
-                }
+                // (P-32 stage 1: the frontier bump moved INTO the per-row
+                // classification walk above — see the kOk arm.)
                 // MIXED cohort (only possible at B>1): hand the executor the
                 // per-row mask (INV-DSA-ROWMIX split). Uniform all-sparse
                 // cohorts keep the legacy nullptr (batched sparse path).

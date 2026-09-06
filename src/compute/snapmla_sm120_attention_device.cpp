@@ -406,6 +406,57 @@ public:
         }
     }
 
+    // ── P-32 stage 1: batched spec_verify sparse decode (s_q = R) ──────────
+    // The FP8 split-KV decode kernel is s_q-general (grid.y carries the query
+    // rows; every per-row compute path indexes row-local Q/indices/out
+    // slices), so R teacher-forced verify rows of ONE sequence run as ONE
+    // launch — each row bit-identical to its own 1-row call (the b1 gate
+    // above). Accepts only the exact shape the champion decode route serves
+    // (FP8 route on, d_rope==0, d_c==512); anything else returns false and
+    // the executor's per-row sub-dispatch loop runs the usual kernels.
+    bool sparse_verify_attention(
+        const void* q_compressed, int batch_size, int seq_len_kv,
+        const int* host_seqlens_k, const int* seqlens_k,
+        const int* block_tables, int max_blocks_per_seq,
+        void* kv_cache, int64_t cache_stride_block,
+        int cache_stride_row, int page_size,
+        const int* sparse_indices, const int* topk_lengths,
+        int topk, void* out, float* lse,
+        int /*layer_idx*/, void* stream) override
+    {
+        if (!(fp8_decode_on_ && d_rope_ == 0 && d_c_ == 512 && kv_cache
+              && prefill_indices_scratch_ && sparse_indices
+              && batch_size >= 1 && batch_size <= 8))
+            return false;
+        auto s = static_cast<cudaStream_t>(stream);
+        // Union-prefix linearization: the LAST row's block-table row covers
+        // the whole prefix [0, seq_len_kv) (rows are consecutive positions
+        // of one sequence — the chunk_causal contract).
+        const int lin_row = batch_size - 1;
+        const int max_blocks = prefill_max_blocks(
+            max_blocks_per_seq, seq_len_kv, page_size);
+        if (!block_tables || !seqlens_k) return false;
+        launch_linearize_block_tables(
+            block_tables + static_cast<size_t>(lin_row) * max_blocks,
+            seqlens_k + lin_row, /*batch=*/1, max_blocks, page_size,
+            seq_len_kv, prefill_indices_scratch_,
+            prefill_seq_offsets_scratch_, prefill_num_fetch_scratch_,
+            stream);
+        if (!logged_verify_) {
+            logged_verify_ = true;
+            std::fprintf(stderr,
+                         "[snapmla] spec_verify batched decode ENGAGED "
+                         "(s_q=%d, topk=%d; LS_SPEC_VERIFY_BATCHED=0 "
+                         "restores the per-row loop)\n",
+                         batch_size, topk);
+        }
+        fp8_sparse_decode(q_compressed, seq_len_kv, kv_cache,
+                          cache_stride_block, cache_stride_row, page_size,
+                          sparse_indices, topk_lengths, topk, out, lse, s,
+                          /*rows=*/batch_size, /*host_bounds=*/host_seqlens_k);
+        return true;
+    }
+
     // ── Decode graph ops ────────────────────────────────────────────────────
 
     void decode_graph_update(
@@ -515,6 +566,7 @@ private:
         if (dec_splits_) { device_.device_free(dec_splits_); dec_splits_ = nullptr; }
         dec_topk_pad_ = 0;
         dec_nsp_ = 0;
+        dec_rows_ = 0;
     }
 
     // Exact integer replica of deps smxx/get_mla_metadata.cu with topk > 0
@@ -571,26 +623,33 @@ private:
         }
     }
 
-    void ensure_decode_scratch(int topk_pad) {
+    void ensure_decode_scratch(int topk_pad, int rows = 1) {
         const int num_blocks = topk_pad / 64;
         // Auto split request: one 64-row block per split (num_blocks + 1
         // parts makes the scheduler payload exactly one block); combine cap
         // 192 (deps mla_combine MAX_SPLITS).
         int nsp = nsp_request_ > 0 ? nsp_request_ : num_blocks + 1;
         nsp = std::max(1, std::min(nsp, 192));
-        if (dec_topk_pad_ == topk_pad && dec_nsp_ == nsp) return;
+        // P-32 stage 1: scratch is sized for the LARGEST row count seen —
+        // plain decode (rows=1) and batched verify (rows<=8) share it; a
+        // grow re-allocates, a shrink keeps the larger buffers (the strides
+        // are per-call, so a 1-row call over 8-row scratch is identical).
+        if (dec_topk_pad_ == topk_pad && dec_nsp_ == nsp
+            && rows <= dec_rows_) return;
+        rows = std::max(rows, dec_topk_pad_ == topk_pad && dec_nsp_ == nsp
+                                  ? dec_rows_ : 1);
         free_decode_scratch();
 
         dec_indices_ = static_cast<int*>(device_.device_alloc(
-            static_cast<size_t>(topk_pad) * sizeof(int)));
+            static_cast<size_t>(rows) * topk_pad * sizeof(int)));
         dec_q_fp8_ = device_.device_alloc(
-            static_cast<size_t>(h_q_) * d_c_);  // FP8 = 1 B/elem
+            static_cast<size_t>(rows) * h_q_ * d_c_);  // FP8 = 1 B/elem
         dec_q_scales_ = static_cast<float*>(device_.device_alloc(
-            static_cast<size_t>(h_q_) * sizeof(float)));
+            static_cast<size_t>(rows) * h_q_ * sizeof(float)));
         dec_o_accum_ = static_cast<float*>(device_.device_alloc(
-            static_cast<size_t>(nsp) * h_q_ * d_c_ * sizeof(float)));
+            static_cast<size_t>(nsp) * rows * h_q_ * d_c_ * sizeof(float)));
         dec_lse_accum_ = static_cast<float*>(device_.device_alloc(
-            static_cast<size_t>(nsp) * h_q_ * sizeof(float)));
+            static_cast<size_t>(nsp) * rows * h_q_ * sizeof(float)));
         dec_meta_ = static_cast<int*>(device_.device_alloc(
             static_cast<size_t>(nsp) * TileSchedulerMetaDataSize
             * sizeof(int)));
@@ -607,7 +666,8 @@ private:
         // walks whole 64-row blocks; -1 rows are masked, and the fixed
         // rescale guard makes fully-masked blocks a no-op).
         cudaMemset(dec_indices_, 0xFF,
-                   static_cast<size_t>(topk_pad) * sizeof(int));
+                   static_cast<size_t>(rows) * topk_pad * sizeof(int));
+        dec_rows_ = rows;
 
         std::vector<int> meta, splits;
         sched_meta_host(topk_pad, nsp, meta, splits);
@@ -629,22 +689,38 @@ private:
         }
     }
 
+    // P-32 stage 1: `rows` > 1 = the batched spec_verify shape — rows
+    // consecutive positions of ONE sequence, per-row selections at stride
+    // `topk` in sparse_indices, per-row causal bounds host_bounds[b]
+    // (ascending; host_bounds[rows-1] == seq_len_kv). The s_q grid axis of
+    // the split-KV kernel carries the rows; every per-row compute is the
+    // exact s_q=1 body (grid.y indexes row-local Q/indices/out slices), so
+    // each row is bit-identical to its own 1-row call (INV-DSA-BATCH
+    // discipline; locked by SnapMlaSparseVerify.* GPU tests).
     void fp8_sparse_decode(const void* q_compressed, int seq_len_kv,
                            void* kv_cache, int64_t cache_stride_block,
                            int cache_stride_row, int page_size,
                            const int* sparse_indices, const int* topk_lengths,
-                           int topk, void* out, float* lse, cudaStream_t s) {
+                           int topk, void* out, float* lse, cudaStream_t s,
+                           int rows = 1, const int* host_bounds = nullptr) {
         const int topk_pad = ((topk + 63) / 64) * 64;
-        ensure_decode_scratch(topk_pad);
+        ensure_decode_scratch(topk_pad, rows);
         const int d_qk = d_c_ + d_rope_;
         const int d_v = d_c_;  // absorbed geometry: V is the latent
 
         // 1. Translate DSA token positions → pool slots (composes the
         // linearization above); -1 outside topk_length/causal bound. The
-        // [topk, topk_pad) tail is the persistent -1 fill.
-        launch_tq_sparse_translate_indices(
-            sparse_indices, prefill_indices_scratch_, topk_lengths, topk,
-            seq_len_kv, /*seq_len_dev=*/nullptr, dec_indices_, s);
+        // [topk, topk_pad) tail is the persistent -1 fill. Per row: the
+        // row's OWN causal bound (host_bounds[b], else the flat bound).
+        for (int b = 0; b < rows; ++b) {
+            launch_tq_sparse_translate_indices(
+                sparse_indices + static_cast<size_t>(b) * topk,
+                prefill_indices_scratch_, topk_lengths ? topk_lengths + b
+                                                       : nullptr,
+                topk, host_bounds ? host_bounds[b] : seq_len_kv,
+                /*seq_len_dev=*/nullptr,
+                dec_indices_ + static_cast<size_t>(b) * topk_pad, s);
+        }
 
         // 2. Quantize Q: BF16 → FP8 NOPE + per-head scales (rope leg empty
         // at d_rope == 0; q_rope output stays null).
@@ -653,7 +729,7 @@ private:
         qq.q_nope_fp8 = static_cast<__nv_fp8_e4m3*>(dec_q_fp8_);
         qq.q_rope_bf16 = nullptr;
         qq.q_scales = dec_q_scales_;
-        qq.s_q = 1;
+        qq.s_q = rows;
         qq.h_q = h_q_;
         qq.d_qk = d_qk;
         qq.d_nope = d_c_;
@@ -663,7 +739,7 @@ private:
         // cache directly — no staging).
         sm120::decode::sparse_fp8::SparseAttnDecodeParams p{};
         p.b = 1;
-        p.s_q = 1;
+        p.s_q = rows;
         p.h_q = h_q_;
         p.h_kv = 1;
         p.d_qk = d_qk;
@@ -694,9 +770,9 @@ private:
         p.stride_o_h_q = d_v;
         p.lse_accum = dec_lse_accum_;
         p.o_accum = dec_o_accum_;
-        p.stride_lse_accum_split = h_q_;       // num_q_seqs = s_q * h_q
+        p.stride_lse_accum_split = rows * h_q_;  // num_q_seqs = s_q * h_q
         p.stride_lse_accum_s_q = h_q_;
-        p.stride_o_accum_split = h_q_ * d_v;
+        p.stride_o_accum_split = rows * h_q_ * d_v;
         p.stride_o_accum_s_q = h_q_ * d_v;
         p.stride_o_accum_h_q = d_v;
         p.tile_scheduler_metadata_ptr =
@@ -716,7 +792,7 @@ private:
             cp.b = 1;
             cp.h_q = h_q_;
             cp.h_k = 1;
-            cp.q_seq_per_hk = h_q_;  // h_q / h_k * s_q
+            cp.q_seq_per_hk = rows * h_q_;  // h_q / h_k * s_q
             cp.d_v = d_v;
             cp.o_ptr = out;
             cp.softmax_lse_ptr = lse;
@@ -756,6 +832,7 @@ private:
     int  nsp_request_ = 0;            // LS_SNAPMLA_NSP (0 = auto)
     bool logged_budget_ = false;
     bool logged_fp8_ = false;
+    bool logged_verify_ = false;  // P-32 stage 1 engagement witness
     // Stage (b) scratch (allocated at first decode; shapes fixed per boot)
     int*   dec_indices_ = nullptr;    // [topk_pad] pool slots, -1 padded
     void*  dec_q_fp8_ = nullptr;      // [h_q, d_c] FP8
@@ -767,6 +844,7 @@ private:
     int    dec_topk_pad_ = 0;
     int    dec_nsp_ = 0;
     int    dec_total_splits_ = 0;
+    int    dec_rows_ = 0;   // P-32 stage 1: row capacity of the scratch
 };
 
 // ── Factory ─────────────────────────────────────────────────────────────────

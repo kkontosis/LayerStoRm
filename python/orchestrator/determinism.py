@@ -219,6 +219,17 @@ REGISTRY: tuple[Knob, ...] = (
     Knob("LS_MOE_XTP_BOUNCE", REFERENCE, KEEP_ON, None, NO_CONFLICT, None,
          "P-29 step 17: EP-XTP broadcast via explicit pinned-bounce — identical "
          "bytes to identical destinations, equivalent ordering"),
+    Knob("LS_SPEC_VERIFY_FETCH_HIDE", REFERENCE, KEEP_ON, None, NO_CONFLICT, None,
+         "P-32 stage 1: B=1 fetch-hiding fast paths extended to spec_verify "
+         "R<=8 MoE commands; enqueue/detection time only; consulted only on "
+         "spec arms (speculation.method=mtp); =0 restores phase-B exposed-H2D "
+         "verify byte-identically"),
+    Knob("LS_SPEC_VERIFY_BATCHED", REFERENCE, KEEP_ON, None, NO_CONFLICT, None,
+         "P-32 stage 1: sparse-MLA verify layers run R rows as ONE batched "
+         "dispatch (device s_q=R arm, exact per-row kernel bodies, "
+         "INV-DSA-BATCH discipline; per-row sub-dispatch fallback); "
+         "consulted only on spec_verify FAR commands; =0 restores the "
+         "phase-B per-row command loop"),
     Knob("LS_FAR_GATE_DISPATCH", REFERENCE, KEEP_ON, None, NO_CONFLICT, None,
          "P-29 step 19: force-dispatch the layer's own staged demand copies past "
          "the (measured 100%-stale) inflight cap inside the gated-final commit — "

@@ -797,6 +797,21 @@ class Solver:
             # emitted by _explain_tiering for the WINNING choice only.
             tiering_want = False
             tier_escalatable = self.shape.has_dsa
+        if self.shape.is_v4:
+            # P-34/TD-AUTOCONFIG-V4-KVT-SIZING: the engine's KV tiering
+            # assumes a uniform per-token KV row; V4's 3-tier per-layer
+            # scheme (V4-3b, compute_v4_kv_layout) is unsupported — the
+            # shipped V4 recipes serve UNTIERED.  The tiering axis
+            # collapses to OFF; a pin asking for it is an impossible ask.
+            if kt_pin is not None and bool(kt_pin.value):
+                raise Infeasible(
+                    "v4-kv-tiering-unsupported", "memory.kv_tiering.enabled",
+                    "pin memory.kv_tiering.enabled=true on deepseek_v4",
+                    "untiered serving (V4 3-tier KV rows are not tierable; "
+                    "vram_allocator.cpp:36-42)",
+                    "drop the pin (TD-AUTOCONFIG-V4-KVT-SIZING)")
+            tiering_want = False
+            tier_escalatable = False
         # TD-KVT-LOCAL-INDEXER-UNBLOCK resolved 2026-08-30: the engine's
         # replicated-only tiering construction gate was a merge artifact and
         # is REMOVED — tiering composes with dcp_indexer_mode=local (exact
@@ -1493,6 +1508,20 @@ class Solver:
                       in-block slack invisible to runtime cudaMalloc.
         """
         s, k = self.shape, self.k
+        if s.is_v4 and tiering_on:
+            # TD-AUTOCONFIG-V4-KVT-SIZING: the KVT staging model
+            # (kvt_union_staging_bytes) sizes rows via the uniform
+            # kv_bytes_per_token, which V4's 3-tier per-layer scheme does
+            # not have (vram_allocator.cpp:36-42, compute_v4_kv_layout).
+            # Until the solver mirrors V4-3b tier sizing, tiered attempts
+            # are refused per-attempt — untiered fits still serve.
+            raise Infeasible(
+                "v4-kv-tiering-sizing-unimplemented", "memory.kv_tiering",
+                "tiering_on for deepseek_v4",
+                "untiered fit (V4 KVT staging sizing not modelled)",
+                "lower serving.max_sequence_length until the untiered KV "
+                "fits, or implement V4-3b tier sizing "
+                "(TD-AUTOCONFIG-V4-KVT-SIZING)")
         ftmpl = templates.FAMILY[templates.family_of(s.architecture)]
         backend = self.attention_backend()
         gguf = "gguf" in str(self.quant.get("weights", "")).lower()

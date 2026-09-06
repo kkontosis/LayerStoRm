@@ -337,42 +337,84 @@ void DcpExecutor::execute_attention_kda(const AttentionExecParams& params) {
             auto emit_span = [&] {
                 emit_qkv();
 
-                compute::KdaConvDecodeArgs ca{};
-                ca.x_q = x_q; ca.x_k = x_k; ca.x_v = x_v;
-                ca.w_q = w.kda_q_conv1d; ca.w_k = w.kda_k_conv1d;
-                ca.w_v = w.kda_v_conv1d;
-                ca.ring_q = region_c + ring0_off;
-                ca.ring_k = region_c + ring0_off
-                          + opts_.kda_ring_bytes_per_layer;
-                ca.ring_v = region_c + ring0_off
-                          + 2 * opts_.kda_ring_bytes_per_layer;
-                ca.slots = kda_slots_dev_[r];
-                ca.ring_slot_stride = slot_stride_f;
-                ca.out_q = cq; ca.out_k = ck; ca.out_v = cv;
-                ca.batch = B; ca.channels = C;
-                attn->kda_conv_decode(ca, stream);
+                // P-32 stage 1 (seq_rows): the batch rows are ONE sequence
+                // at consecutive positions — the recurrence must see row
+                // j's state update before row j+1 reads it. The conv +
+                // step kernels run SEQUENTIALLY per row (batch=1 at row
+                // offsets, same stream = ordered; same kernel bodies as
+                // the per-row command loop → bit-identical per row),
+                // while projections above and o_proj below stay batched
+                // over B (weights read once instead of B times). Anchor
+                // D2Ds interleave exactly where the per-row loop put them:
+                // right after row j's state update.
+                const int steps = kda->seq_rows ? B : 1;
+                const int step_rows = kda->seq_rows ? 1 : B;
+                for (int j = 0; j < steps; ++j) {
+                    compute::KdaConvDecodeArgs ca{};
+                    ca.x_q = static_cast<char*>(x_q)
+                             + static_cast<size_t>(j) * C * 2;
+                    ca.x_k = static_cast<char*>(x_k)
+                             + static_cast<size_t>(j) * C * 2;
+                    ca.x_v = static_cast<char*>(x_v)
+                             + static_cast<size_t>(j) * C * 2;
+                    ca.w_q = w.kda_q_conv1d; ca.w_k = w.kda_k_conv1d;
+                    ca.w_v = w.kda_v_conv1d;
+                    ca.ring_q = region_c + ring0_off;
+                    ca.ring_k = region_c + ring0_off
+                              + opts_.kda_ring_bytes_per_layer;
+                    ca.ring_v = region_c + ring0_off
+                              + 2 * opts_.kda_ring_bytes_per_layer;
+                    ca.slots = static_cast<int*>(kda_slots_dev_[r]) + j;
+                    ca.ring_slot_stride = slot_stride_f;
+                    ca.out_q = static_cast<char*>(cq)
+                               + static_cast<size_t>(j) * C * 4;
+                    ca.out_k = static_cast<char*>(ck)
+                               + static_cast<size_t>(j) * C * 4;
+                    ca.out_v = static_cast<char*>(cv)
+                               + static_cast<size_t>(j) * C * 4;
+                    ca.batch = step_rows; ca.channels = C;
+                    attn->kda_conv_decode(ca, stream);
 
-                compute::KdaDecodeStepArgs da{};
-                da.q = cq; da.k = ck; da.v = cv;
-                da.raw_g = kda_rawg_[r];
-                da.beta = kda_beta_[r];
-                da.g2 = kda_g2_[r];
-                da.a_log = w.kda_a_log;
-                da.dt_bias = w.kda_dt_bias;
-                da.onorm_w = w.kda_o_norm;
-                da.state_base = region_c + rec_off;
-                da.state_slot_stride = slot_stride_f;
-                da.slots = kda_slots_dev_[r];
-                da.core_out = nullptr;
-                da.out_bf16 = kda_onorm_bf16_[r];
-                da.out_f32 = nullptr;
-                da.batch = B;
-                da.num_heads = Hk;
-                da.lower_bound = opts_.kda_gate_lower_bound;
-                da.l2_eps = opts_.kda_l2_eps;
-                da.onorm_eps = opts_.rms_norm_eps;
-                da.scale = scale;
-                attn->kda_decode_step(da, stream);
+                    compute::KdaDecodeStepArgs da{};
+                    da.q = ca.out_q; da.k = ca.out_k; da.v = ca.out_v;
+                    da.raw_g = static_cast<char*>(kda_rawg_[r])
+                               + static_cast<size_t>(j) * C * 2;
+                    da.beta = static_cast<char*>(kda_beta_[r])
+                              + static_cast<size_t>(j) * Hk * 2;
+                    da.g2 = static_cast<char*>(kda_g2_[r])
+                            + static_cast<size_t>(j) * C * 2;
+                    da.a_log = w.kda_a_log;
+                    da.dt_bias = w.kda_dt_bias;
+                    da.onorm_w = w.kda_o_norm;
+                    da.state_base = region_c + rec_off;
+                    da.state_slot_stride = slot_stride_f;
+                    da.slots = static_cast<int*>(kda_slots_dev_[r]) + j;
+                    da.core_out = nullptr;
+                    da.out_bf16 = static_cast<char*>(kda_onorm_bf16_[r])
+                                  + static_cast<size_t>(j) * C * 2;
+                    da.out_f32 = nullptr;
+                    da.batch = step_rows;
+                    da.num_heads = Hk;
+                    da.lower_bound = opts_.kda_gate_lower_bound;
+                    da.l2_eps = opts_.kda_l2_eps;
+                    da.onorm_eps = opts_.rms_norm_eps;
+                    da.scale = scale;
+                    attn->kda_decode_step(da, stream);
+
+                    // Anchor snapshot for row j (INV-KDA-ANCHOR): whole
+                    // layer-unit D2D on this stream — lands after row j's
+                    // conv-ring + recurrent-state writes, before row j+1.
+                    if (kda->seq_rows && kr.anchor_dst && kr.anchor_src
+                        && kr.anchor_dst[j] && kr.anchor_src[j]
+                        && kda->anchor_unit_bytes > 0
+                        && r < static_cast<int>(
+                               opts_.device_backends.size())
+                        && opts_.device_backends[r]) {
+                        opts_.device_backends[r]->memcpy_d2d_async(
+                            kr.anchor_dst[j], kr.anchor_src[j],
+                            kda->anchor_unit_bytes, stream);
+                    }
+                }
 
                 emit_oproj();
             };
@@ -380,7 +422,12 @@ void DcpExecutor::execute_attention_kda(const AttentionExecParams& params) {
             // GGUF-dequant is NOT graph-eligible (INV-0.6a: host-loop syncs
             // mid-sequence) — spans stay eager under that strategy.
             const bool span_ok = span_graphs_.enabled()
-                && opts_.gguf_strategy != config::GgufStrategy::dequant;
+                && opts_.gguf_strategy != config::GgufStrategy::dequant
+                // P-32 stage 1: seq_rows runs EAGER — the per-round anchor
+                // plan (mask + dst pointers) varies faster than the span
+                // variant budget tolerates; the eager batched chain is
+                // ~12 launches (one qkv, R conv/step pairs, o_proj).
+                && !kda->seq_rows;
             if (span_ok) {
                 compute::DecodeSpanGraphs::Fp fp;
                 // Buffers (per-rank persistent; content varies, addresses
@@ -625,6 +672,11 @@ bool ArchGlm5Next::stage_step(
 
     kda_ranks_.assign(static_cast<size_t>(dcp_size), {});
     kda_slots_.assign(static_cast<size_t>(dcp_size), {});
+    // P-32 stage 1: kda_step_ is a reused member — reset the seq_rows/
+    // anchor fields every dispatch (only the spec_verify batched arm sets
+    // them).
+    kda_step_.seq_rows = false;
+    kda_step_.anchor_unit_bytes = 0;
 
     if (prefill_shape) {
         // ONE sequence at consecutive ascending positions (the same shape
@@ -676,6 +728,68 @@ bool ArchGlm5Next::stage_step(
                               + (kda_mapped ? static_cast<size_t>(ord)
                                             : 0)].gpu_ptr;
         kda_step_.decode = false;
+    } else if (p.spec_flags & 2 && batch_size > 1) {
+        // P-32 stage 1 (batched spec_verify, LS_SPEC_VERIFY_BATCHED): the
+        // batch rows are ONE sequence at CONSECUTIVE positions, teacher-
+        // forced. The parallel batched kernel would race the shared slot,
+        // so the executor runs the recurrence SEQUENTIALLY per row
+        // (KdaStep::seq_rows) while projections/o_proj stay batched.
+        const uint64_t sid = be[0].seq_id;
+        const uint32_t start = be[0].token_pos;
+        for (int b = 1; b < batch_size; ++b) {
+            if (be[b].seq_id != sid
+                || be[b].token_pos != start + static_cast<uint32_t>(b))
+                return refuse(
+                    "glm5_next: malformed spec_verify KDA cohort — rows "
+                    "must be ONE sequence at consecutive positions");
+        }
+        auto* st = d_.find_seq(sid);
+        if (!st)
+            return refuse("glm5_next: KDA step on unknown seq_id");
+        const size_t kda_units = static_cast<size_t>(std::max(
+            1, d_.deps_.page_allocator
+                   ? d_.deps_.page_allocator->kda_units_per_rank() : 1));
+        const bool kda_mapped = d_.deps_.page_allocator
+            && d_.deps_.page_allocator->kda_state_mapped();
+        if (st->kda_state.size()
+            != static_cast<size_t>(dcp_size) * kda_units)
+            return refuse(
+                "glm5_next: sequence carries no KDA state slot (draft or "
+                "pre-GF3.8 create?)");
+        if (st->kda_next_pos.empty())
+            st->kda_next_pos.assign(static_cast<size_t>(num_linear_), 0);
+        // INV-KDA-REWIND frontier guard: identical to the per-row loop's
+        // per-row check — the cohort must start exactly at this layer's
+        // state frontier (anchor-restore rolls the frontier back BEFORE a
+        // replay round dispatches, so a legal round always starts here).
+        if (st->kda_next_pos[static_cast<size_t>(ord)] != start)
+            return refuse(
+                "glm5_next: spec_verify KDA cohort start is not this "
+                "layer's state frontier (INV-KDA-REWIND)");
+        st->kda_next_pos[static_cast<size_t>(ord)] =
+            start + static_cast<uint32_t>(batch_size);
+        for (int r = 0; r < dcp_size; ++r) {
+            const size_t u = static_cast<size_t>(r) * kda_units
+                             + (kda_mapped ? static_cast<size_t>(ord) : 0);
+            kda_slots_[static_cast<size_t>(r)].assign(
+                static_cast<size_t>(batch_size),
+                st->kda_state[u].page_idx);
+            kda_ranks_[static_cast<size_t>(r)].slots_host =
+                kda_slots_[static_cast<size_t>(r)].data();
+            // Anchor plan (staged by handle_far_forward_layer; empty =
+            // no anchors this round).
+            if (static_cast<size_t>(r) < d_.spec_kda_anchor_plan_.size()) {
+                kda_ranks_[static_cast<size_t>(r)].anchor_src =
+                    d_.spec_kda_anchor_plan_[static_cast<size_t>(r)]
+                        .src.data();
+                kda_ranks_[static_cast<size_t>(r)].anchor_dst =
+                    d_.spec_kda_anchor_plan_[static_cast<size_t>(r)]
+                        .dst.data();
+            }
+        }
+        kda_step_.decode = true;
+        kda_step_.seq_rows = true;
+        kda_step_.anchor_unit_bytes = d_.spec_kda_anchor_unit_bytes_;
     } else {
         // Decode: one token per row; every row its own sequence (two rows
         // of one sequence in a single step would race the slot).
