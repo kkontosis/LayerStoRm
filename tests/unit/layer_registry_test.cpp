@@ -4,6 +4,7 @@
 #include <numeric>
 
 #include "model/layer_registry.h"
+#include "model/pinned_region_layout.h"
 #include "model/quantization/fp8.h"
 #include "model/quantization/nvfp4.h"
 #include "model/quantization/registry.h"
@@ -827,4 +828,177 @@ TEST(LayerRegistryV4, EstimateGpuBudgetsPinnedFitsVram) {
     EXPECT_GT(budgets[0].pinned_bytes, 10LL << 30);
     EXPECT_LT(budgets[0].pinned_bytes, 20LL << 30);
     EXPECT_GT(budgets[0].available_for_cache_bytes, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// glm5_next / GLM-5.3-Flash (GF3.3) — the "288 flows through the VRAM plan and
+// the boot budget table" verification.  Dimensions verified from HF rev
+// 04c4e9e9 (spec/GLM-5.3-FLASH-MODELINFO.md §2/§3a/§3b/§3c/§3e/§4/§5).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static lc::Config glm53_flash_full_config(int tp) {
+    nlohmann::json layer_types = nlohmann::json::array();
+    for (int l = 0; l < 45; ++l)
+        layer_types.push_back((l % 4 == 3) ? "deepseek_sparse_attention"
+                                           : "linear_attention");
+    nlohmann::json gpus = nlohmann::json::array();
+    nlohmann::json tp_array = nlohmann::json::array();
+    for (int i = 0; i < tp; ++i) {
+        gpus.push_back({{"id", i}, {"type", "rtx5090"}, {"vram_gb", 32}});
+        tp_array.push_back(i);
+    }
+    auto j = nlohmann::json{
+        {"model", {
+            {"architecture",           "glm5_next"},
+            {"weights_path",           "/data/models/glm-5.3-flash/"},
+            {"weights_format",         "safetensors"},
+            {"num_hidden_layers",      45},
+            {"hidden_size",            4096},
+            {"num_attention_heads",    64},
+            {"num_key_value_heads",    64},
+            {"intermediate_size",      12288},
+            {"n_routed_experts",       288},
+            {"n_shared_experts",       1},
+            {"num_experts_per_tok",    8},
+            {"n_group",                1},
+            {"topk_group",             1},
+            {"vocab_size",             154880},
+            {"max_position_embeddings", 1048576},
+            {"kv_lora_rank",           512},
+            {"q_lora_rank",            1536},
+            {"qk_rope_head_dim",       0},
+            {"qk_nope_head_dim",       256},
+            {"v_head_dim",             256},
+            {"first_k_dense_replace",  3},
+            {"moe_layer_freq",         1},
+            {"index_topk",             2048},
+            {"index_n_heads",          32},
+            {"index_head_dim",         128},
+            {"index_kpool",            4},
+            {"index_kpool_compress",   true},
+            {"index_kpool_always_select_tail", true},
+            {"mla_use_nope",           true},
+            {"layer_types",            layer_types},
+            {"linear_attn_config", {
+                {"num_heads", 64}, {"head_dim", 128},
+                {"short_conv_kernel_size", 4}, {"gate_lower_bound", -5.0}}},
+            {"hc_mult",                4},
+            {"hc_sinkhorn_iters",      20},
+            {"hc_eps",                 1e-6},
+            {"swiglu_limit",           10.0},
+            {"num_nextn_predict_layers", 1},
+            {"rms_norm_eps",           1e-5},
+            {"routed_scaling_factor",  2.5},
+            {"moe_intermediate_size",  2048},
+        }},
+        {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
+                          {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
+        {"hardware", {{"gpus", gpus}, {"system_ram_gb", 512},
+                      {"tp_array", tp_array}}},
+        {"parallelism", {{"tensor_parallelism", tp}}},
+    };
+    return lc::parse_config(j);
+}
+
+TEST(LayerRegistryGlm5Next, LayerCountsAndExpertPopulation) {
+    auto cfg = glm53_flash_full_config(1);
+    ModelConfig model_cfg{cfg};
+    layerstorm::model::Fp8E4M3 fp8;
+    LayerRegistry reg{model_cfg, cfg, fp8};
+
+    EXPECT_EQ(reg.num_layers(), 45);
+    EXPECT_EQ(reg.num_moe_layers(), 42);   // first_k_dense_replace = 3
+    EXPECT_EQ(reg.num_dense_layers(), 3);
+    // 288 routed experts — the headline MoE change vs GLM-5.2's 256.
+    EXPECT_EQ(reg.total_routed_experts(), 288);
+    EXPECT_EQ(model_cfg.num_linear_attention_layers(), 34);
+}
+
+TEST(LayerRegistryGlm5Next, GatingAndExpertBytes) {
+    auto cfg = glm53_flash_full_config(1);
+    ModelConfig model_cfg{cfg};
+    layerstorm::model::Fp8E4M3 fp8;
+    LayerRegistry reg{model_cfg, cfg, fp8};
+
+    // Router: mlp.gate [288, 4096] sized at the gating_compute dtype (fp32 in
+    // this config) — 288 experts × hidden × 4 B.
+    ASSERT_EQ(cfg.quantization.gating_compute, lc::GatingQuant::fp32);
+    EXPECT_EQ(reg.layer(3).gating_bytes, 288LL * 4096 * 4);
+    EXPECT_EQ(reg.layer(3).gating_bytes, 4'718'592LL);
+    EXPECT_EQ(reg.layer(0).gating_bytes, 0);  // dense stem layer
+
+    // One routed expert = FP8 gate/up/down at [4096, 2048] + blockwise scales.
+    const layerstorm::model::ExpertShape moe{4096, 2048};
+    EXPECT_EQ(reg.per_routed_expert_bytes(), fp8.bytes_per_expert(moe));
+    EXPECT_EQ(reg.layer(3).per_routed_expert_bytes, fp8.bytes_per_expert(moe));
+    // 3 × (2048·4096 weight + ceil(2048/128)·ceil(4096/128)·4 scale).
+    EXPECT_EQ(reg.per_routed_expert_bytes(),
+              3LL * (2048LL * 4096 + 16LL * 32 * 4));
+    EXPECT_EQ(reg.per_routed_expert_bytes(), 25'171'968LL);
+    EXPECT_EQ(reg.layer(0).per_routed_expert_bytes, 0);  // dense stem layer
+}
+
+TEST(LayerRegistryGlm5Next, HybridAttentionBytesPerLayer) {
+    auto cfg = glm53_flash_full_config(1);
+    ModelConfig model_cfg{cfg};
+    layerstorm::model::Fp8E4M3 fp8;
+    LayerRegistry reg{model_cfg, cfg, fp8};
+
+    // LayerInfo carries FULL-layer (tp=1) sizes, mHC included, and must NOT
+    // add the legacy MLA indexer formula on top for glm5_next.
+    const int64_t kda = layerstorm::model::glm5_next_attention_layer_bytes(
+        cfg.model, cfg.quantization.weights, /*linear=*/true,
+        /*include_hc=*/true, /*tp=*/1);
+    const int64_t sparse = layerstorm::model::glm5_next_attention_layer_bytes(
+        cfg.model, cfg.quantization.weights, /*linear=*/false,
+        /*include_hc=*/true, /*tp=*/1);
+    // GF3.9: hc_*_fn is widened to F32 at load (launch_mhc_pre contract)
+    // and sized F32 — +2*24*16384*2 B per hidden layer vs the GF3.3 lock.
+    EXPECT_EQ(kda, 278'627'040LL);
+    EXPECT_EQ(sparse, 152'336'096LL);
+
+    EXPECT_EQ(reg.layer(0).attention_bytes, kda);      // KDA linear layer
+    EXPECT_EQ(reg.layer(3).attention_bytes, sparse);   // sparse-MLA layer
+    int kda_layers = 0, sparse_layers = 0;
+    for (int l = 0; l < reg.num_layers(); ++l) {
+        const bool linear = model_cfg.is_linear_attention_layer(l);
+        EXPECT_EQ(reg.layer(l).attention_bytes, linear ? kda : sparse)
+            << "layer " << l;
+        (linear ? kda_layers : sparse_layers)++;
+    }
+    EXPECT_EQ(kda_layers, 34);
+    EXPECT_EQ(sparse_layers, 11);
+}
+
+TEST(LayerRegistryGlm5Next, EstimateGpuBudgetsChargesPinnedOnTpGpus) {
+    auto cfg = glm53_flash_full_config(2);
+    ModelConfig model_cfg{cfg};
+    layerstorm::model::Fp8E4M3 fp8;
+    LayerRegistry reg{model_cfg, cfg, fp8};
+
+    auto budgets = reg.estimate_gpu_budgets();
+    ASSERT_EQ(budgets.size(), 2u);
+    for (const auto& b : budgets) {
+        EXPECT_GT(b.pinned_bytes, 0) << "gpu " << b.gpu_id;
+        EXPECT_EQ(b.pinned_bytes, reg.pinned_layout().total_bytes);
+        EXPECT_LT(b.pinned_bytes, b.total_vram_bytes) << "gpu " << b.gpu_id;
+        EXPECT_GT(b.available_for_cache_bytes, 0) << "gpu " << b.gpu_id;
+    }
+
+    // The pinned region is dominated by the hybrid attention stack: 34 KDA +
+    // 11 sparse hidden layers at tp=2 plus the MTP block.
+    const int64_t kda2 = layerstorm::model::glm5_next_attention_layer_bytes(
+        cfg.model, cfg.quantization.weights, true, true, 2);
+    const int64_t sparse2 = layerstorm::model::glm5_next_attention_layer_bytes(
+        cfg.model, cfg.quantization.weights, false, true, 2);
+    EXPECT_EQ(reg.pinned_layout().attention_bytes, 34 * kda2 + 11 * sparse2);
+    EXPECT_GT(reg.pinned_layout().total_bytes,
+              reg.pinned_layout().attention_bytes);
+
+    // tp=1 charges strictly more per GPU than tp=2.
+    auto cfg1 = glm53_flash_full_config(1);
+    ModelConfig mc1{cfg1};
+    LayerRegistry reg1{mc1, cfg1, fp8};
+    EXPECT_GT(reg1.pinned_layout().total_bytes,
+              reg.pinned_layout().total_bytes);
 }

@@ -97,6 +97,17 @@
       },
       "required": ["type"],
       "additionalProperties": false
+    },
+    "linear_attn_object": {
+      "type": "object",
+      "description": "KDA (Kimi Delta Attention, arXiv:2510.26692) linear-attention geometry for glm5_next layer_types == linear_attention layers. Field names and defaults follow config.json text_config.linear_attn_config of zai-org/GLM-5.3-Flash (test-data/GLM-5.3-Flash/config.json). The per-layer kda_layers/full_attn_layers arrays of the HF config are NOT duplicated here: model.layer_types is authoritative (the HF arrays mirror it exactly — spec/GLM-5.3-FLASH-MODELINFO.md §3).",
+      "properties": {
+        "num_heads": { "$ref": "#/$defs/positive_int", "default": 64, "description": "KDA heads per linear-attention layer (GLM-5.3-Flash: 64). q/k/v_proj are [num_heads*head_dim, hidden]; the per-request recurrent state is (num_heads/tp, head_dim, head_dim) per layer." },
+        "head_dim": { "$ref": "#/$defs/positive_int", "default": 128, "description": "KDA head dimension (GLM-5.3-Flash: 128; also the low-rank decay/output gate rank of f_a/f_b and g_a/g_b)." },
+        "short_conv_kernel_size": { "$ref": "#/$defs/positive_int", "default": 4, "description": "Depthwise causal short-convolution width on q/k/v (GLM-5.3-Flash: 4). The carried conv state per layer is (3*num_heads*head_dim/tp, kernel-1 [+ num_spec for speculative decoding])." },
+        "gate_lower_bound": { "type": "number", "exclusiveMaximum": 0, "default": -5.0, "description": "Bounded-sigmoid decay-gate lower bound (GLM-5.3-Flash: -5.0). A trained model constant — must NOT be tuned (the SGLang reference says so explicitly)." }
+      },
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -110,8 +121,8 @@
       "properties": {
         "architecture": {
           "type": "string",
-          "enum": ["deepseek_v3", "glm_moe_dsa", "kimi_k25", "deepseek_v4"],
-          "description": "Model architecture class. deepseek_v4: DeepSeek-V4 family (native MQA-over-latent, CSA/HCA hybrid attention, mHC residual streams — spec/DEEPSEEK4_PLAN.md)"
+          "enum": ["deepseek_v3", "glm_moe_dsa", "kimi_k25", "deepseek_v4", "glm5_next"],
+          "description": "Model architecture class. deepseek_v4: DeepSeek-V4 family (native MQA-over-latent, CSA/HCA hybrid attention, mHC residual streams — spec/DEEPSEEK4_PLAN.md). glm5_next: GLM-5.3-Flash family (hybrid KDA linear attention + NoPE sparse MLA per layer_types, IndexPool indexer, mHC — spec/GLM-5.3-FLASH-MODELINFO.md, PLAN.md Phase GF3)"
         },
         "weights_path": {
           "type": "string",
@@ -152,9 +163,10 @@
           "description": "KV LoRA rank for MLA"
         },
         "qk_rope_head_dim": {
-          "$ref": "#/$defs/positive_int",
+          "type": "integer",
+          "minimum": 0,
           "default": 64,
-          "description": "RoPE dimension in MLA"
+          "description": "RoPE dimension in MLA. 0 = NoPE (glm5_next with mla_use_nope: no rope component anywhere on the text path; KV latent per token = kv_lora_rank exactly — GLM-5.3-Flash MODELINFO §3b)."
         },
         "qk_nope_head_dim": {
           "$ref": "#/$defs/positive_int",
@@ -261,6 +273,22 @@
           "minimum": 0,
           "default": 0,
           "description": "IndexShare leading-full count: the first N layers are always full. Full-layer set = { l : l < offset OR (l - offset + 1) % index_topk_freq == 0 }."
+        },
+        "index_kpool": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "IndexPool pooling factor (glm5_next: 4; GLM-5.3-Flash config.json index_kpool): indexer key vectors are pooled kpool:1 before scoring, so indexer-K stores one entry per kpool tokens and top-k selects index_topk/index_kpool POOLS which expand back to their constituent token rows — index_topk stays a TOKEN budget (visibility ~index_topk tokens, spec/GLM-5.3-FLASH-MODELINFO.md §3d). index_topk must be divisible by index_kpool. Every engine-produced prefill boundary (KV page, prefill chunk grid, superchunk stride, indexer-K page) must be a multiple of index_kpool or the pooled store fragments (MODELINFO §10.8; the vLLM reference hard-asserts the analogous constraint). 1 (default) = no pooling (GLM-5.2/V3.2 behavior)."
+        },
+        "index_kpool_compress": {
+          "type": "boolean",
+          "default": false,
+          "description": "LEARNED IndexPool compression (glm5_next: true): pooled entry = softmax(gate_score + slot APE)-weighted sum of the kpool raw keys, using the per-layer indexer.index_kpool_compress_gate [head_dim, hidden] and index_kpool_compress_ape [kpool, head_dim] tensors. REQUIRED true when index_kpool > 1 — no unlearned (mean-pooled) variant exists in the checkpoint or any reference engine (validator-enforced fail-closed)."
+        },
+        "index_kpool_always_select_tail": {
+          "type": "boolean",
+          "default": false,
+          "description": "IndexPool tail selection (glm5_next: true): the un-pooled in-progress tail pool (0..kpool-1 raw rows) is ALWAYS appended to the top-k selection on top of the pooled budget (final row width <= index_topk + kpool - 1). Implies a per-sequence tail state (raw K + gate score of the in-progress pool, ~2 KiB/layer) that is FRONTIER state: holder freeze/hibernate/restore must retain it (INV-PREFIX-CACHE-3/-4; MODELINFO §3d)."
         },
         "rope_scaling": {
           "$ref": "#/$defs/rope_scaling_object"
@@ -374,6 +402,21 @@
           "maximum": 0.001,
           "default": 1e-6,
           "description": "mHC epsilon: added to the sigmoid pre-mix weights and to Sinkhorn row/column normalization denominators; V4: 1e-6. Ignored when hc_mult == 1."
+        },
+        "layer_types": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["linear_attention", "deepseek_sparse_attention"], "x-cType": "LayerAttentionType" },
+          "default": [],
+          "description": "glm5_next per-layer attention type (HF config.json text_config.layer_types verbatim; GLM-5.3-Flash: 34x linear_attention + 11x deepseek_sparse_attention at depths 3+4k and 43). linear_attention = KDA recurrent layer: NO KV cache, NO indexer, per-request recurrent + conv state (linear_attn_config). deepseek_sparse_attention = NoPE sparse MLA + IndexPool indexer: KV-bearing. Length must equal num_hidden_layers (the MTP layer is NOT included — it is sparse MLA by checkpoint, MODELINFO §5). This array is the single per-layer dispatch axis; the HF linear_attn_config.kda_layers/full_attn_layers mirrors are derived from it, never stored. Empty (default) = non-glm5_next model; REQUIRED non-empty for glm5_next."
+        },
+        "linear_attn_config": {
+          "$ref": "#/$defs/linear_attn_object",
+          "description": "KDA linear-attention geometry (glm5_next). REQUIRED when any layer_types entry is linear_attention; ignored otherwise."
+        },
+        "mla_use_nope": {
+          "type": "boolean",
+          "default": false,
+          "description": "NoPE MLA (glm5_next: true; HF config.json mla_use_nope): the sparse-MLA layers apply NO rotary embedding anywhere on the text path — qk_rope_head_dim must be 0, kv_a_proj carries exactly kv_lora_rank rows (KV latent = kv_lora_rank, no rope block in the page layout), and the indexer applies no rope either (indexer_rope_interleave is inert at rope dim 0; position enters the indexer only through the learned IndexPool APE — MODELINFO §3b/§3c). false (default) = RoPE MLA (V3.2/GLM-5.2 behavior)."
         },
         "vision": {
           "type": "object",
@@ -656,8 +699,8 @@
               "type": "integer",
               "minimum": 1,
               "default": 8192,
-              "description": "Page size in tokens for DSA indexer K cache. Only used when model has DSA (index_topk > 0). Coarse default: at ~132 B/token the block-table overhead is negligible and a growing sequence claims ~1 MB chunks on demand (amortized-growth behavior with no copies); lower toward 64 only for many-sequence serving where fine-grained multiplexing matters.",
-              "x-devDoc": "PageAllocator Pool::kIndexerK uses this as its page granularity. Separate pool with own base pointer, metadata array, and free list (INV-4.9d). Replication/sharding governed by hardware.dcp_indexer_mode. Page size is a pure capacity-multiplexing policy knob — same code path at any value (see TD-GLM-INDEXER-PAGED)."
+              "description": "Page span in token POSITIONS for the DSA indexer K cache. Only used when model has DSA (index_topk > 0). Coarse default: the block-table overhead is negligible (~132 B/token legacy; ~33 B/token + a 2 KiB in-page tail region under IndexPool pooling, where a page stores span/index_kpool pooled entries) and a growing sequence claims whole slabs on demand (amortized-growth behavior with no copies); lower toward 64 only for many-sequence serving where fine-grained multiplexing matters. Must be a multiple of index_kpool on IndexPool models (pool-alignment invariant).",
+              "x-devDoc": "PageAllocator Pool::kIndexerK uses this as its page granularity, in token POSITIONS. Separate pool tag over the shared slab region (S4 elastic; INV-SLAB-1). Replication/sharding governed by hardware.dcp_indexer_mode; owner math (pos/span)%dcp and reservation math ceil(tokens/span) are position-stated and IndexPool-invariant (GF3.5): pooling divides only the stored ROW count per page (span/index_kpool entries + the in-progress-pool tail region), never the span. Same code path at any value (TD-GLM-INDEXER-PAGED)."
             },
             "prefill_scratch_preallocated_gb": {
               "type": "number",
@@ -726,7 +769,7 @@
               "type": "number",
               "minimum": 1,
               "default": 8.0,
-              "description": "Cold host-pool capacity as a multiple of the per-layer hot buffer (HiSparse host_to_device_ratio). When the pool is full further demotions are skipped (pages stay hot, fail-safe)."
+              "description": "Cold host-pool capacity as a multiple of the per-layer hot buffer (HiSparse host_to_device_ratio). A full pool skips demotions IN-STEP only (pages stay hot — a cold slot is the sole copy of demoted KV, so the pool never evicts one); kMain pressure recovers out-of-step: pool-exhausted growth runs a behind-window demote sweep, drains, and retries once, and if the cold pool itself is the limit the step fails with the retryable kKvPoolExhausted class so the orchestrator evicts prefix holders and re-issues (TD-KVT-COLD-FULL-HOT-WEDGE). Sizes performance headroom (how much backlog drains without holder eviction), never a wedge boundary."
             },
             "replica_cold_dedup": {
               "type": "boolean",
@@ -1666,6 +1709,11 @@
               "default": false,
               "description": "Lever-4 verify-chunk expert prefetch (DSP52_BOOST campaign; batched verify only). During each batched verify chunk, at the LAUNCH of MoE layer L's attention (the H2D-idle window), the orchestrator fires ONE fire-and-forget D_B_CMD_PREFETCH_BATCH carrying the PREVIOUS chunk's layer-L routed expert union at its previous (expert, gpu) placement, at DMA priority -1.0 (strictly below demand fetches, which the FED issues at 0.0/kDemandFetchPriority). Advisory residency warm-up ONLY: the same weights land in the same cache seam the demand fetch would use, so tokens stay byte-identical prefetch-on vs prefetch-off (no numerics change, no routing change). Policy lives in the orchestrator (Python bridge / dsp52 test); the engine only executes the generic prefetch command. DEFAULT false: measured a NET LOSS on this DMA-bound box — -1.0% champion wall (9.562 vs 9.650 tok/s, 2026-08-17 arm C4), hit-neutral ~+0.6% wall tax under EPM-0, and the perfect-predictor oracle upper bound lost in every arm (top-1 -5.9%, all-misses -3.1%, bulk -7.5%). Kept as a reusable knob for future work (B>1 batching, sub-expert grain) where an idle H2D window may exist. Env override at the test interface: DSP52_PREFETCH=1 forces ON, DSP52_PREFETCH=0 forces OFF.",
               "x-devDoc": "Orchestrator-side policy, not an engine behavior: dsp52_test.cpp dsp52_prefetch() and tests/integration/test_dsp52_bridge.py read this field (env DSP52_PREFETCH wins when set). Companion env-only modulators (NOT config fields): DSP52_PREFETCH_MISS=n (fire only the top-n board-non-resident predicted-reuse experts) and DSP52_PREFETCH_AHEAD=k (predict layer L+k). Superseded by DSP52_ELB when that seam is armed (both would double-write the sideband prefetch region). Evidence: spec/reports/DSP52_BOOST.md (lever 4, EPM-0 keeppred sweep, TD-KEEPPRED-HYBRID, 'Oracle upper-bound'), scratchpad/GAP_EXPERIMENTS_9_1.md arm C4."
+            },
+            "ctx_rotate": {
+              "type": "boolean",
+              "default": true,
+              "description": "TD-DSPARK-CTX-POLICY windowed draft-context rotation (spec/plans/DSPARK_CTX_ROTATION.md, INV-DSPARK-CTX-WINDOW): the draft context arena becomes a sliding window over the newest positions instead of a hard fail-closed cap, so drafting stays alive at ANY depth. DEFAULT ON for the classic dspark backbone; false = the legacy fail-closed cap (TD-DSPARK-CTX-CAP behavior). Forced OFF engine-side for the V4 dflash arm regardless of this field (absolute-position rope table + single-copy latent arena; its serving recipe is draftless), and the orchestrator mirror follows. The SpecRoundGovernor acceptance governor (LS_SPEC_GOVERNOR, env-only) guards the low-acceptance regime independently. Env override: LS_DSPARK_CTX_ROTATE (either way; '0' disables, any other value enables). Was env-first (TD-DSPARK-CTX-ROTATE-SCHEMA)."
             }
           },
           "additionalProperties": false
@@ -2304,7 +2352,7 @@
           "enum": ["snapmla", "turboquant_mla", "csa_hca", "csa_hca_tq", "csa_hca_tq_mix"],
           "x-cType": "AttentionBackendType",
           "default": "snapmla",
-          "description": "Attention kernel library. snapmla: FP8 MLA (644 B/tok). turboquant_mla: TQ_MSE 4-bit (386 B/tok, 1.67x compression). V4-only (architecture deepseek_v4; MLA backends rejected for V4 and vice versa): csa_hca = FP8 compressed KV, csa_hca_tq = TQ 4-bit on ALL compressed tiers, csa_hca_tq_mix = TQ on CSA tiers + FP8 on HCA tiers (recommended TQ variant, validation gate V4K-10a passed). Engine wiring lands in spec/DEEPSEEK4_PLAN.md Phase V4-5/V4-7; selecting a csa_hca* backend before then fails loud at engine init."
+          "description": "Attention kernel library. Row bytes are GEOMETRY-dependent (kv_lora_rank 512): snapmla: FP8 MLA (kv_lora_rank + 2*qk_rope_head_dim + 4 B/tok = 644 B at rope-64 V3.2/GLM-5.2, 516 B at glm5_next NoPE). turboquant_mla: TQ_MSE 4-bit (kv_lora_rank/2 + 2 + 2*qk_rope_head_dim B/tok = 386 B rope-64 / 258 B NoPE; 1.67x / 2.0x compression; verified on glm5_next 2026-09-01, TD-GLM5-TQ-BACKEND-UNWIRED). V4-only (architecture deepseek_v4; MLA backends rejected for V4 and vice versa): csa_hca = FP8 compressed KV, csa_hca_tq = TQ 4-bit on ALL compressed tiers, csa_hca_tq_mix = TQ on CSA tiers + FP8 on HCA tiers (recommended TQ variant, validation gate V4K-10a passed). Engine wiring lands in spec/DEEPSEEK4_PLAN.md Phase V4-5/V4-7; selecting a csa_hca* backend before then fails loud at engine init."
         },
         "prefill_superchunk_tokens": {
           "type": "integer",
@@ -2321,9 +2369,25 @@
         "moe_big_chunk_tokens": {
           "type": "integer",
           "minimum": 16,
-          "maximum": 512,
+          "maximum": 32768,
           "default": 512,
-          "description": "TD-PREFILL-MOE-BIG: token chunk size for the chunked grouped-GEMM execution (prefill_moe_big). The MoE transient scratch is sized for this many tokens (x topk expansion) and reused across chunks; batches larger than max(this, orchestrator.max_batch_size) are processed chunk-by-chunk. LARGER IS FASTER until the transient set outgrows the ~512 MB prefill-scratch tail it is homed in: each grouped-GEMM sweep pays a ~(num_experts x tile_m=64) tile-row floor regardless of real rows (a 64-token chunk = avg 2 rows/expert against a 64-row tile), so total MoE cost scales with waves x ceil(batch/chunk) sweeps (measured 64-tok chunks ~4x slower than single-shot at n=876; see TD-MOE-BIG-GEMM-SWEEP). 512 tokens ~= 262 MB transients — still tail-resident."
+          "description": "TD-PREFILL-MOE-BIG: token chunk size for the chunked grouped-GEMM execution (prefill_moe_big) — equivalently the SINGLE-SHOT MoE batch bound. The MoE transient scratch is sized for this many tokens (x topk expansion) and reused across chunks; batches larger than max(this, orchestrator.max_batch_size) are processed chunk-by-chunk. LARGER IS FASTER: each grouped-GEMM sweep pays a ~(num_experts x tile_m=64) tile-row floor regardless of real rows (a 512-token chunk = avg 14 rows/expert on top-8-of-288 against a 64-row mmq tile ~= 4.5x padded FLOPs; ~1.1x by 2048), and on EP-beyond-TP topologies this bound IS the served superchunk stride (the orchestrator clamps the stride to the single-shot capacity because chunked batches are rejected with expert-only ranks resident, TD-MOE-EP-XTP-WAVES), so it also sets the per-layer expert-fetch amortization. The value is a REQUEST: transients are homed in the per-GPU kv_main prefill-scratch tail (device_alloc fallback), and the realized capacity is stepped down elastically at dispatcher construction so tail-overflow + 1.5 GiB working headroom always fit the smallest expert-device free VRAM (never OOM; floor = legacy max(min(request,512), orchestrator.max_batch_size); realized value exported as EngineInfo.moe_chunk_capacity). History: hard-clamped at 512 (schema+code) until P-30 step 1 re-derived it — ~0.48 MiB/token of transients (measured 246 MiB @512 on glm5_next tp2/EP4). See TD-MOE-BIG-GEMM-SWEEP."
+        },
+        "moe_big_fit_headroom_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16384,
+          "default": 1024,
+          "description": "TD-PREFILL-MOE-BIG working headroom (MiB) the dispatcher-construction chunk-fit reserves on ATTENTION-HOST devices before homing the MoE big-chunk transients (P-30 step 2 re-derivation of the fossilized blanket 1.5 GiB). The check runs POST-carve/POST-arena-page-tables, so this must cover only what allocates on an attention device AFTER it: the DCP/attention executor buffers sized from the resolved superchunk (measured 578 MiB at superchunk 2048 on the glm5_next tp2/EP4 production box) plus driver slack. All such demand is BOOT-time — an under-reserve fails the boot loudly, it cannot OOM mid-serving (P-30 step 2 measured both device classes dead-flat across fresh 8k/24k/97k prefill + decode). Requests sized from superchunk rows well beyond 2048 grow the DCP demand past this default — raise it (or lower the request) if such a boot fails.",
+          "x-devDoc": "Consumed at CommandDispatcher construction (chunk-fit + elastic batch-capacity sizing). Diagnostic env LS_MOE_BIG_FIT_HEADROOM_MB overrides BOTH device classes (registered in the determinism registries: REFERENCE/PIN_DEFAULT — capacity -> stride clamps -> prefill batch-width shape class)."
+        },
+        "moe_big_fit_headroom_expert_only_mb": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16384,
+          "default": 256,
+          "description": "TD-PREFILL-MOE-BIG working headroom (MiB) reserved by the same chunk-fit on EXPERT-ONLY devices (no kv_main tail, no attention/DCP consumers). Measured post-fit-check demand on the production EP4 5080s is ~21 MiB (constructor persistents + lazy module loading + decode-only FFN graph execs; P-30 step 2, dead-flat during serving) — the old blanket 1.5 GiB reserve on these devices was guarding ~21 MiB and pinned the served superchunk stride at 512 (114 vs 180 tok/s fresh 8k prefill). Default 256 keeps >10x the measured demand.",
+          "x-devDoc": "Expert-only = deps_.attention_devices[gpu] == nullptr at the dispatcher. See moe_big_fit_headroom_mb."
         },
         "dsa_sparse_prefill": {
           "type": "boolean",
@@ -2335,6 +2399,18 @@
           "default": true,
           "description": "INV-DSA-REWIND: bless SAME-SEQUENCE contiguous OVERWRITE-REWINDS in the DSA indexer coverage guard (pos0 <= high-water — the speculative batched-verify partial-acceptance re-feed shape) so those decode rows stay SPARSE-eligible instead of failing closed to per-row DENSE attention. Sound because every indexer-K append is POSITION-keyed: a re-feed overwrites its rows in place exactly as it overwrites the KV rows, and sparse validity comes from each step's own kv-meta seqlens bound. Token-correct either way; dense-vs-sparse kernel numerics differ in principle, but the dsp52 champion A/B (2026-08-18) measured IDENTICAL fingerprints (acc/tau/lookups) and a bit-identical 107-token trajectory on vs off — hence DEFAULT TRUE (production posture; sparse stays alive across speculative re-feeds). Gaps, mixed-sequence chunks, foreign sequences, and superchunk shapes stay fail-closed regardless. Env LS_INDEXER_REWIND OVERRIDES either way (set & !='0' -> on, '0' -> off, unset defers here). Set false for the legacy fail-closed guard (per-row dense fallback at pos < high-water).",
           "x-devDoc": "Read once at CommandDispatcher construction (command_dispatcher.cpp, indexer_rewind_ok_); the coverage-guard consume site is dispatch_attention.cpp (INV-DSA-REWIND)."
+        },
+        "deterministic": {
+          "type": "boolean",
+          "default": false,
+          "description": "DETERMINISM SUPERFLAG 1 of 2 — RUN-TO-RUN DETERMINISM: same binary, same config, same input => byte-identical output on every run. Forces the determinism enforcers ON (deterministic_reduce, deterministic_ep_combine — the atomic/arrival-order paths are warp-scheduling-dependent) and the genuinely nondeterministic knobs OFF (SpecRoundGovernor, whose round-shape choice follows wall-clock noise), and refuses contrary env pins LOUDLY at boot instead of silently overriding them. Deliberately LEAVES trajectory-forking-but-STABLE optimizations alone — e.g. LS_TQ_SPLITKV forks the reference trajectory (327/6999 argmax flips) yet is provably byte-identical run-to-run, so it SURVIVES this flag; use compute.reference_trajectory_identity for the stronger guarantee (which implies this one). Optimizations proven bit-identical stay ON: make-it-reproducible, not make-it-slow. Not covered: cross-placement bit-identity at depth on EP shapes (TD-MOE-EP-XTP-PLACEMENT-DRIFT, open), the DET-TOPK-TIES build precondition (deps/LayerStoRmKernels >= 8228e71, gate-suite-verified), and sampled (temperature>0) decoding beyond per-arm seeded reproducibility. Registry + boot audit log: src/core/determinism.cpp mirrored by python/orchestrator/determinism.py. Override either way with env LS_DETERMINISTIC (set & !=0 -> on, 0 -> off). DEFAULT false: current behavior unchanged.",
+          "x-devDoc": "Applied once at Engine::init_modules (setenv before any getenv-latching static runs) and again — same registry — at serve.py boot before the engine import (os.environ so Python-read knobs see it). Every LS_*/LAYERSTORM_* env knob that can affect the output trajectory MUST be registered in both registries, classified on BOTH axes (deterministic? / forks reference?); unit tests scan the tree and fail on unregistered knobs (tests/unit/determinism_registry_test.cpp, tests/unit/test_determinism_superflag.py)."
+        },
+        "reference_trajectory_identity": {
+          "type": "boolean",
+          "default": false,
+          "description": "DETERMINISM SUPERFLAG 2 of 2 — REFERENCE-TRAJECTORY IDENTITY: the STRONGER guarantee that output matches the CANONICAL trajectory for this configuration — the one goldens, identity shas and A/B baselines are pinned to. STRICT HIERARCHY: this flag IMPLIES compute.deterministic (matching a deterministic reference exactly means being deterministic); enabling it applies flag 1's forcings too, and requesting it while explicitly suppressing flag 1 (LS_DETERMINISTIC=0) is REFUSED at boot. On top of flag 1 it forces every trajectory-FORKING knob to its canonical state (LS_TQ_SPLITKV=0, LS_SNAPMLA_FP8_DECODE=0, subgrid_mid_edge OFF, bf16 EP-combine payload) and refuses contrary env pins of ~30 registered trajectory-relevant knobs (kernel-variant flips, batch-width shape knobs, residency-carve levers). WHAT 'REFERENCE' MEANS — read carefully, this is the subtle part: the reference is RELATIVE, not a global golden. It is what THIS configuration produces with no flag-level shortcut forking it — the canonical numerics path for the chosen backend, accuracy tier and parallelism. It is NOT a fixed sha (the reference legitimately moves: the OQ-8 truncation fix moved it; a granted default-flip + re-golden moves it again — update the registry row in the same commit) and NOT 'one true backend' (TQ vs snapMLA is a configuration choice). The guarantee is 'no FLAG has moved you off your config's canonical trajectory'. Proven-bit-identical optimizations stay ON. Override either way with env LS_REFERENCE_TRAJECTORY_IDENTITY (set & !=0 -> on, 0 -> off). DEFAULT false: current behavior unchanged.",
+          "x-devDoc": "Same registry/apply machinery as compute.deterministic (src/core/determinism.cpp, python/orchestrator/determinism.py): Axis::kRunToRun rows act under flag 1 and (via the hierarchy) flag 2; Axis::kReference rows act under flag 2 only. Boot log tags every forced knob with the flag that forced it. When a trajectory-forking flag's default is deliberately flipped and re-goldened (e.g. OQ-6 LS_TQ_SPLITKV), update its registry forced value in the SAME commit as the re-golden — the flag pins the reference, and the reference may move deliberately, never by accident."
         },
         "deterministic_reduce": {
           "type": "boolean",
@@ -2426,7 +2502,7 @@
         "tokenizer_mode": {
           "type": "string",
           "default": "auto",
-          "description": "Serving tokenizer mode (vLLM TokenizerMode parity subset). \"auto\" resolves from model.architecture (deepseek_v4 models -> \"deepseek_v4\", else \"hf\"); \"deepseek_v4\" switches chat-template kwarg normalization + thinking defaults to the DeepSeek-V4 rules (thinking defaults OFF; reasoning_effort none->off, max/xhigh->\"max\", other->\"high\"). Consumed by the Python serving layer; CLI override: --tokenizer-mode."
+          "description": "Serving tokenizer mode (vLLM TokenizerMode parity subset). \"auto\" resolves from model.architecture (deepseek_v4 models -> \"deepseek_v4\", glm5_next models -> \"glm5_next\", else \"hf\"); \"deepseek_v4\" switches chat-template kwarg normalization + thinking defaults to the DeepSeek-V4 rules (thinking defaults OFF; reasoning_effort none->off, max/xhigh->\"max\", other->\"high\"); \"glm5_next\" to the GLM-5.3 rules (thinking always ON — the template pre-seeds <think> unconditionally, thinking-off requests are 400s; reasoning_effort minimal/low->\"low\", medium/high->\"high\", max/xhigh->\"max\", default max, \"none\"/unknown are 400s; clear_thinking chat default TRUE; generation_config.json top_p fills explicitly-sampled requests). Consumed by the Python serving layer; CLI override: --tokenizer-mode."
         },
         "prefix_cache": {
           "type": "object",
@@ -2450,6 +2526,31 @@
               "maximum": 64,
               "default": 8,
               "description": "Maximum retained prefix holder sequences (LRU). Also bounded by the engine page budget's max_concurrent_forks sizing. SIZING INPUT (INV-PREFIX-CACHE-3): on deepseek_v4 every holder owns a full COPY-ON-FORK side-tier set (kSwa/kHca/kIndexerK, ~45 MiB/holder/TP-GPU at 32k), so the engine carves the side pools for max_concurrent_requests + max_entries sequences and logs the achievable holder count at boot (warns when VRAM caps it below max_entries — expect retryable eviction churn there). GLM holders are refcount-cheap and do not scale pools."
+            },
+            "kda_checkpoints": {
+              "type": "object",
+              "description": "P-29 step 24 (OQ-13): position-keyed UNCOMPRESSED host-RAM checkpoints of the KDA recurrent state, captured during prefill at a token cadence, so a DIVERGED prompt (edited/re-rendered mid-prompt) replays from the nearest checkpoint at or below the divergence instead of re-prefilling from zero. Restore is a whole-slot fp32 byte round-trip and replay from a 64-aligned uniform frontier is BIT-IDENTICAL (INV-KDA-CARRY) — no accuracy trade, latency only. Only meaningful on recurrent-state architectures (glm5_next); inert elsewhere. Env LS_KDA_PREFIX_CKPT overrides enabled EITHER WAY when set (first char != '0' = ON).",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Enable checkpoint capture + divergence reuse. DEFAULT ON since 2026-09-06 (user decision) — the three byte-identity gates are GREEN on this deployment: golden KdaPrefixCkptForkReplayBitExact (token-identical continuation + byte-identical end-state ckpt snapshot, negative-control refusal at a non-checkpoint position), TF byte-compare 1,023/1,023 positions with ZERO byte mismatches, and in-vivo generation-sha equal to the control arm on every divergence leg. The feature changes admission latency, never bytes: measured TTFT after a late divergence 67.5s -> 18.4s at 8k (edit @98%) and ~923s -> 78.7s at 97k (edit @95%); decode untouched (capture is prefill-time; 27.50 vs 27.3 control). Cost ~146 MiB host RAM per checkpoint per cached entry against the budget_mib cap. Set false (or LS_KDA_PREFIX_CKPT=0) to disable."
+                },
+                "interval_tokens": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1048576,
+                  "default": 2048,
+                  "description": "Checkpoint cadence in prompt tokens (0 = capture disabled). Rounded UP to a multiple of 512 (the superchunk stride — captures happen only between prefill commands, where the per-layer KDA frontier is uniform; 512-multiples are also KV-page- and indexer-pool-aligned, so a truncating fork at a checkpoint never straddles anything). Cost ~146 MiB host RAM per checkpoint per cached entry; worst-case replay tail after a late divergence ~= interval tokens of re-prefill."
+                },
+                "budget_mib": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 32768,
+                  "description": "Global soft cap, in MiB, on host bytes held by KDA checkpoints (default 32768 MiB = 32 GiB ~= 220 checkpoints at the GLM-5.3-Flash tp2 slot size). Enforced at CAPTURE time by the orchestrator (a capture that would exceed it is skipped — later divergences simply floor to an older checkpoint); checkpoint bytes are additionally freed whenever their prefix entry is evicted. 0 = unbounded."
+                }
+              },
+              "additionalProperties": false
             }
           },
           "additionalProperties": false
@@ -2505,6 +2606,9 @@
     "_internal-prefix_cache": {
       "$ref": "internal-schemas/prefix_cache.schema.json"
     },
+    "_internal-prefix_spill": {
+      "$ref": "internal-schemas/prefix_spill.schema.json"
+    },
     "_internal-prescope": {
       "$ref": "internal-schemas/prescope.schema.json"
     },
@@ -2552,6 +2656,29 @@
     },
     "_internal-orchestrator": {
       "$ref": "internal-schemas/orchestrator.schema.json"
+    },
+    "autoconfig": {
+      "type": "object",
+      "description": "OPT-IN hardware-fit config derivation (TD-AUTOCONFIG-HARDWARE-FIT; docs/AUTOCONFIG_MODEL.md). Default OFF: a hand-tuned recipe always wins. When enabled (or via serve.py --autoconfig), the hardware is detected CPU-only, GPU speed comes from the engine's gpu_loader calibration artifact, and a full recipe is derived from the two levers below, persisted to output_path with an .explain.md sidecar, and reused until the hardware fingerprint changes. The user-facing entry point is 'python python/cli/autoconfigure.py --model <weights>', which calibrates, derives, and trains the loader constants on a real 100-token decode before printing the serve command (spec/AUTO_RUN.md).",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false, "description": "Opt in to autoconfig. Never silently re-tunes a hand-written recipe: derivation writes a NEW recipe file at output_path." },
+        "vram_expert_ratio": { "oneOf": [{ "type": "null" }, { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }], "default": null, "description": "Lever 1: VRAM-resident expert slots as a fraction of ALL expert slots (n_routed_experts x num_moe_layers), summed over every expert-hosting GPU's stable+streaming zones — the single dial for the expert/KV tradeoff. null = fill expert hosts to capacity, TP GPUs take the residual after KV." },
+        "total_active_context_tokens": { "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1024 }], "default": null, "description": "Lever 2: TOTAL active context the box should serve, summed across concurrent requests — NOT the per-request maximum (e.g. 1.1M on a 1M-context model leaves headroom for a second sequence). Degrades gracefully: fewer concurrent requests, then shorter max_sequence_length, never a boot failure. null = 2 x 64k default." },
+        "output_path": { "type": "string", "default": "", "description": "Where the derived recipe is persisted (a normal, diffable, editable recipe). Empty = '<base config stem>.autoconfig.json' next to the base config." },
+        "fingerprint": { "type": "string", "default": "", "description": "Measurement-derived hardware-topology fingerprint written by the solver (GPU UUIDs/NUMA/max-PCIe/VRAM, NUMA banks, calibration tier matrix; volatile rates excluded). Re-derivation happens only when the live fingerprint differs or on explicit --redetect." },
+        "prefer": { "type": "string", "enum": ["speed", "balanced", "capacity"], "default": "balanced", "description": "AUTOCONFIG §2.3, the third human-facing lever: preference ORDER over feasible fits — never a weight, and never a reason to refuse (the E1 degradation ladder is preference-independent). speed = fastest feasible fit; capacity = most active context; balanced (DEFAULT) = the shipped tradeoff. The solver emits this field into a derived recipe ONLY when it is non-default, so default derivations stay byte-identical and a lever-carrying recipe re-applies its preference on every --autoconfig boot; CLI --prefer overrides the recipe's value for one derivation. Was CLI-first with the schema field owed (TD-AUTOCONFIG-HARDWARE-FIT §2.3 precedent)." },
+        "accuracy": { "type": "string", "enum": ["compact", "standard", "high", "superior"], "default": "standard", "description": "AUTOCONFIG §2.4, the fourth human-facing lever (TD-AUTOCONFIG-ACCURACY-LEVER): a FLOOR over the per-family numerics ladder (templates.ACCURACY_LADDER) — order/floor only, never a weight. standard (DEFAULT) is byte-identical to the pre-lever derivation; compact allows the most quantized serveable backend; high floors at the measured-best backend (mla-tq-vs-snapmla-accuracy row for MLA families); superior is DEFINED BUT NOT IMPLEMENTED and refuses at derive time naming the missing kFull codec arm. Emitted into a derived recipe ONLY when non-default (see prefer); CLI --accuracy overrides for one derivation." }
+      },
+      "additionalProperties": false
+    },
+    "_internal-autoconfig": {
+      "$ref": "internal-schemas/autoconfig.schema.json"
+    },
+    "_internal-kda_state": {
+      "$ref": "internal-schemas/kda_state.schema.json"
+    },
+    "_internal-kv_expert_rebalance": {
+      "$ref": "internal-schemas/kv_expert_rebalance.schema.json"
     },
     "gpu_loader": {
       "type": "object",

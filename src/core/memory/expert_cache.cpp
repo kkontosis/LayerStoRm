@@ -1,7 +1,10 @@
 #include "core/memory/expert_cache.h"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <stdexcept>
 
 namespace layerstorm::memory {
@@ -32,6 +35,21 @@ void ExpertCache::SlotAllocator::init(void* base_ptr, int64_t bytes_per_slot,
     slot_bytes = bytes_per_slot;
     total_slots_ = (bytes_per_slot > 0) ? static_cast<int>(zone_bytes / bytes_per_slot) : 0;
 
+    free_list.clear();
+    free_list.reserve(total_slots_);
+    for (int i = total_slots_ - 1; i >= 0; --i) {
+        free_list.push_back(i);
+    }
+}
+
+void ExpertCache::SlotAllocator::init_with_count(void* base_ptr, int64_t stride,
+                                                  int count) {
+    base = base_ptr;
+    slot_bytes = stride;
+    total_slots_ = (stride > 0 && count > 0) ? count : 0;
+
+    // Same free-list convention as init(): descending push so the LIFO back()
+    // hands out slot 0 first.
     free_list.clear();
     free_list.reserve(total_slots_);
     for (int i = total_slots_ - 1; i >= 0; --i) {
@@ -170,6 +188,27 @@ void* ExpertCache::reserve(ExpertKey key, int gpu_idx, CacheZone zone,
     }
 
     int slot = alloc->allocate();
+
+    // 44z: the boot carve's stable slots are exhausted — spend elastic zone
+    // capacity before reporting the zone full. Zones are offered in ascending
+    // id order (gs.elastic_zones is kept sorted), oldest grant first, and
+    // DRAINING zones are never offered: they are on their way back to the KV
+    // pool and must not take on new residents. With no zones registered the
+    // loop body never runs and this is the pre-44z path exactly.
+    int elastic_id = -1;
+    if (slot < 0 && zone == CacheZone::kStable) {
+        for (auto& z : gs.elastic_zones) {
+            if (z.state != ElasticZoneState::kActive) continue;
+            const int zslot = z.slots.allocate();
+            if (zslot < 0) continue;
+            slot = zslot;
+            alloc = &z.slots;
+            elastic_id = z.id;
+            ++z.resident_entries;
+            break;
+        }
+    }
+
     if (slot < 0) return nullptr;
 
     void* addr = alloc->address(slot);
@@ -183,6 +222,7 @@ void* ExpertCache::reserve(ExpertKey key, int gpu_idx, CacheZone zone,
     entry.sub_components_ready = 0;
     entry.vram_address = addr;
     entry.slot_idx = slot;
+    entry.elastic_zone = elastic_id;
     entry.gate_offset = 0;
     entry.up_offset = gate_bytes_;
     entry.down_offset = gate_bytes_ + up_bytes_;
@@ -249,7 +289,18 @@ bool ExpertCache::evict(ExpertKey key, int gpu_idx) {
     // #90: refuse to evict locked experts.
     if (entry.lock_count > 0) return false;
     const bool was_stable = (entry.zone == CacheZone::kStable);
-    if (entry.zone == CacheZone::kStable) {
+    if (entry.elastic_zone >= 0) {
+        // 44z: the slot belongs to an elastic zone — return it THERE, tested
+        // before the zone tag because demote() can retag an elastic resident
+        // to kStreaming without moving its bytes. Draining zones take their
+        // slots back too; only new reserves are refused, not returns.
+        ElasticZone* z = find_elastic_zone(gs, entry.elastic_zone);
+        assert(z != nullptr && "elastic zone removed while still resident");
+        if (z != nullptr) {
+            z->slots.free(entry.slot_idx);
+            --z->resident_entries;
+        }
+    } else if (entry.zone == CacheZone::kStable) {
         gs.stable_slots.free(entry.slot_idx);
     } else {
         // Streaming zone: return to correct sub-allocator
@@ -350,6 +401,139 @@ bool ExpertCache::demote(ExpertKey key, int gpu_idx) {
     return true;
 }
 
+// ── Elastic zones (44z) ─────────────────────────────────────────────────────
+
+ExpertCache::ElasticZone* ExpertCache::find_elastic_zone(GpuState& gs,
+                                                          int zone_id) {
+    for (auto& z : gs.elastic_zones) {
+        if (z.id == zone_id) return &z;
+    }
+    return nullptr;
+}
+
+const ExpertCache::ElasticZone* ExpertCache::find_elastic_zone(
+    const GpuState& gs, int zone_id) {
+    for (const auto& z : gs.elastic_zones) {
+        if (z.id == zone_id) return &z;
+    }
+    return nullptr;
+}
+
+int ExpertCache::add_elastic_zone(int gpu_idx, void* base, int64_t bytes,
+                                   int64_t slot_stride, int num_slots,
+                                   int64_t cookie) {
+    auto& gs = gpu_state(gpu_idx);
+    assert(base != nullptr);
+    assert(slot_stride > 0);
+    assert(num_slots > 0);
+
+    // Slot 0 sits at align_up(base, kExpertZoneSlotAlign): a granted slab run
+    // base is only slab-granular, and a byte-exact zone split once faulted
+    // with cudaErrorMisalignedAddress 716 (vram_allocator.cpp kZoneAlign).
+    auto* raw = static_cast<char*>(base);
+    const int64_t misalign = static_cast<int64_t>(
+        reinterpret_cast<std::uintptr_t>(raw)
+        % static_cast<std::uintptr_t>(kExpertZoneSlotAlign));
+    const int64_t pad = (misalign == 0) ? 0 : kExpertZoneSlotAlign - misalign;
+
+    // The caller sized num_slots with the same ExpertZoneGeometry, so the
+    // aligned slots fit: pad + (N-1) strides + the last slot's expert bytes.
+    assert(pad + static_cast<int64_t>(num_slots - 1) * slot_stride
+               + expert_bytes_ <= bytes);
+
+    ElasticZone z;
+    z.id = gs.next_elastic_id++;
+    z.base = base;
+    z.bytes = bytes;
+    z.slot_stride = slot_stride;
+    z.state = ElasticZoneState::kActive;
+    z.resident_entries = 0;
+    z.cookie = cookie;
+    z.slots.init_with_count(raw + pad, slot_stride, num_slots);
+
+    // Ids are monotonic and push_back appends, so the vector stays sorted by
+    // id — that IS the order reserve() offers zones in.
+    gs.elastic_zones.push_back(z);
+
+    // Generation bump: stable capacity GREW, and capacity consumers latching
+    // total_slots(kStable) key their refresh off this counter
+    // (TD-KVXP-CAPACITY-REPUBLISH). Address-caching consumers are only
+    // over-invalidated by an add, which is safe.
+    ++elastic_generation_;
+    return z.id;
+}
+
+bool ExpertCache::begin_drain_elastic_zone(int gpu_idx, int zone_id) {
+    auto& gs = gpu_state(gpu_idx);
+    ElasticZone* z = find_elastic_zone(gs, zone_id);
+    if (z == nullptr) {
+        spdlog::error("ExpertCache: begin_drain_elastic_zone(gpu={}, zone={}) "
+                      "— unknown zone id", gpu_idx, zone_id);
+        return false;
+    }
+    // Idempotent. The bump is unconditional on success (over-invalidating a
+    // consumer's cached pointer table is safe; under-invalidating is not).
+    z->state = ElasticZoneState::kDraining;
+    ++elastic_generation_;
+    // Residents stay valid, dispatchable stable residents — the caller evicts
+    // them through the ordinary evict() path as they become evictable.
+    return true;
+}
+
+ExpertCache::ElasticDrainStatus ExpertCache::elastic_drain_status(
+    int gpu_idx, int zone_id) const {
+    const auto& gs = gpu_state(gpu_idx);
+    const ElasticZone* z = find_elastic_zone(gs, zone_id);
+    if (z == nullptr) return ElasticDrainStatus{};
+    return ElasticDrainStatus{z->resident_entries, z->resident_entries == 0};
+}
+
+std::vector<ExpertKey> ExpertCache::elastic_zone_residents(
+    int gpu_idx, int zone_id) const {
+    const auto& gs = gpu_state(gpu_idx);
+    std::vector<ExpertKey> result;
+    if (find_elastic_zone(gs, zone_id) == nullptr) return result;
+    for (const auto& [k, e] : gs.residents) {
+        if (e.elastic_zone == zone_id) result.push_back(k);
+    }
+    // residents is unordered — sort so the drain loop is deterministic.
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool ExpertCache::remove_elastic_zone(int gpu_idx, int zone_id) {
+    auto& gs = gpu_state(gpu_idx);
+    auto it = std::find_if(gs.elastic_zones.begin(), gs.elastic_zones.end(),
+                           [zone_id](const ElasticZone& z) {
+                               return z.id == zone_id;
+                           });
+    if (it == gs.elastic_zones.end()) {
+        spdlog::error("ExpertCache: remove_elastic_zone(gpu={}, zone={}) — "
+                      "unknown zone id", gpu_idx, zone_id);
+        return false;
+    }
+    if (it->resident_entries != 0) {
+        spdlog::error("ExpertCache: remove_elastic_zone(gpu={}, zone={}) "
+                      "refused — {} resident entr{} left; drain first",
+                      gpu_idx, zone_id, it->resident_entries,
+                      it->resident_entries == 1 ? "y" : "ies");
+        return false;
+    }
+    // erase keeps the remaining zones in ascending id order.
+    gs.elastic_zones.erase(it);
+    ++elastic_generation_;
+    return true;
+}
+
+int ExpertCache::elastic_zone_count(int gpu_idx) const {
+    return static_cast<int>(gpu_state(gpu_idx).elastic_zones.size());
+}
+
+int64_t ExpertCache::elastic_zone_cookie(int gpu_idx, int zone_id) const {
+    const ElasticZone* z = find_elastic_zone(gpu_state(gpu_idx), zone_id);
+    return z != nullptr ? z->cookie : 0;
+}
+
 // ── Prefill spill mode ──────────────────────────────────────────────────────
 
 ScratchRegion ExpertCache::enter_spill_mode(int gpu_idx) {
@@ -360,6 +544,10 @@ ScratchRegion ExpertCache::enter_spill_mode(int gpu_idx) {
     // #90: skip locked experts — they are in active use by progressive MoE.
     std::vector<ExpertKey> to_evict;
     for (const auto& [k, e] : gs.residents) {
+        // 44z: elastic zones are stable-side capacity and are never part of
+        // the streaming spill sub-allocator, so the spill machinery cannot
+        // reach them — reserve() only ever sets in_spill_zone on spill slots.
+        assert(!(e.in_spill_zone && e.elastic_zone >= 0));
         if (e.zone == CacheZone::kStreaming && e.in_spill_zone
             && e.lock_count == 0) {
             to_evict.push_back(k);
@@ -471,7 +659,15 @@ bool ExpertCache::affinity_hints_valid() const {
 int ExpertCache::free_slots(int gpu_idx, CacheZone zone) const {
     const auto& gs = gpu_state(gpu_idx);
     if (zone == CacheZone::kStable) {
-        return gs.stable_slots.free_count();
+        // 44z: ACTIVE elastic zones are ordinary stable capacity. DRAINING
+        // zones are excluded from free AND total (see the header note: stats
+        // under-report during a drain window rather than over-report).
+        int n_free = gs.stable_slots.free_count();
+        for (const auto& z : gs.elastic_zones) {
+            if (z.state == ElasticZoneState::kActive)
+                n_free += z.slots.free_count();
+        }
+        return n_free;
     }
     // Streaming: sum of both sub-allocators (spill frozen during spill mode)
     if (gs.mode == PrefillMode::kSpillActive) {
@@ -483,7 +679,12 @@ int ExpertCache::free_slots(int gpu_idx, CacheZone zone) const {
 int ExpertCache::total_slots(int gpu_idx, CacheZone zone) const {
     const auto& gs = gpu_state(gpu_idx);
     if (zone == CacheZone::kStable) {
-        return gs.stable_slots.total_slots_;
+        int total = gs.stable_slots.total_slots_;
+        for (const auto& z : gs.elastic_zones) {
+            if (z.state == ElasticZoneState::kActive)
+                total += z.slots.total_slots_;
+        }
+        return total;
     }
     return gs.spill_slots.total_slots_ + gs.prefetch_slots.total_slots_;
 }

@@ -37,6 +37,12 @@
 // and further demotions are skipped (fail-safe, pages stay hot) — one
 // sequence can never monopolize the pool.  Slots return in full at seq
 // teardown (release_seq); other sequences' slots are never touched.
+// A FULL pool skips the same way IN-STEP ONLY (a cold slot is the sole
+// copy of demoted KV — the pool never evicts one, TD-KVT-COLD-FULL-HOT-
+// WEDGE / INV-KVT-18); the skipped hot backlog is recovered OUT of step:
+// kMain-exhausted growth drives the dispatcher's pressure_demote sweep,
+// and cold CAPACITY comes back only as whole-holder retirement through
+// the orchestrator's evict-retry seam (INV-KVT-17).
 // A true B>1 cohort in ONE step remains fail-closed (TD-KVT-BATCH-COHORT:
 // needs per-row fake views + batched materialization).
 //
@@ -189,6 +195,16 @@ public:
         int page_size = 16;        ///< tokens per page
         int kv_layers = 1;         ///< layers incl. MTP
         int index_topk = 2048;
+        /// GF3.5 (IndexPool): model.index_kpool (1 = legacy). Selection is
+        /// index_topk/index_kpool POOLS; the expanded per-row selection is
+        /// up to index_topk_rows() token rows — every per-row buffer, cap
+        /// and stride in this manager is ROWS-denominated. hot_buffer_slots
+        /// auto-sizing (2 x index_topk) stays TOKEN-denominated (a
+        /// retention window, not a row capacity — MODELINFO §3d).
+        int index_kpool = 1;
+        int index_topk_rows() const {
+            return index_topk + (index_kpool > 1 ? index_kpool - 1 : 0);
+        }
 
         int hot_buffer_slots = 0;        ///< 0 = auto (2 × index_topk)
         double host_to_device_ratio = 8.0;
@@ -213,14 +229,14 @@ public:
         /// TD-KVT-ADMISSION-UPFRONT (cohort seam): maximum chunk rows a
         /// blessed sparse prefill chunk may carry through materialize_row.
         /// Sizes the pinned cohort selection staging (cohort_rows_max x
-        /// index_topk ints + cohort_rows_max lengths).  0 = cohort seam
+        /// index_topk_rows ints + cohort_rows_max lengths).  0 = cohort seam
         /// disabled (materialize_row fails loud; legacy B==1 staging only).
         int cohort_rows_max = 0;
 
         /// TD-KVT-COHORT-BATCHED-MATERIALIZE: capacity (rows) of the cohort
         /// UNION staging — the batched consumer materializes the union of a
         /// chunk's per-row selections once instead of per-row fake views.
-        /// Caller sizes it min(cohort_rows_max × index_topk, the rank-local
+        /// Caller sizes it min(cohort_rows_max × index_topk_rows, the rank-local
         /// max prefix rows) — a union can never exceed either bound.  0 =
         /// batched cohort arm disabled (materialize_cohort returns false;
         /// per-row consumption only).  Ignored when cohort_rows_max <= 1.
@@ -232,6 +248,64 @@ public:
         /// SHARED.  Drives the IndexShare reuse skip + lookahead prefetch
         /// (TD-KVT-SYNC / TD-KVT-PREFETCH).  Empty = no sharing = both off.
         std::vector<uint8_t> indexer_full_layers;
+
+        /// GF3.9 (glm5_next hybrid): per-layer ATTENTION-TYPE mask —
+        /// kv_bearing_layers[l] != 0 iff layer l appends per-token KV
+        /// (sparse MLA).  KDA linear layers carry a per-request recurrent
+        /// state instead (Pool::kKdaState — never demoted, never tiered,
+        /// INV-KDA-STATE (d)), so tiering must SKIP them entirely:
+        /// begin_layer / after_attention refuse, the share-successor walk
+        /// never counts them (lookahead prefetch would otherwise walk
+        /// their empty/sentinel page lists), and the S3 step-boundary
+        /// flush keys on the FIRST bearing layer instead of literal 0.
+        /// EMPTY = every layer bears KV (GLM-5.2/V3.2 — byte-identical
+        /// legacy behavior).  Model-layer indexed, size kv_layers.
+        std::vector<uint8_t> kv_bearing_layers;
+
+        /// S3 (tiering by slab, RADIX_SLAB_DESIGN §5): kMain pages per slab
+        /// (S1/S2 geometry, PageAllocator::pages_per_slab()).  > 0 enables
+        /// SLAB-COHORT demotion: the in-step window sweep DEFERS each
+        /// layer's demotion candidates and flushes them ONCE per step (all
+        /// layers of the behind-window token range together — under
+        /// position-major packing, INV-SLAB-2, that set is a run of
+        /// complete slabs), so the flush issues ONE contiguous D2H per
+        /// (rank, physically-contiguous run) instead of one copy per page,
+        /// and a fully-demoted slab returns WHOLE to the free-slab list
+        /// through the ordinary refcounted free path.  Demotion SELECTION
+        /// stays PAGE-PRECISE in both modes: INV-KVT-4 retention semantics
+        /// are unchanged, and a slab STRADDLING the retention window
+        /// demotes its behind-window pages individually, completing on
+        /// later flushes — it is never demoted whole while any of its
+        /// pages sits inside the window or on the append frontier.
+        /// 0 = unslabbed: legacy per-call (per-layer) demotion — fixtures
+        /// and non-slabbed models.  Coalescing itself is unconditional
+        /// (physically contiguous candidate pages batch into one D2H in
+        /// both modes); only the cross-layer DEFERRAL is gated here.
+        /// Env kill switch: LS_KVT_SLAB_DEMOTE=0 forces per-call demotion.
+        int pages_per_slab = 0;
+        /// Per-RANK kMain slab-span page count
+        /// (PageAllocator::total_pages(gpu, kMain)): a page_idx >= span is
+        /// a LOOSE page (INV-4.9b promoted spec-range index — physically
+        /// outside the slab region), so a D2H run must never coalesce
+        /// across the span boundary.  Empty = no span limit (tests).
+        std::vector<int> slab_span_pages;
+
+        /// TD-PREFIX-TIDY-COLD-SPILL: directory for holder cold-page spill
+        /// files ("" = spilling disabled).  Created on demand (mkdir -p,
+        /// "~" already expanded by the config layer or here via $HOME);
+        /// any I/O failure DISABLES spilling for the boot (loudly) and
+        /// never fails a step — the cold pool simply stays the last hop.
+        /// The directory is a CACHE, never a store: files carry a
+        /// boot-unique nonce and the orchestrator reclaims stale ones at
+        /// startup; nothing in it is load-bearing across boots.
+        std::string spill_dir;
+        /// MANDATORY byte cap over this manager's LIVE spill files,
+        /// enforced BEFORE each write (a single 25k GLM holder is
+        /// ~600 MiB/rank of cold KV — a handful can fill a home
+        /// partition).  A spill that would exceed the cap is REFUSED so
+        /// the caller can evict spilled holders (deleting their files)
+        /// and retry.  <= 0 disables spilling.
+        int64_t spill_max_bytes = 0;
     };
 
     explicit KvTieringManager(Options opts);
@@ -270,9 +344,120 @@ public:
                          const memory::PageHandle* pages, int num_logical,
                          int handle_stride);
 
+    /// R3 holder hibernation (CMD_SEQ_HIBERNATE): demote ALL of one layer's
+    /// demote-eligible hot pages of a FROZEN sequence — everything except
+    /// the append-frontier logical page (INV-KVT-4's frontier rule kept) —
+    /// through the same machinery as window demotion.  Returns the number
+    /// of pages enqueued for D2H (0 = nothing eligible / dense layer).
+    int hibernate_layer(int layer, uint64_t seq_id,
+                        const memory::PageHandle* pages, int num_logical,
+                        int handle_stride, int frontier_logical = -1);
+
+    // ── TD-PREFIX-TIDY-COLD-SPILL (S3 rider): 2nd tiering hop ──────────
+
+    /// Spill a HIBERNATED holder's COLD pages to ONE file under spill_dir
+    /// (the second tiering hop: VRAM → pinned cold pool → disk).  Writes
+    /// one copy per page (replicas are byte-identical, INV-KV-REP; the
+    /// dedup/shard owner's slot is the source), releases every cold slot
+    /// (respecting fork-family refcounts — a shared slot survives for its
+    /// other holders and frees no RAM), flips pages kCold → kSpilled and
+    /// returns pages spilled.  Returns -1 when the byte cap would be
+    /// exceeded (nothing written — the caller evicts spilled holders and
+    /// may retry); 0 when disabled / nothing cold / not hibernated.  An
+    /// I/O failure unlinks the partial file, keeps every slot (pages stay
+    /// kCold) and disables spilling for the boot — capacity, never
+    /// correctness.
+    int spill_seq(uint64_t seq_id);
+
+    /// True when the sequence has kSpilled pages — fork/snapshot/
+    /// repromote must unspill_seq() first (the dispatcher owns those call
+    /// sites; reaching a spilled page on a read path throws, INV-KVT-2
+    /// fail-loud).
+    bool seq_spilled(uint64_t seq_id) const;
+
+    /// Reload every kSpilled page into fresh cold slots (byte-exact,
+    /// INV-KVT-1) and delete the spill file.  Slot acquisition follows
+    /// the demotion storing-rank rule (all ranks under replicated
+    /// non-dedup — the one file copy fans out; the owner under dedup/
+    /// sharded) and bypasses the fair-share cap (holder reload, like
+    /// hibernation).  False on cold-slot exhaustion or I/O failure —
+    /// partial progress stays consistent (reloaded pages are kCold; the
+    /// rest stay kSpilled with the file intact) and the caller fails
+    /// RETRYABLE (kKvPoolExhausted: holder eviction frees slots).
+    bool unspill_seq(uint64_t seq_id);
+
+    /// Live bytes across this manager's spill files (cap accounting).
+    int64_t spilled_bytes_total() const { return spilled_total_; }
+
+    /// S3 whole-sequence hibernation: hibernate_layer over EVERY layer of
+    /// the dispatcher's layer-major handle table (handle (logical j, layer
+    /// l) at pages[j * kv_layers + l]) collected into ONE slab-grouped
+    /// flush — all layers of the holder's cold token range demote together,
+    /// so complete slabs leave in single contiguous D2H runs (one
+    /// attention-order fence for the whole sweep).  Same demote set and
+    /// frontier rule as the per-layer loop it replaces (INV-KVT-4;
+    /// fair-share-cap-exempt like hibernate_layer).  Returns total pages
+    /// enqueued for D2H.
+    int hibernate_seq(uint64_t seq_id, const memory::PageHandle* pages,
+                      int num_logical, int frontier_logical = -1);
+
+    /// TD-KVT-COLD-FULL-HOT-WEDGE: out-of-step pressure sweep.  Re-runs the
+    /// after_attention window demotion for EVERY layer of one LIVE sequence
+    /// at its recorded high-water position — the behind-window hot BACKLOG
+    /// that accumulated while demotions were skipped (cold pool full /
+    /// fair-share budget) becomes demotable the moment slots free up (the
+    /// orchestrator's holder-eviction seam, INV-KVT-17), and this call
+    /// drains it WITHOUT the very step that kMain exhaustion is blocking.
+    /// Same demote_layer_range body as a step's sweep: retention window and
+    /// append-frontier rules hold unchanged (INV-KVT-4), fair-share
+    /// applies, hibernated holders / unknown / never-stepped sequences are
+    /// no-ops.  `pages` is the dispatcher's layer-major handle table
+    /// (handle (logical j, layer l) at pages[j * kv_layers + l]).  Returns
+    /// pages enqueued for D2H; the caller must drain_demotions() before
+    /// retrying an allocation.
+    int pressure_demote(uint64_t seq_id, const memory::PageHandle* pages,
+                        int num_logical);
+
     /// Poll in-flight demotion D2H copies; completed pages flip to COLD and
     /// their device pages return to the allocator.
     void poll_demotions();
+
+private:
+    /// Shared demotion body (window demotion + hibernation): demote this
+    /// layer's HOT pages with (j+1)*page_size <= demote_end_tok and
+    /// j < frontier.  Returns pages enqueued.  S3: implemented as
+    /// collect_layer_range + an immediate flush_pending.
+    int demote_layer_range(int layer, uint64_t seq_id,
+                           const memory::PageHandle* pages, int num_logical,
+                           int handle_stride, int64_t demote_end_tok,
+                           int frontier, bool fair_share = true);
+
+    /// S3 phase 1: mark this layer's window-eligible HOT pages
+    /// pending-demote and append them (handle copies) to the step batch.
+    /// Same eligibility predicate as the pre-S3 demotion loop (retention
+    /// window, append frontier, sticky-dense layer, valid handle).  A
+    /// foreign-sequence pending tail is flushed first (one batch, one
+    /// sequence).  Returns candidates collected.
+    int collect_layer_range(int layer, uint64_t seq_id,
+                            const memory::PageHandle* pages, int num_logical,
+                            int handle_stride, int64_t demote_end_tok,
+                            int frontier);
+
+    /// S3 phase 2: demote the pending batch — per-page cold-slot
+    /// acquisition (fair-share budget + pool-capacity fail-safe exactly as
+    /// before), then the D2H issued as physically-contiguous runs (sorted
+    /// by (storing rank, page_idx); a run needs source pages AND every
+    /// storing rank's cold slots consecutive, and never crosses the
+    /// slab-span boundary).  One InflightDemotion group + one
+    /// attention-order fence per participating rank per flush.  Returns
+    /// pages enqueued for D2H; skipped candidates stay HOT (fail-safe).
+    int flush_pending(bool fair_share);
+
+    /// Drop a dying sequence's pending batch without demoting it (its
+    /// pages are freed by ordinary sequence teardown).
+    void discard_pending(uint64_t seq_id);
+
+public:
 
     /// Block until every in-flight demotion completed (spin + yield).
     /// Throws on device error or timeout.  Used by sequence teardown and by
@@ -310,7 +495,18 @@ public:
     /// slot returns to the pool only when its last holder releases it
     /// (release_seq / repromote_seq).  No-op when the parent has no
     /// demotions (the child starts fresh on first sight).
-    void on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id);
+    /// R4a TRUNCATING fork: prefix_len > 0 = the child took only the
+    /// parent's first prefix_len TOKENS, i.e. logical pages
+    /// [0, ceil(prefix_len / page_size)).  The child's copied state is
+    /// truncated to that logical prefix per layer, only the KEPT cold
+    /// slots are refcount-shared (a full-copy share would leak the
+    /// parent's tail slots at the child's release: release_seq walks the
+    /// child's own page vectors), and demoted_frontier /
+    /// demoted_or_inflight / cold_used / max_pos_seen are RECOMPUTED from
+    /// the kept pages.  prefix_len == 0 keeps the full-fork semantics
+    /// above byte-identically.
+    void on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id,
+                     uint32_t prefix_len = 0);
 
     /// TD-KVT-SPEC-FORK / TD-KVT-PREFILL-REPROMOTE machinery: re-promote
     /// every COLD page of `seq_id` holding any position >= keep_frontier
@@ -374,7 +570,7 @@ public:
     /// TD-KVT-COHORT-BATCHED-MATERIALIZE: batched union cohort consumption.
     /// ONE gather of the union of the chunk's per-row selections into the
     /// union staging set + host-side order-preserving index rewrite to union
-    /// slots ([rows x index_topk] upload; IndexShare shared layers reuse the
+    /// slots ([rows x index_topk_rows] upload; IndexShare shared layers reuse the
     /// union + rewrite under the (seq, pos, rows) identity — the gather still
     /// runs per layer, per-layer KV bytes/cold sets).  Same classify/burst/
     /// gather placement body as the per-row path (INV-KVT-1); union cold
@@ -411,6 +607,11 @@ public:
         uint64_t cache_evictions = 0;   ///< hot row-cache LRU evictions
         uint64_t budget_skips = 0;      ///< demotions skipped by the per-seq
                                         ///< cold fair-share cap (TD-KVT-BATCH)
+        uint64_t cold_full_skips = 0;   ///< demote batches cut short by a
+                                        ///< FULL cold pool (in-step skip,
+                                        ///< TD-KVT-COLD-FULL-HOT-WEDGE)
+        uint64_t pressure_demoted = 0;  ///< backlog pages demoted by
+                                        ///< out-of-step pressure sweeps
         // TD-KVT-SYNC / TD-KVT-PREFETCH
         uint64_t prepares = 0;          ///< prepare() readbacks issued
         uint64_t sync_reuses = 0;       ///< materializations with NO D2H
@@ -439,6 +640,20 @@ public:
         uint64_t cohort_union_rows = 0;     ///< union rows gathered
         uint64_t cohort_union_rewrites = 0; ///< union builds + index rewrites
                                             ///< (IndexShare reuse skips these)
+        // TD-PREFIX-TIDY-COLD-SPILL (2nd hop)
+        uint64_t spill_files = 0;       ///< holder spill files written
+        uint64_t spill_pages = 0;       ///< cold pages written to disk
+        uint64_t spill_bytes = 0;       ///< bytes written to spill files
+        uint64_t spill_cap_refusals = 0;///< spills refused by the byte cap
+        uint64_t unspill_pages = 0;     ///< pages reloaded from disk
+        uint64_t unspill_bytes = 0;     ///< bytes reloaded from disk
+        // S3 (tiering by slab) — slab-cohort demotion/promotion telemetry
+        uint64_t slab_flushes = 0;      ///< pending-batch demote flushes
+        uint64_t slab_runs = 0;         ///< contiguous D2H runs issued
+        uint64_t slab_pages = 0;        ///< pages demoted through flushes
+        uint64_t slabs_demoted_whole = 0;  ///< whole slabs covered by a
+                                           ///< single contiguous run
+        uint64_t promote_runs = 0;      ///< coalesced re-promotion H2D runs
     };
     const Stats& stats() const { return stats_; }
 
@@ -471,16 +686,25 @@ public:
     void log_stats() const;
 
 private:
-    enum class PageState : uint8_t { kHot = 0, kD2hInflight = 1, kCold = 2 };
+    enum class PageState : uint8_t { kHot = 0, kD2hInflight = 1, kCold = 2,
+                                     kSpilled = 3 };
 
     struct PageInfo {
         PageState state = PageState::kHot;
+        /// S3: collected into the pending slab-cohort demote batch (still
+        /// HOT — the flag only prevents double collection before the
+        /// step's flush).  Cleared by flush_pending / discard_pending.
+        bool pending_demote = false;
         std::vector<int> cold_slot;  ///< per-rank cold pool slot (-1 = none;
                                      ///< exactly one >= 0 under dedup/
                                      ///< sharded).  Slots are REFCOUNTED
                                      ///< (RankBufs::cold_ref) — a fork
                                      ///< family shares a demoted parent's
                                      ///< slots (TD-KVT-SPEC-FORK).
+        /// TD-PREFIX-TIDY-COLD-SPILL: byte offset of this page's single
+        /// copy inside the sequence's spill file (kSpilled only; -1
+        /// otherwise).
+        int64_t spill_off = -1;
     };
 
     /// TD-KVT-BATCH: all per-sequence tiering state.
@@ -497,12 +721,27 @@ private:
         uint32_t demoted_frontier = 0;
         int demoted_or_inflight = 0;  ///< cold + in-flight page count
         int inflight = 0;             ///< in-flight demotion page count
+        /// R3: this sequence was HIBERNATED (a frozen prefix holder).  It
+        /// never steps, so it will never demote again — the cold
+        /// fair-share census (nseq_cold) excludes it: its retained slots
+        /// are the prefix cache's budget (bounded by holder eviction),
+        /// not a competing live demoter's share.  Without the exclusion a
+        /// live long prefill beside k hibernated holders is throttled to
+        /// capacity/(k+1) and its retention window stops draining
+        /// (measured: budget_skips=7063 during one 8k prefill beside two
+        /// hibernated warm-up holders).
+        bool hibernated = false;
         /// Cold pool slots held per rank — fair-share budget input: with
         /// N demoting sequences a sequence's per-rank cold usage is capped
         /// at capacity / N; further demotions are skipped (fail-safe, pages
         /// stay hot) so one sequence cannot monopolize the shared pool.
         /// A single demoting sequence keeps the full pool.
         std::vector<int> cold_used;
+        /// TD-PREFIX-TIDY-COLD-SPILL: this holder's spill file (empty =
+        /// none) and its live byte count (cap accounting; deleted +
+        /// released at unspill / release_seq).
+        std::string spill_path;
+        int64_t spill_bytes = 0;
     };
 
     /// Shared per-(rank, layer) device row-cache slab, entries keyed by
@@ -550,13 +789,13 @@ private:
     struct MatSet {
         // Device
         void* scratch = nullptr;        ///< fake pages: n_fake_pages × stride_block
-        void* cold_incoming = nullptr;  ///< index_topk × stride_row (packed misses)
-        void* dev_src_ptrs = nullptr;   ///< index_topk × void*
-        void* dev_scatter_ptrs = nullptr;   ///< index_topk × void*
-        void* dev_scatter_idx = nullptr;    ///< index_topk × int
+        void* cold_incoming = nullptr;  ///< index_topk_rows × stride_row (packed misses)
+        void* dev_src_ptrs = nullptr;   ///< index_topk_rows × void*
+        void* dev_scatter_ptrs = nullptr;   ///< index_topk_rows × void*
+        void* dev_scatter_idx = nullptr;    ///< index_topk_rows × int
         // Pinned host (inside the rank arena)
-        char* h_stage = nullptr;            ///< index_topk × stride_row
-        const void** h_src_ptrs = nullptr;  ///< index_topk
+        char* h_stage = nullptr;            ///< index_topk_rows × stride_row
+        const void** h_src_ptrs = nullptr;  ///< index_topk_rows
         const void** h_scatter_ptrs = nullptr;
         int* h_scatter_idx = nullptr;
         // Events / state
@@ -569,7 +808,7 @@ private:
     struct RankBufs {
         // Device
         void* row_cache = nullptr;      ///< kv_layers × hot_slots × stride_row
-        void* dev_ident_indices = nullptr;  ///< index_topk × int iota
+        void* dev_ident_indices = nullptr;  ///< index_topk_rows × int iota
         void* dev_fake_bt = nullptr;        ///< n_fake_pages × int iota
         MatSet mat[2];                  ///< ping-pong materialize staging
         int mat_parity = 0;             ///< next set to use
@@ -580,7 +819,7 @@ private:
         // LS_KVT_COHORT_ROWWISE).  umat capacity = union_rows_max rows;
         // umat.h_scatter_* stay null (union gathers never cache-insert).
         MatSet umat;
-        void* dev_uidx = nullptr;       ///< cohort_rows_max × index_topk int
+        void* dev_uidx = nullptr;       ///< cohort_rows_max × index_topk_rows int
                                         ///< (per-row indices rewritten to
                                         ///< union slots, order-preserving)
         void* dev_useq = nullptr;       ///< cohort_rows_max × int (= union_n)
@@ -603,18 +842,18 @@ private:
         // Device — IndexShare lookahead prefetch (TD-KVT-PREFETCH); separate
         // from the materialize buffers: a prefetch burst may be in flight
         // while the next materialize reuses cold_incoming/h_stage.
-        void* pf_incoming = nullptr;        ///< index_topk × stride_row
-        void* dev_pf_scatter_ptrs = nullptr;  ///< index_topk × void*
-        void* dev_pf_scatter_idx = nullptr;   ///< index_topk × int
+        void* pf_incoming = nullptr;        ///< index_topk_rows × stride_row
+        void* dev_pf_scatter_ptrs = nullptr;  ///< index_topk_rows × void*
+        void* dev_pf_scatter_idx = nullptr;   ///< index_topk_rows × int
         // Pinned host (NUMA home node)
         memory::NumaBuffer host_arena{};    ///< staging + tables + cold pool
         bool host_registered = false;
         int numa_node = -1;
-        int* h_indices = nullptr;           ///< cohort_rows_max × index_topk
+        int* h_indices = nullptr;           ///< cohort_rows_max × index_topk_rows
         int* h_topk_len = nullptr;          ///< cohort_rows_max (min 1)
-        char* h_pf_stage = nullptr;         ///< index_topk × stride_row
-        const void** h_pf_scatter_ptrs = nullptr;  ///< index_topk
-        int* h_pf_scatter_idx = nullptr;    ///< index_topk
+        char* h_pf_stage = nullptr;         ///< index_topk_rows × stride_row
+        const void** h_pf_scatter_ptrs = nullptr;  ///< index_topk_rows
+        int* h_pf_scatter_idx = nullptr;    ///< index_topk_rows
         char* cold_base = nullptr;          ///< cold_pool_pages × stride_block
         // Streams / events.  h2d_stream is ALWAYS owned (TD-KVT-H2D-
         // CONTENTION: a dedicated per-rank tiering H2D stream so cold bursts
@@ -628,7 +867,12 @@ private:
         void* ev_pf = nullptr;          ///< prefetch burst+scatter completion
         void* ev_pf_order = nullptr;    ///< attention→prefetch-write ordering
         bool pf_inflight = false;       ///< ev_pf recorded, h_pf_* in use
-        std::vector<int> cold_free;  ///< free cold pool slots
+        std::vector<int> cold_free;  ///< free cold pool slots (kept sorted
+                                     ///< DESCENDING so pops hand out
+                                     ///< ascending, contiguous slot runs —
+                                     ///< S3 D2H coalescing)
+        bool cold_free_dirty = false;  ///< out-of-order releases since the
+                                       ///< last flush-time re-sort
         /// Per-slot holder count (TD-KVT-SPEC-FORK): 0 = free, 1 = single
         /// owner, >1 = shared across a fork family.  A slot returns to
         /// cold_free only when the count reaches 0 (release_cold_slot).
@@ -674,7 +918,7 @@ private:
                          const int* sparse_indices_dev,
                          const int* topk_lengths_dev, void* stream);
     /// Cohort variant (TD-KVT-ADMISSION-UPFRONT): ONE batched D2H of the
-    /// whole chunk's selection (rows x index_topk indices + rows lengths)
+    /// whole chunk's selection (rows x index_topk_rows indices + rows lengths)
     /// into the cohort staging; IndexShare shared layers reuse the host copy
     /// (selection_fresh == false + same (seq, pos, rows) — INV-KVT-6).
     void ensure_cohort_selection(int rank, int layer_idx,
@@ -752,8 +996,39 @@ private:
     std::vector<std::vector<uint8_t>> pf_pending_; ///< [rank][layer]: a
         ///< prefetch targeted this layer's cache; its next materialize must
         ///< stream-wait ev_pf before reading/overwriting cache slots
+    /// GF3.9: layer bears per-token KV (attention-type gating; empty mask
+    /// = every layer — legacy byte-identical).
+    bool layer_bears_kv(int l) const {
+        return opts_.kv_bearing_layers.empty()
+            || (l >= 0
+                && l < static_cast<int>(opts_.kv_bearing_layers.size())
+                && opts_.kv_bearing_layers[static_cast<size_t>(l)] != 0);
+    }
+    int first_bearing_layer_ = 0;  ///< GF3.9: S3 step-boundary flush key
     std::vector<int> share_succ_;  ///< [layer]: # of following IndexShare
         ///< SHARED layers reusing this FULL layer's selection (0 on shared)
+
+    // S3 slab-cohort demotion: the deferred per-step candidate batch.
+    struct PendingDemote {
+        int layer;
+        int logical;
+        memory::PageHandle handle;  ///< copied at collect time (valid until
+                                    ///< the flush: every state-mutating
+                                    ///< entry point flushes or discards
+                                    ///< first, and appends never touch
+                                    ///< behind-window pages)
+    };
+    std::vector<PendingDemote> pend_;
+    uint64_t pend_seq_ = 0;       ///< sequence of the pending batch
+    int pend_last_layer_ = -1;    ///< layer of the newest collected
+                                  ///< candidates — layer 0 marks a
+                                  ///< still-running layer-outer superchunk
+                                  ///< pass (begin_layer(0) must not flush
+                                  ///< it; see the trigger comment)
+    bool slab_demote_ = false;    ///< pages_per_slab > 0 && env not "0":
+                                  ///< after_attention defers to a per-step
+                                  ///< flush (layer == kv_layers-1 / next
+                                  ///< step's begin_layer)
 
     // Step context (begin_layer)
     uint64_t ctx_seq_ = 0;        ///< sequence of the current step (0 = none)
@@ -777,6 +1052,10 @@ private:
                                   ///< batched union arm returns false)
     int union_cap_ = 0;           ///< union staging rows (0 = arm disabled)
     int u_pages_cap_ = 0;         ///< union fake pages (ceil(cap / page))
+    // TD-PREFIX-TIDY-COLD-SPILL
+    int64_t spilled_total_ = 0;   ///< live bytes across spill files
+    bool spill_disabled_ = false; ///< sticky: first I/O failure disables
+    uint64_t spill_nonce_ = 0;    ///< boot-unique file-name component
     bool verify_ = false;         ///< LS_KVT_VERIFY=1 byte-oracle (debug)
     bool cold_pool_full_warned_ = false;
     Stats stats_;

@@ -61,6 +61,20 @@ std::string_view tensor_component_name(TensorComponent c) {
         case TensorComponent::output_hc_fn:          return "output_hc_fn";
         case TensorComponent::output_hc_base:        return "output_hc_base";
         case TensorComponent::output_hc_scale:       return "output_hc_scale";
+        case TensorComponent::kda_q_proj:            return "kda_q_proj";
+        case TensorComponent::kda_k_proj:            return "kda_k_proj";
+        case TensorComponent::kda_v_proj:            return "kda_v_proj";
+        case TensorComponent::kda_b_proj:            return "kda_b_proj";
+        case TensorComponent::kda_f_a_proj:          return "kda_f_a_proj";
+        case TensorComponent::kda_f_b_proj:          return "kda_f_b_proj";
+        case TensorComponent::kda_g_a_proj:          return "kda_g_a_proj";
+        case TensorComponent::kda_g_b_proj:          return "kda_g_b_proj";
+        case TensorComponent::kda_q_conv1d:          return "kda_q_conv1d";
+        case TensorComponent::kda_k_conv1d:          return "kda_k_conv1d";
+        case TensorComponent::kda_v_conv1d:          return "kda_v_conv1d";
+        case TensorComponent::kda_a_log:             return "kda_a_log";
+        case TensorComponent::kda_dt_bias:           return "kda_dt_bias";
+        case TensorComponent::kda_o_norm:            return "kda_o_norm";
     }
     return "unknown";
 }
@@ -135,6 +149,11 @@ std::optional<RoleParse> parse_role_suffix(const std::vector<std::string_view>& 
 
     if (last == "weight") return RoleParse{TensorRole::weight, 1};
     if (last == "weight_scale") return RoleParse{TensorRole::weight_scale, 1};
+    // GF3.3: DeepSeek/GLM native-FP8 checkpoints name the blockwise
+    // dequant multiplier `weight_scale_inv` (historical name; it IS the
+    // multiplier w_bf16 = w_fp8 * scale — same semantics our FP8 handler
+    // and kernels give TensorRole::weight_scale). Map it onto the same role.
+    if (last == "weight_scale_inv") return RoleParse{TensorRole::weight_scale, 1};
     if (last == "weight_scale_2") return RoleParse{TensorRole::weight_scale_2, 1};
     if (last == "input_scale") return RoleParse{TensorRole::input_scale, 1};
     if (last == "bias") return RoleParse{TensorRole::bias, 1};
@@ -150,6 +169,16 @@ std::optional<RoleParse> parse_role_suffix(const std::vector<std::string_view>& 
 std::optional<TensorId> parse_hf_name(std::string_view name) {
     auto parts = split_dot(name);
     if (parts.empty()) return std::nullopt;
+
+    // ── Namespace normalization (GF3.3, MODELINFO §1) ──
+    // Multimodal checkpoints (glm5_next) wrap the text model: tensors live
+    // under `model.language_model.layers.N.*` / `model.language_model.
+    // embed_tokens` etc. Collapse the wrapper segment so every downstream
+    // pattern matches both namespaces. (`model.visual.*` — the vision tower —
+    // stays unrecognized here by design: GF3.14 loads it; load_weights
+    // classifies and skips it without a warning.)
+    if (parts.size() >= 3 && parts[0] == "model" && parts[1] == "language_model")
+        parts.erase(parts.begin() + 1);
 
     // ── Model-level tensors (no "layers" prefix) ──
 
@@ -181,9 +210,14 @@ std::optional<TensorId> parse_hf_name(std::string_view name) {
     // parts[3..] is the component path + role suffix
     size_t path_start = 3;
 
-    // Parse role from the trailing segment(s)
+    // Parse role from the trailing segment(s). Some glm5_next tensors carry
+    // NO role suffix at all (bare parameter names in the checkpoint):
+    // self_attn.A_log, self_attn.dt_bias, hc_{attn,ffn}_{base,fn,scale},
+    // indexer.index_kpool_compress_{gate,ape}. For those the full remaining
+    // path IS the component and the role is `weight`.
     auto role_parse = parse_role_suffix(parts);
-    if (!role_parse) return std::nullopt;
+    const bool bare_name = !role_parse.has_value();
+    if (bare_name) role_parse = RoleParse{TensorRole::weight, 0};
 
     // Path segments = everything between layer index and role suffix
     size_t path_end = parts.size() - role_parse->segments_consumed;
@@ -241,6 +275,66 @@ std::optional<TensorId> parse_hf_name(std::string_view name) {
         return TensorId{TensorComponent::kv_b_proj, role, TensorOwner::attention, layer_idx, -1};
     if (path_is({"self_attn", "o_proj"}))
         return TensorId{TensorComponent::o_proj, role, TensorOwner::attention, layer_idx, -1};
+
+    // ── glm5_next KDA linear attention (GF3.3; MODELINFO §3a) ──
+    // Pure name→component mappings (no model gate — this parser maps names).
+    // o_proj of a KDA layer uses the same `self_attn.o_proj` name as MLA and
+    // maps to the shared TensorComponent::o_proj above (row-parallel there
+    // and here).
+
+    if (path_is({"self_attn", "q_proj"}))
+        return TensorId{TensorComponent::kda_q_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "k_proj"}))
+        return TensorId{TensorComponent::kda_k_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "v_proj"}))
+        return TensorId{TensorComponent::kda_v_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "b_proj"}))
+        return TensorId{TensorComponent::kda_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "f_a_proj"}))
+        return TensorId{TensorComponent::kda_f_a_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "f_b_proj"}))
+        return TensorId{TensorComponent::kda_f_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "g_a_proj"}))
+        return TensorId{TensorComponent::kda_g_a_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "g_b_proj"}))
+        return TensorId{TensorComponent::kda_g_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "q_conv1d"}))
+        return TensorId{TensorComponent::kda_q_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "k_conv1d"}))
+        return TensorId{TensorComponent::kda_k_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "v_conv1d"}))
+        return TensorId{TensorComponent::kda_v_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (path_is({"self_attn", "o_norm"}))
+        return TensorId{TensorComponent::kda_o_norm, role, TensorOwner::attention, layer_idx, -1};
+    if (bare_name) {
+        // Bare parameter names (no .weight suffix in the checkpoint).
+        if (path_is({"self_attn", "A_log"}))
+            return TensorId{TensorComponent::kda_a_log, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"self_attn", "dt_bias"}))
+            return TensorId{TensorComponent::kda_dt_bias, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        // mHC hyper-connection weights (glm5_next safetensors; V4 loads the
+        // GGUF names below — same components).
+        if (path_is({"hc_attn_base"}))
+            return TensorId{TensorComponent::hc_attn_base, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"hc_attn_fn"}))
+            return TensorId{TensorComponent::hc_attn_fn, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"hc_attn_scale"}))
+            return TensorId{TensorComponent::hc_attn_scale, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"hc_ffn_base"}))
+            return TensorId{TensorComponent::hc_ffn_base, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"hc_ffn_fn"}))
+            return TensorId{TensorComponent::hc_ffn_fn, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"hc_ffn_scale"}))
+            return TensorId{TensorComponent::hc_ffn_scale, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        // IndexPool learned 4:1 compression (glm5_next; MODELINFO §3c) —
+        // mapped onto the V4 indexer-compressor components (same semantics:
+        // a gate projection + an additive positional bias).
+        if (path_is({"self_attn", "indexer", "index_kpool_compress_gate"}))
+            return TensorId{TensorComponent::indexer_compressor_wgate, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        if (path_is({"self_attn", "indexer", "index_kpool_compress_ape"}))
+            return TensorId{TensorComponent::indexer_compressor_ape, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+        return std::nullopt;
+    }
 
     // ── DSA indexer paths ──
 
@@ -361,7 +455,22 @@ std::optional<TensorId> parse_gguf_name(std::string_view name) {
     if (parts.empty()) return std::nullopt;
 
     auto role_parse = parse_role_suffix(parts);
-    if (!role_parse) return std::nullopt;
+    if (!role_parse) {
+        // GF3.9: NARROW suffix-less escape. The glm5next GGUF writer emits the
+        // KDA per-head decay base as a bare `blk.N.ssm_a` — the ONLY tensor in
+        // any GGUF this engine loads that carries no `.weight`/`.bias` role
+        // suffix (measured over the 1412 tensors of GLM-5.3-Flash-GGUF
+        // UD-Q4_K_XL). Mirrors the HF path's `bare_name` branch for
+        // `self_attn.A_log`; the role is normalized to `weight` so the bundle
+        // groups as the main tensor. Every OTHER suffix-less name still
+        // returns nullopt.
+        if (parts.size() == 3 && parts[0] == "blk" && parts[2] == "ssm_a") {
+            if (auto l = parse_int(parts[1]))
+                return TensorId{TensorComponent::kda_a_log, TensorRole::weight,
+                                TensorOwner::attention, *l, -1};
+        }
+        return std::nullopt;
+    }
     TensorRole role = role_parse->role;
 
     // The "body" is everything before the role suffix (".weight"/".bias").
@@ -438,6 +547,52 @@ std::optional<TensorId> parse_gguf_name(std::string_view name) {
         return TensorId{TensorComponent::q_a_norm, role, TensorOwner::attention, layer_idx, -1};
     if (body_is({"attn_kv_a_norm"}))
         return TensorId{TensorComponent::kv_a_norm, role, TensorOwner::attention, layer_idx, -1};
+
+    // ── glm5_next KDA linear attention (GF3.9; MODELINFO §8b) ──
+    // The llama.cpp glm5next writer names the KDA anatomy with the `ssm_*`
+    // family (it reuses the generic state-space naming slots) plus the BARE
+    // MHA projection names for q/k/v. Mapped UNCONDITIONALLY, like every other
+    // arm here — parse_gguf_name is a pure name→component mapper with no model
+    // gate. COLLISION CAVEAT: `blk.N.attn_{q,k,v}.weight` is the standard
+    // llama.cpp MHA convention, so a future dense-MHA architecture would land
+    // on kda_{q,k,v}_proj. No architecture this engine loads today emits those
+    // bare names (DeepSeek/GLM MLA uses attn_q_a/attn_q_b/attn_kv*; V4 uses
+    // attn_kv), so the mapping is unambiguous for the current surface — revisit
+    // (thread an arch hint) if a plain-MHA model is ever added.
+    // KDA `o_proj` is `blk.N.attn_output.weight` and already maps to the shared
+    // TensorComponent::o_proj above (same row-parallel sharding).
+    if (body_is({"attn_q"}))
+        return TensorId{TensorComponent::kda_q_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"attn_k"}))
+        return TensorId{TensorComponent::kda_k_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"attn_v"}))
+        return TensorId{TensorComponent::kda_v_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_beta"}))
+        return TensorId{TensorComponent::kda_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_f_a"}))
+        return TensorId{TensorComponent::kda_f_a_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_f_b"}))
+        return TensorId{TensorComponent::kda_f_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_g_a"}))
+        return TensorId{TensorComponent::kda_g_a_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_g_b"}))
+        return TensorId{TensorComponent::kda_g_b_proj, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_conv1d_q"}))
+        return TensorId{TensorComponent::kda_q_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_conv1d_k"}))
+        return TensorId{TensorComponent::kda_k_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_conv1d_v"}))
+        return TensorId{TensorComponent::kda_v_conv1d, role, TensorOwner::attention, layer_idx, -1};
+    if (body_is({"ssm_norm"}))
+        return TensorId{TensorComponent::kda_o_norm, role, TensorOwner::attention, layer_idx, -1};
+    // `blk.N.ssm_dt.bias` is the per-channel dt bias — a MAIN tensor that
+    // happens to be written with the `.bias` suffix. Normalize the role to
+    // `weight` (exactly what the HF path does for the bare `self_attn.dt_bias`
+    // at the bare_name branch above) so the bundle groups as the logical weight
+    // and the glm5_next completeness check finds kda_dt_bias.
+    if (body_is({"ssm_dt"}))
+        return TensorId{TensorComponent::kda_dt_bias, TensorRole::weight, TensorOwner::attention, layer_idx, -1};
+    // `blk.N.ssm_a` (no role suffix) is handled by the escape at the top.
 
     // ── Layer norms ──
     if (body_is({"attn_norm"}))

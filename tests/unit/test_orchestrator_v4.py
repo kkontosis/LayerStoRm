@@ -5,7 +5,7 @@ REEF routing + fused FAR burst, superchunk prefill, spec arms, prefix
 cache.  Arch-different behavior is driven by CONFIG
 (orchestrator.prefill_chunk_tokens / decode_expert_fetch_timeout_s,
 gpu roles, gpu_loader) or ENGINE-REPORTED capability
-(EngineInfo.moe_batch_capacity, v4_attention_types) — never model-name
+(EngineInfo.moe_batch_capacity, attention_types) — never model-name
 checks.  The split/ACT arm survives as machinery (configs without
 gpu_loader; LS_ORCH_FORCE_SPLIT_ACT=1 diagnostic) and its V4-shaped
 flow tests below exercise it, plus the unified REEF+FAR shape.
@@ -461,6 +461,44 @@ def test_metadata_attention_type_for_layer():
     m = _meta()
     assert m.attention_type_for_layer(0) == 0          # non-V4: empty
     import dataclasses
-    m2 = dataclasses.replace(m, v4_attention_types=(0, 0, 1, 2, 1))
+    m2 = dataclasses.replace(m, attention_types=(0, 0, 1, 2, 1))
     assert [m2.attention_type_for_layer(i) for i in range(6)] == \
         [0, 0, 1, 2, 1, 0]
+
+
+def test_boot_deterministic_ep_combine_flag(tmp_path, monkeypatch):
+    # TD-SERVE-PREFILL-NONDET-RUN-TO-RUN: boot resolves the EFFECTIVE
+    # routed-EP-combine determinism (config compute.deterministic_ep_combine,
+    # env LAYERSTORM_DETERMINISTIC_EP_COMBINE overriding either way — the
+    # command_dispatcher ctor precedence) and exposes it so token-identity
+    # harnesses can refuse identity verdicts on a non-reproducible boot.
+    monkeypatch.delenv("LAYERSTORM_DETERMINISTIC_EP_COMBINE", raising=False)
+    # Schema default: OFF (the legacy placement-dependent combine).
+    assert _boot(_V4_BOOT_CFG, tmp_path).deterministic_ep_combine is False
+    # Config ON.
+    cfg = json.loads(json.dumps(_V4_BOOT_CFG))
+    cfg["compute"] = {"deterministic_ep_combine": True}
+    assert _boot(cfg, tmp_path).deterministic_ep_combine is True
+    # Env overrides EITHER way.
+    monkeypatch.setenv("LAYERSTORM_DETERMINISTIC_EP_COMBINE", "1")
+    assert _boot(_V4_BOOT_CFG, tmp_path).deterministic_ep_combine is True
+    monkeypatch.setenv("LAYERSTORM_DETERMINISTIC_EP_COMBINE", "0")
+    assert _boot(cfg, tmp_path).deterministic_ep_combine is False
+    # Direct-constructed test orchestrators (null engines): class default
+    # True — no engine, no nondeterministic combine.
+    assert Orchestrator.deterministic_ep_combine is True
+
+
+def test_boot_degraded_retry_knob_plumbing(tmp_path):
+    """TD-V4-FIRSTREQ-COLD-SHARE-OVER-CAPACITY option (d) boot plumbing
+    (_internal-orchestrator.degraded_retry_{enabled,max}): serving boots
+    default ON with ONE retry; the cap is configurable and the off-switch
+    forces 0 regardless of the cap."""
+    orch = _boot(_V4_BOOT_CFG, tmp_path)
+    assert orch._degraded_retry_max == 1          # default: ON, one retry
+    cfg = dict(_V4_BOOT_CFG)
+    cfg["_internal-orchestrator"] = {"degraded_retry_max": 3}
+    assert _boot(cfg, tmp_path)._degraded_retry_max == 3
+    cfg["_internal-orchestrator"] = {"degraded_retry_enabled": False,
+                                     "degraded_retry_max": 3}
+    assert _boot(cfg, tmp_path)._degraded_retry_max == 0   # off-switch wins

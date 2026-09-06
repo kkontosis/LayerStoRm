@@ -164,8 +164,8 @@ void fp8_grouped_gemm_one_row_range(
 }
 
 // ik bridge GgufType <- ExpertDevice GgufQuantType (canonical set, GG-5).
-// Q2_K/Q3_K have no ik vendor support (GPU-only families); they throw. The CPU
-// expert path never receives them.
+// Q2_K/Q3_K/MXFP4 have no ik vendor support (GPU-only families); they throw.
+// The CPU expert path never receives them.
 cpu::ik::GgufType to_ik_gguf(GgufQuantType t) {
     switch (t) {
         case GgufQuantType::Q4_K: return cpu::ik::GgufType::q4_k;
@@ -174,9 +174,10 @@ cpu::ik::GgufType to_ik_gguf(GgufQuantType t) {
         case GgufQuantType::Q8_0: return cpu::ik::GgufType::q8_0;
         case GgufQuantType::Q2_K:
         case GgufQuantType::Q3_K:
+        case GgufQuantType::MXFP4:
             throw std::runtime_error(
-                "GGUF CPU expert path: Q2_K/Q3_K not supported by the ik vendor "
-                "kernels (GPU-only families)");
+                "GGUF CPU expert path: Q2_K/Q3_K/MXFP4 not supported by the ik "
+                "vendor kernels (GPU-only families)");
     }
     throw std::runtime_error("to_ik_gguf: unknown GgufQuantType");
 }
@@ -328,6 +329,11 @@ public:
     void gguf_grouped_gemm(const GgufGroupedGemmParams& params,
                            void* /*workspace*/, size_t /*workspace_bytes*/,
                            void* /*stream*/) override {
+        if (params.d_fp32)
+            throw std::runtime_error(
+                "gguf_grouped_gemm: d_fp32 (TP fp32 combine) has no CPU "
+                "fp32-out path");
+
         if (params.num_experts == 0) return;
         if (!params.B_ptrs) {
             throw std::runtime_error(

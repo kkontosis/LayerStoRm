@@ -54,10 +54,14 @@ void launch_fused_k_append(const sm120::prep::FusedKAppendParams& params,
 
 void launch_dequant_ckv_indexed(const sm120::prep::DequantCKVIndexedParams& params,
                                 cudaStream_t stream) {
-    // KVS-3 (INV-KVS-EMPTY): num_fetch == 0 is a legal empty DCP shard —
-    // grid.x = 0 would be an invalid launch config. Nothing to dequant.
-    if (params.num_fetch <= 0) return;
-    sm120::prep::dequant_ckv_fused_indexed_kernel<<<params.num_fetch, 128, 0, stream>>>(params);
+    // Route through the deps launcher: it branches on gather_rows
+    // (TD-SNAPMLA-ATCTX-DECODE-PATH stage (a) budget-bound staging) and
+    // keeps the KVS-3 (INV-KVS-EMPTY) empty-shard early-outs for BOTH modes
+    // (num_fetch == 0 legacy / max_gather == 0 gather — grid.x = 0 would be
+    // an invalid launch config). A direct kernel launch here silently
+    // no-ops the gather mode (caught by
+    // SnapmlaBudgetDecodeGather.GatherStagingSelectedRowsBitIdentical).
+    sm120::prep::run_dequant_ckv_fused_indexed(params, stream);
 }
 
 }  // namespace layerstorm::compute

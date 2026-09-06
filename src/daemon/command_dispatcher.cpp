@@ -107,7 +107,7 @@ void CommandDispatcher::register_nvme_token(uint64_t token, uint32_t cmd_seq) {
 bool CommandDispatcher::setup_spec_pipeline(
         uint32_t cmd_seq, uint32_t gpu, uint32_t token_id,
         const char* pipeline_name, SpecScratch& ss,
-        void*& stream_out, int& pair_idx_out) {
+        void*& stream_out, int& pair_idx_out, int stage_row) {
     auto* dev = expert_dev(gpu);
     if (!dev) {
         char msg[64];
@@ -128,13 +128,18 @@ bool CommandDispatcher::setup_spec_pipeline(
     const auto& mc = deps_.live_config->model;
     pair_idx_out = resolve_pair_idx(gpu);
     const size_t h_bytes = static_cast<size_t>(mc.hidden_size) * 2;
+    // P-29 step 13: staging offset in TRUNK row units (hc-wide rows — the
+    // sharded lookup / broadcast staging layout).
+    const size_t stage_off = static_cast<size_t>(stage_row)
+        * mc.hidden_size * std::max(1, deps_.hc_streams) * 2;
     bool sharded_embed_done = false;
 
     // TD-GOLDEN-EMB-OOB: vocab-sharded table (TP) — masked per-rank lookup
     // + allreduce fills EVERY rank's attn_buf; hidden_a is then copied back
     // from the primary rank's attn_buf (replaces lookup + broadcast below).
     if (deps_.cuda_kernels_enabled && embedding_tp_degree() > 1) {
-        if (!dispatch_embedding_lookup_sharded(1)) {
+        if (!dispatch_embedding_lookup_sharded(
+                1, static_cast<uint32_t>(stage_row))) {
             char msg[80];
             std::snprintf(msg, sizeof(msg),
                           "%s: TP-sharded embedding lookup failed", pipeline_name);
@@ -150,7 +155,10 @@ bool CommandDispatcher::setup_spec_pipeline(
                 evt, static_cast<int>(gpu), compute::StreamId::kAttention);
             deps_.device_backends[gpu]->stream_wait_event(stream_out, evt);
             deps_.device_backends[gpu]->memcpy_d2d_async(
-                ss.hidden_a, deps_.hidden_state_pairs[pair_idx_out].attn_buf,
+                ss.hidden_a,
+                static_cast<const char*>(
+                    deps_.hidden_state_pairs[pair_idx_out].attn_buf)
+                    + stage_off,
                 h_bytes, stream_out);
             deps_.device_backends[gpu]->destroy_event(evt);
         }
@@ -182,8 +190,9 @@ bool CommandDispatcher::setup_spec_pipeline(
     if (!sharded_embed_done && deps_.cuda_kernels_enabled && pair_idx_out >= 0
         && deps_.hidden_state_pairs[pair_idx_out].attn_buf) {
         deps_.device_backends[gpu]->memcpy_d2d_async(
-            deps_.hidden_state_pairs[pair_idx_out].attn_buf, ss.hidden_a,
-            h_bytes, stream_out);
+            static_cast<char*>(
+                deps_.hidden_state_pairs[pair_idx_out].attn_buf) + stage_off,
+            ss.hidden_a, h_bytes, stream_out);
 
         // TD-73n: Broadcast embedding to all other TP ranks (same pattern
         // as TD-73i in dispatch_compute.cpp).  Source is the primary rank's
@@ -191,8 +200,8 @@ bool CommandDispatcher::setup_spec_pipeline(
         if (deps_.dcp_executor
             && deps_.dcp_executor->dcp_size() > 1
             && deps_.hidden_state_pairs.size() > 1) {
-            const void* src =
-                deps_.hidden_state_pairs[pair_idx_out].attn_buf;
+            const void* src = static_cast<const char*>(
+                deps_.hidden_state_pairs[pair_idx_out].attn_buf) + stage_off;
             void* embed_evt =
                 deps_.device_backends[gpu]->create_event();
             deps_.device_backends[gpu]->record_event(
@@ -217,7 +226,8 @@ bool CommandDispatcher::setup_spec_pipeline(
                 deps_.device_backends[dst_pos]->stream_wait_event(
                     dst_stream, embed_evt);
                 deps_.device_backends[dst_pos]->memcpy_async(
-                    dp.attn_buf, src, h_bytes, dst_stream);
+                    static_cast<char*>(dp.attn_buf) + stage_off, src,
+                    h_bytes, dst_stream);
             }
 
             // Restore device context.
@@ -267,6 +277,13 @@ CommandDispatcher::CommandDispatcher(Deps deps)
 {
     // I8 GPU-loader config (LS_LOADER_* env gates); see dispatch_loader.cpp.
     init_loader_from_env();
+
+    // P-29 step 7 (INV-0.6(b) span graphs): ARM the executor's span-graph
+    // runner only when real CUDA kernels are live — null-backend test
+    // harnesses hand out fake stream handles that a stream-capture call
+    // would segfault on. LS_DECODE_CHAIN_GRAPH=0 still wins inside enabled().
+    if (deps_.dcp_executor)
+        deps_.dcp_executor->span_graphs().arm(deps_.cuda_kernels_enabled);
 
     // DET-REDUCE Phase 1b: placement-invariant fp32 EP combine gate. Read once
     // here (engine init) from config; env LAYERSTORM_DETERMINISTIC_EP_COMBINE
@@ -430,11 +447,22 @@ CommandDispatcher::CommandDispatcher(Deps deps)
 
             // TD-PREFILL-MOE-BIG mode + chunk capacity (config knobs).
             moe_big_enabled_ = deps_.live_config->compute.prefill_moe_big;
+            // P-30 step 1: the 512 upper clamp here (and in the schema) was a
+            // fossilized template value, not a derivation — it froze both the
+            // grouped-GEMM tile-M floor AND (on EP-beyond-TP topologies,
+            // where the orchestrator clamps the superchunk stride to the
+            // single-shot capacity — TD-MOE-EP-XTP-WAVES) the per-layer
+            // expert-fetch amortization. The request is now bounded only by
+            // the schema hard cap; VRAM fit is enforced elastically below.
             const int cfg_chunk = std::clamp(
-                deps_.live_config->compute.moe_big_chunk_tokens, 16, 512);
+                deps_.live_config->compute.moe_big_chunk_tokens, 16, 32768);
             // Chunk capacity: at least the decode batch bound so every decode /
             // small-batch dispatch stays on the byte-identical single-shot path.
-            const int chunk_cap = std::max(cfg_chunk, deps_.max_batch_size);
+            int chunk_cap = std::max(cfg_chunk, deps_.max_batch_size);
+            // Elastic floor = the pre-P-30 legacy bound, so any step-down
+            // degrades to exactly the old (proven-to-boot) sizing.
+            const int chunk_floor =
+                std::max(std::min(cfg_chunk, 512), deps_.max_batch_size);
 
             const int floor_cap = static_cast<int>(ipc::kMaxBatchDescriptors);
             int want = std::max(deps_.superchunk_tokens, floor_cap);
@@ -449,7 +477,114 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                     have_query = true;
                 }
             }
-            constexpr size_t kHeadroom = 1536ull << 20;  // 1.5 GiB
+            constexpr size_t kHeadroom = 1536ull << 20;  // 1.5 GiB (legacy branch)
+
+            // P-30 step 2 (TD-PREFILL-MOE-BIG headroom re-derivation): the
+            // construction-time fit checks below run POST-carve and
+            // POST-arena-page-tables, so the "working headroom" they reserve
+            // must cover only what allocates on that device class AFTERWARDS
+            // — measured on the production EP4 box: ~578 MiB on an
+            // attention-host device (DCP/attention consumers sized from the
+            // resolved superchunk) vs ~21 MiB on an expert-only device
+            // (constructor persistents + lazy modules + decode FFN graph
+            // execs). The old blanket 1.5 GiB treated every device as the
+            // worst class and silently pinned the served EP4 stride at 512.
+            // All post-check demand is boot-time (serving-time allocation on
+            // both classes measured dead-flat across 8k/24k/97k prefill +
+            // decode), so an under-reserve fails the boot loudly instead of
+            // OOMing mid-serving. Config: compute.moe_big_fit_headroom_mb /
+            // moe_big_fit_headroom_expert_only_mb; the diagnostic env
+            // LS_MOE_BIG_FIT_HEADROOM_MB overrides BOTH classes.
+            size_t headroom_attn = static_cast<size_t>(std::max(
+                0, deps_.live_config->compute.moe_big_fit_headroom_mb)) << 20;
+            size_t headroom_exp = static_cast<size_t>(std::max(
+                0, deps_.live_config->compute
+                       .moe_big_fit_headroom_expert_only_mb)) << 20;
+            if (const char* e = std::getenv("LS_MOE_BIG_FIT_HEADROOM_MB");
+                e && *e) {
+                const long mb = std::strtol(e, nullptr, 10);
+                if (mb >= 0) {
+                    headroom_attn = headroom_exp =
+                        static_cast<size_t>(mb) << 20;
+                    spdlog::warn(
+                        "TD-PREFILL-MOE-BIG: LS_MOE_BIG_FIT_HEADROOM_MB={} — "
+                        "chunk-fit headroom {} MiB on BOTH device classes "
+                        "(diagnostic override)", mb, headroom_attn >> 20);
+                }
+            }
+            auto headroom_for = [&](size_t gi) -> size_t {
+                const bool attn_host =
+                    gi < deps_.attention_devices.size()
+                    && deps_.attention_devices[gi] != nullptr;
+                return attn_host ? headroom_attn : headroom_exp;
+            };
+
+            // P-30 step 1 elastic chunk fail-safe (never OOM): the TRANSIENT
+            // buffers are homed in each GPU's kv_main prefill-scratch tail
+            // via bump alloc with device_alloc fallback (see the scratch
+            // homing block below), so on EVERY expert device the tail
+            // OVERFLOW share must fit free VRAM with the working headroom
+            // preserved. Step the request down toward the legacy floor;
+            // requests at or below the old 512 clamp are untouched by
+            // construction (chunk_floor). Expert-only GPUs have no kv_main
+            // tail (engine.cpp: no KV pool) — their whole transient set is
+            // fallback bytes, so they are usually the binding device.
+            if (moe_big_enabled_ && have_query && chunk_cap > chunk_floor) {
+                // P-30 step 2 observability: the fit verdict below is decided
+                // by per-device numbers that were previously invisible — log
+                // them once so any production step-down (or headroom audit)
+                // can be diagnosed from the boot log alone.
+                for (size_t gi = 0; gi < deps_.expert_devices.size(); ++gi) {
+                    auto* dev = deps_.expert_devices[gi];
+                    if (!dev) continue;
+                    size_t f = 0, t = 0;
+                    if (!dev->device_mem_info(f, t)) continue;
+                    const size_t tail =
+                        (gi < deps_.prefill_scratch_tails.size())
+                            ? deps_.prefill_scratch_tails[gi].second : 0;
+                    const size_t need = transient_bytes(chunk_cap);
+                    spdlog::info(
+                        "TD-PREFILL-MOE-BIG chunk-fit device {}: free {} MiB "
+                        "(total {} MiB), scratch tail {} MiB, transients@{} "
+                        "{} MiB -> spill {} MiB, headroom {} MiB",
+                        gi, f >> 20, t >> 20, tail >> 20, chunk_cap,
+                        need >> 20, (need > tail ? (need - tail) : 0) >> 20,
+                        headroom_for(gi) >> 20);
+                }
+                auto chunk_fits = [&](int bt) -> bool {
+                    for (size_t gi = 0; gi < deps_.expert_devices.size();
+                         ++gi) {
+                        auto* dev = deps_.expert_devices[gi];
+                        if (!dev) continue;
+                        size_t f = 0, t = 0;
+                        if (!dev->device_mem_info(f, t)) continue;
+                        const size_t tail =
+                            (gi < deps_.prefill_scratch_tails.size())
+                                ? deps_.prefill_scratch_tails[gi].second : 0;
+                        const size_t need = transient_bytes(bt);
+                        const size_t spill = need > tail ? need - tail : 0;
+                        if (spill + headroom_for(gi) > f) return false;
+                    }
+                    return true;
+                };
+                const int requested = chunk_cap;
+                while (chunk_cap > chunk_floor && !chunk_fits(chunk_cap)) {
+                    chunk_cap = std::max(
+                        chunk_floor,
+                        chunk_cap - std::max(256, chunk_cap / 8));
+                }
+                if (chunk_cap < requested) {
+                    spdlog::warn(
+                        "TD-PREFILL-MOE-BIG: moe_big_chunk_tokens request {} "
+                        "does not fit (transients ~{} MiB vs per-GPU scratch "
+                        "tail + free VRAM with the class headroom {}/{} MiB "
+                        "attn/expert-only preserved) — stepped down to {} "
+                        "tokens (elastic, never OOM; P-30 step 2)",
+                        requested, transient_bytes(requested) >> 20,
+                        headroom_attn >> 20, headroom_exp >> 20,
+                        chunk_cap);
+                }
+            }
 
             if (!moe_big_enabled_) {
                 // Legacy TD-PREFILL-SUPERCHUNK fail-safe: transient scratch is
@@ -482,51 +617,55 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                 // chunks are the pathological floor of the chunk loop, and the
                 // legacy 512-token capacity is the floor of the batch bound.
                 if (want > floor_cap && have_query) {
-                    // Preserve the config safety margin ON TOP of the working
-                    // headroom — the elastic capacity must never eat the VRAM
-                    // the margin reserves for page tables / driver overhead.
-                    const size_t margin = static_cast<size_t>(
-                        deps_.live_config->memory.vram_safety_margin_gb
-                        * (1ull << 30));
-                    // Scratch homing: when EVERY expert-device GPU has a
-                    // prefill-scratch tail big enough for the chunk transients,
-                    // they cost zero post-region free VRAM — drop the term.
-                    bool tail_covers = !deps_.prefill_scratch_tails.empty();
-                    for (size_t gi = 0; tail_covers
-                         && gi < deps_.expert_devices.size(); ++gi) {
-                        if (!deps_.expert_devices[gi]) continue;
-                        const size_t tb =
-                            (gi < deps_.prefill_scratch_tails.size())
-                                ? deps_.prefill_scratch_tails[gi].second : 0;
-                        if (tb < transient_bytes(chunk_cap))
-                            tail_covers = false;
-                    }
-                    // Working headroom ONLY (1.5 GiB) — unlike the engine-
-                    // level derivation (pre-arena-registration, must reserve
-                    // the margin for page tables/driver still to come), this
+                    // Working headroom ONLY — unlike the engine-level
+                    // derivation (pre-arena-registration, must reserve the
+                    // margin for page tables/driver still to come), this
                     // re-verify runs at construction time when those costs
-                    // are MATERIALIZED and already excluded from min_free.
+                    // are MATERIALIZED and already excluded from free VRAM.
                     // Re-reserving the config margin here double-counted it
                     // and stepped the capacity back to the 512 floor
                     // (min_free 2768 MiB < margin 3 GiB on the keeper52
                     // shape) after the engine had correctly derived ~13k.
-                    (void)margin;
-                    const size_t fixed =
-                        (tail_covers ? 0 : transient_bytes(chunk_cap))
-                        + kHeadroom;
+                    //
+                    // P-30 step 2: the budget is PER-DEVICE — each expert
+                    // device pays its own transient tail-overflow (spill)
+                    // and its own class headroom; the persistent per-token
+                    // cost must fit the tightest device's remainder. (The
+                    // old form compared against the single global min_free
+                    // with an all-devices tail_covers flag, so one tailless
+                    // expert-only GPU charged every GPU the full transient.)
+                    size_t min_budget = SIZE_MAX;
+                    for (size_t gi = 0; gi < deps_.expert_devices.size();
+                         ++gi) {
+                        auto* dev = deps_.expert_devices[gi];
+                        if (!dev) continue;
+                        size_t f = 0, t = 0;
+                        if (!dev->device_mem_info(f, t)) continue;
+                        const size_t tail =
+                            (gi < deps_.prefill_scratch_tails.size())
+                                ? deps_.prefill_scratch_tails[gi].second : 0;
+                        const size_t need = transient_bytes(chunk_cap);
+                        const size_t spill = need > tail ? need - tail : 0;
+                        const size_t reserved = spill + headroom_for(gi);
+                        min_budget = std::min(
+                            min_budget, f > reserved ? f - reserved : 0);
+                    }
+                    if (min_budget == SIZE_MAX) min_budget = 0;
                     while (want > floor_cap
-                           && persist_bytes(want) + fixed > min_free) {
+                           && persist_bytes(want) > min_budget) {
                         want = std::max(floor_cap, want - std::max(256, want / 8));
                     }
                     if (want < deps_.superchunk_tokens) {
                         spdlog::warn(
                             "TD-PREFILL-MOE-BIG: requested superchunk capacity "
-                            "{} tokens exceeds the elastic bound (min free {} "
-                            "MiB, chunk transients {} MiB + 1.5 GiB headroom, "
+                            "{} tokens exceeds the elastic bound (min per-"
+                            "device budget {} MiB after chunk transients {} "
+                            "MiB + class headroom {}/{} MiB attn/expert-only, "
                             "persistent ~{} B/token) — derived {} tokens "
                             "(elastic, never OOM)",
-                            deps_.superchunk_tokens, min_free >> 20,
+                            deps_.superchunk_tokens, min_budget >> 20,
                             transient_bytes(chunk_cap) >> 20,
+                            headroom_attn >> 20, headroom_exp >> 20,
                             persist_bytes(1024) / 1024, want);
                     }
                 }
@@ -725,6 +864,13 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                     s.moe_output_fp32 = moe_scratch_alloc(
                         i, static_cast<size_t>(Bt) * T * H * 4);
             }
+            // TD-GLM5-TP-COMBINE-PRECISION: fp32 shared/dense FFN-combine
+            // staging (single-shot bound only — the chunked path keeps the
+            // legacy bf16 combine).
+            if (deps_.dcp_executor
+                && deps_.dcp_executor->tp_combine_fp32_active())
+                s.ffn_combine_f32 = moe_scratch_alloc(
+                    i, static_cast<size_t>(B) * H * 4);
             s.normalized_hidden = dev->device_alloc(static_cast<size_t>(B) * H * 2);
             // V4-5b mHC FFN-stage scratch (persistent, full batch capacity).
             if (deps_.hc_streams > 1) {
@@ -753,6 +899,23 @@ CommandDispatcher::CommandDispatcher(Deps deps)
             if (model::gguf::is_gguf_weight_quant(
                     deps_.live_config->quantization.weights)) {
                 s.gguf_single_b_ptr = dev->device_alloc(sizeof(void*));
+                // MPOKE (P-29 step 3): per-(layer,slot) dense/shared B_ptrs
+                // bind-cache arena (3 slots/layer: gate/fused, up-split, down).
+                // ~1 KiB of device memory per GPU; kills the two 8-byte binds
+                // per dense/shared layer per token in steady-state decode.
+                {
+                    // P-29 step 11 (LS_MTP_PROBE): the probe drives the MTP
+                    // layer's shared expert through this cache too — size
+                    // the arena to the MoE dispatch bound (== NH with the
+                    // flag off) or bind_gguf_b_slot writes past both the
+                    // device arena and the host mirror at layer 45.
+                    const size_t L = static_cast<size_t>(
+                        moe_layer_bound(deps_.live_config->model));
+                    s.gguf_layer_b_ptrs =
+                        dev->device_alloc(L * 3 * sizeof(void*));
+                    s.gguf_layer_b_host.assign(L * 3, nullptr);
+                    s.shared_offsets_last_b = -1;
+                }
                 // GG-5c: split-path up GEMM output buffer, sized like
                 // activation_output ([B, I_dense] dominates [expanded, I]) so it
                 // holds the dense/shared up half regardless of intermediate size.
@@ -891,11 +1054,17 @@ CommandDispatcher::CommandDispatcher(Deps deps)
         // incoming-partial staging. EP degree beyond TP: GPUs that host an
         // ExpertDevice but are not DCP ranks run routed expert subsets whose
         // partials are D2D-folded onto a TP rank before the EP combine
-        // (dispatch_moe_ep_extras). Only when CUDA is live and a multi-rank
-        // DCP executor exists — otherwise the vector stays empty and every
-        // EP-XTP hook is a structural no-op.
+        // (dispatch_moe_ep_extras). Only when CUDA is live and a DCP executor
+        // exists — otherwise the vector stays empty and every EP-XTP hook is a
+        // structural no-op.
+        // TD-GLM53-EP4-DEGENERATE-GENERATION: this used to require dcp_size>=2,
+        // which made the hooks a no-op on the ONE-TP-RANK / EP>1 topology
+        // (tp_array of size 1 + expert-only GPUs) — so experts placed on those
+        // GPUs were fetched and marked resident but never computed or folded,
+        // and the routed output silently lost them. The fold is a D2D copy +
+        // add; it needs a TP rank to fold ONTO, not a collective.
         if (deps_.cuda_kernels_enabled && deps_.dcp_executor
-            && deps_.dcp_executor->dcp_size() >= 2) {
+            && deps_.dcp_executor->dcp_size() >= 1) {
             const auto& tp_gpus = deps_.dcp_executor->gpus();
             auto is_tp = [&](int pos) {
                 for (const auto& g : tp_gpus)
@@ -1111,14 +1280,32 @@ CommandDispatcher::CommandDispatcher(Deps deps)
         if (deps_.live_config->model.architecture
                 == config::Architecture::deepseek_v4) {
             model::ModelConfig mc(deps_.live_config->model);
-            v4_kmain_layer_.assign(static_cast<size_t>(kv_layers_), 0);
+            kmain_layer_.assign(static_cast<size_t>(kv_layers_), 0);
             const int hidden = deps_.live_config->model.num_hidden_layers;
             for (int l = 0; l < hidden && l < kv_layers_; ++l) {
-                v4_kmain_layer_[static_cast<size_t>(l)] =
+                kmain_layer_[static_cast<size_t>(l)] =
                     mc.attention_type_for_layer(l)
                         == model::V4AttentionType::kCsa;
             }
             // MTP (nextn) layers are SWA-only by spec — mask stays 0.
+        }
+        // TD-KV-POOL-SIZED-OVER-ALL-LAYERS (GF3.9): glm5_next KDA linear
+        // layers carry per-request recurrent state, not KV pages — same
+        // sentinel-slot shape as V4 non-CSA layers, so the layer-major
+        // [j * kv_layers_ + l] indexing stays intact while only the 11
+        // sparse-MLA layers (+ the sparse-MLA MTP layer, GF3.1 §9.3)
+        // consume kMain pages. Mirrors the vram_allocator sizer, which now
+        // funds num_kv_layers() + nextn layers.
+        if (deps_.live_config->model.architecture
+                == config::Architecture::glm5_next) {
+            model::ModelConfig mc(deps_.live_config->model);
+            kmain_layer_.assign(static_cast<size_t>(kv_layers_), 0);
+            const int hidden = deps_.live_config->model.num_hidden_layers;
+            for (int l = 0; l < kv_layers_; ++l) {
+                // MTP layers (>= hidden) are sparse MLA: KV-bearing.
+                kmain_layer_[static_cast<size_t>(l)] =
+                    l >= hidden || !mc.is_linear_attention_layer(l);
+            }
         }
     }
 
@@ -1308,7 +1495,15 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                 } else {
                     const int gpu = deps_.hidden_state_pairs.empty()
                         ? 0 : deps_.hidden_state_pairs[0].gpu_position;
-                    h = pa->allocate_unreserved(gpu, memory::Pool::kMain);
+                    // S2: re-promotion is a run-aware claim — the fresh
+                    // VRAM page comes from this sequence's position-major
+                    // bump run (a position-matched hole in its own cohort
+                    // slab first, RADIX_SLAB_DESIGN §5).
+                    h = pa->allocate_for_sequence(
+                        gpu, memory::Pool::kMain, seq,
+                        static_cast<uint32_t>(layer), ts,
+                        ts + static_cast<uint32_t>(page_size),
+                        /*unreserved=*/true);
                 }
                 if (!h) return std::nullopt;
                 auto& m = pa->meta(*h);
@@ -1347,9 +1542,26 @@ CommandDispatcher::CommandDispatcher(Deps deps)
         const bool dsa = cfg.model.index_topk > 0;
         const int dcp_size = deps_.dcp_executor
             ? deps_.dcp_executor->dcp_size() : 0;
-        const bool indexer_ok = dcp_size <= 1
-            || cfg.hardware.dcp_indexer_mode
-                   == config::DcpIndexerMode::replicated;
+        // TD-KVT-LOCAL-INDEXER-UNBLOCK (resolved 2026-08-30): tiering is
+        // INDEXER-MODE-AGNOSTIC — the former "replicated indexer only at
+        // dcp>=2" refusal here was a merge artifact (47d62fe4), not an
+        // analysed incompatibility.  The manager consumes the indexer only
+        // as a SELECTION (sparse_indices + topk_lengths handed to
+        // prepare()/materialize() on the attention stream) plus the mode-
+        // independent indexer_full_layers mask.  Under dcp_indexer_mode=
+        // local the executor's exact cross-rank merge
+        // (merge_local_indexer_candidates) reconstructs the identical
+        // global top-k into the very buffers replicated mode's producer
+        // writes, BEFORE any consumer: the candidate allgather, the merge
+        // kernels, the KVS-4 shard translation and prepare()'s D2H
+        // readback are all enqueued on the same per-rank attention stream
+        // in that order (FIFO), and IndexShare reuse keys are blessed only
+        // POST-merge, so a selection_fresh=false host-copy reuse always
+        // refers to merged content of the same (seq, pos) step.  Identity
+        // is unit-gated (LightningTopkMerge.MergeEqualsFullHistoryTopk /
+        // PrefillChunkRowsShardBoundMergeEqualsReplicatedTopk) and was
+        // champion-A/B token-identity-gated on the champion shape
+        // (sharded KV, dcp=2, tiering + tiered sparse prefill ON).
         // TD-KVT-TQ (resolved by audit): both cache formats are row-self-
         // contained, so byte-granular row moves are placement-exact
         // (INV-KVT-1).  SnapMLA FP8: FP8 c_kv | f32 scale | BF16 rope.
@@ -1372,15 +1584,15 @@ CommandDispatcher::CommandDispatcher(Deps deps)
         const bool shard_ok = !kv_sharded_
             || (kv_dcp_chunk_tokens_ > 0 && deps_.kv_page_size > 0
                 && kv_dcp_chunk_tokens_ % deps_.kv_page_size == 0);
-        if (!dsa || !shard_ok || !indexer_ok || !fmt_ok
+        if (!dsa || !shard_ok || !fmt_ok
             || !deps_.cuda_kernels_enabled || !deps_.stream_manager
             || !deps_.page_allocator || dcp_size < 1
             || kv_cache_base_ptrs_.empty() || !kv_cache_base_ptrs_[0]) {
             spdlog::warn("KvTiering: memory.kv_tiering.enabled but "
                          "prerequisites unmet (dsa={}, shard_geometry_ok={}, "
-                         "indexer_replicated={}, row_self_contained_fmt={}, "
+                         "row_self_contained_fmt={}, "
                          "cuda={}) — tiering DISABLED (non-tiered path)",
-                         dsa, shard_ok, indexer_ok, fmt_ok,
+                         dsa, shard_ok, fmt_ok,
                          deps_.cuda_kernels_enabled);
         } else {
             KvTieringManager::Options topts;
@@ -1443,7 +1655,15 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                         : (deps_.hidden_state_pairs.empty()
                                ? 0
                                : deps_.hidden_state_pairs[0].gpu_position);
-                    h = pa->allocate_unreserved(gpu, memory::Pool::kMain);
+                    // S2: re-promotion is a run-aware claim — the fresh
+                    // VRAM page comes from this sequence's position-major
+                    // bump run (a position-matched hole in its own cohort
+                    // slab first, RADIX_SLAB_DESIGN §5).
+                    h = pa->allocate_for_sequence(
+                        gpu, memory::Pool::kMain, seq,
+                        static_cast<uint32_t>(layer), ts,
+                        ts + static_cast<uint32_t>(page_size),
+                        /*unreserved=*/true);
                 }
                 if (!h) return std::nullopt;
                 auto& m = pa->meta(*h);
@@ -1456,11 +1676,29 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                 return h;
             };
             topts.kv_main_bases = kv_cache_base_ptrs_;
+            // TD-PREFIX-TIDY-COLD-SPILL: 2nd-hop spill knobs (the
+            // orchestrator owns the POLICY — which holder, when; the
+            // manager owns the byte moves + the exact pre-write cap).
+            if (cfg._internal_prefix_spill.enabled) {
+                topts.spill_dir = cfg._internal_prefix_spill.path;
+                topts.spill_max_bytes =
+                    static_cast<int64_t>(cfg._internal_prefix_spill.max_mib)
+                    * 1024 * 1024;
+            }
+            // S3 (tiering by slab): slab geometry so the manager can flush
+            // demotions as slab-cohort runs (0/empty on unslabbed models —
+            // legacy per-layer demotion).
+            topts.pages_per_slab = deps_.page_allocator->pages_per_slab();
+            for (const auto& g : topts.gpus)
+                topts.slab_span_pages.push_back(
+                    deps_.page_allocator->total_pages(g.position,
+                                                     memory::Pool::kMain));
             topts.stride_block = deps_.kv_cache_stride_block;
             topts.stride_row = deps_.kv_cache_stride_row;
             topts.page_size = deps_.kv_page_size > 0 ? deps_.kv_page_size : 64;
             topts.kv_layers = kv_layers_ > 0 ? kv_layers_ : 1;
             topts.index_topk = cfg.model.index_topk;
+            topts.index_kpool = cfg.model.index_kpool;  // GF3.5 row math
             topts.hot_buffer_slots = cfg.memory.kv_tiering.hot_buffer_slots;
             topts.host_to_device_ratio =
                 cfg.memory.kv_tiering.host_to_device_ratio;
@@ -1493,7 +1731,7 @@ CommandDispatcher::CommandDispatcher(Deps deps)
                     }
                     const int64_t by_topk =
                         static_cast<int64_t>(topts.cohort_rows_max)
-                        * std::max(1, cfg.model.index_topk);
+                        * std::max(1, topts.index_topk_rows());  // GF3.5
                     topts.union_rows_max = static_cast<int>(
                         std::min(by_topk, local_rows));
                 }
@@ -1506,18 +1744,32 @@ CommandDispatcher::CommandDispatcher(Deps deps)
             // (no sharing).  MTP layers (>= num_hidden_layers) are SHARED by
             // construction (beyond the mask).
             {
+                // GF3.5: routed through ModelConfig::is_full_index_layer —
+                // the same formula for GLM-5.2/V3.2 (byte-identical), and
+                // the correct sparse-only mask for glm5_next (whose KDA
+                // linear layers must never drive tiering prefetch).
                 const int NH = cfg.model.num_hidden_layers;
-                const int freq = cfg.model.index_topk_freq;
-                const int off = cfg.model.index_skip_topk_offset;
+                model::ModelConfig mc(cfg);
                 std::vector<uint8_t> mask(
-                    static_cast<size_t>(std::max(NH, 0)), 1);
-                if (freq > 0) {
-                    for (int l = 0; l < NH; ++l)
-                        mask[static_cast<size_t>(l)] =
-                            (l < off || (l - off + 1) % freq == 0) ? 1 : 0;
-                }
+                    static_cast<size_t>(std::max(NH, 0)), 0);
+                for (int l = 0; l < NH; ++l)
+                    mask[static_cast<size_t>(l)] =
+                        mc.is_full_index_layer(l) ? 1 : 0;
                 topts.indexer_full_layers = std::move(mask);
             }
+            // GF3.9 (glm5_next): attention-type mask — tiering covers ONLY
+            // the KV-bearing (sparse-MLA) layers; KDA linear layers carry
+            // recurrent state (never tiered, INV-KDA-STATE (d)). The kMain
+            // sentinel mask IS that predicate (kmain_layer_ — filled for
+            // glm5_next above; empty on uniform models = all bearing,
+            // byte-identical). NOTE the glm5_next DEFAULT is tiering OFF
+            // (memory.kv_tiering.enabled=false in the recipes): the 25k
+            // prompt that cost 1.24 GiB of KV+indexer on GLM-5.2 costs
+            // ~0.14 GiB here (NoPE 516 B rows x 11 layers + pooled
+            // indexer), so the machinery stays reachable but idle until a
+            // >=256k measurement re-decides (PLAN GF3.9).
+            if (!kmain_layer_.empty())
+                topts.kv_bearing_layers = kmain_layer_;
             kv_tiering_ = std::make_unique<KvTieringManager>(std::move(topts));
         }
     }
@@ -1684,9 +1936,11 @@ CommandDispatcher::~CommandDispatcher() {
         || gated_final_fb_not_transferring_ || gated_final_fb_not_dispatched_
         || gated_final_fb_other_) {
         spdlog::info(
-            "FAR gate engagement: engaged={} fb_unissued={} fb_not_transferring={} "
+            "FAR gate engagement: engaged={} (force_dispatched={}) "
+            "fb_unissued={} fb_not_transferring={} "
             "fb_not_dispatched={} fb_other={}",
-            gated_final_engaged_, gated_final_fb_unissued_,
+            gated_final_engaged_, gated_final_force_dispatched_,
+            gated_final_fb_unissued_,
             gated_final_fb_not_transferring_, gated_final_fb_not_dispatched_,
             gated_final_fb_other_);
     }
@@ -1790,6 +2044,7 @@ CommandDispatcher::~CommandDispatcher() {
         // device_free tolerates nullptr).
         free_scratch(s.moe_output_fp32);
         free_scratch(s.moe_output_bf16_perslot);
+        free_scratch(s.ffn_combine_f32);
         dev->device_free(s.normalized_hidden);
         dev->device_free(s.hc_x);
         dev->device_free(s.hc_post);
@@ -1833,6 +2088,26 @@ CommandDispatcher::~CommandDispatcher() {
         }
     }
     moe_scratch_.clear();
+
+    // P-29 step 17 (LS_MOE_XTP_BOUNCE): destroy leftover consumer events and
+    // free the pinned bounce slots (owner = the TP rank0 backend that
+    // allocated them).
+    for (auto& cons : xtp_bounce_cons_evs_) {
+        for (auto& [ev, evg] : cons)
+            if (ev && deps_.stream_manager)
+                deps_.stream_manager->destroy_event(ev, evg);
+        cons.clear();
+    }
+    if (xtp_bounce_src_gpu_ >= 0
+        && static_cast<size_t>(xtp_bounce_src_gpu_)
+               < deps_.device_backends.size()
+        && deps_.device_backends[xtp_bounce_src_gpu_]) {
+        for (auto*& hb : xtp_bounce_host_)
+            if (hb) {
+                deps_.device_backends[xtp_bounce_src_gpu_]->host_free_pinned(hb);
+                hb = nullptr;
+            }
+    }
 
     // TD-DECODE-FFN-GRAPH: destroy captured routed-FFN graphs (must precede
     // device teardown so the graph exec handles are released first).
@@ -1968,6 +2243,8 @@ void CommandDispatcher::dispatch(const ipc::Command& cmd) {
             case ipc::CMD_SEQ_CREATE:         handle_seq_create(cmd); break;
             case ipc::CMD_SEQ_FREE:           handle_seq_free(cmd); break;
             case ipc::CMD_SEQ_FORK:           handle_seq_fork(cmd); break;
+            case ipc::CMD_SEQ_FORK_FROZEN:     handle_seq_fork(cmd); break;
+            case ipc::CMD_SEQ_HIBERNATE:      handle_seq_hibernate(cmd); break;
             case ipc::CMD_SEQ_SNAPSHOT:       handle_seq_snapshot(cmd); break;
             case ipc::CMD_SEQ_RESTORE:        handle_seq_restore(cmd); break;
 
@@ -1995,6 +2272,9 @@ void CommandDispatcher::dispatch(const ipc::Command& cmd) {
             case ipc::D_CMD_RUN_ADAPTER_FORWARD:  handle_run_adapter_forward(cmd); break;
             case ipc::D_CMD_RUN_MTP_STEP:         handle_run_mtp_step(cmd); break;
             case ipc::D_CMD_MTP_PROJECT:          handle_mtp_project(cmd); break;
+            case ipc::D_CMD_KDA_SNAPSHOT:         handle_kda_snapshot(cmd); break;
+            case ipc::D_CMD_KDA_RESTORE:          handle_kda_restore(cmd); break;
+            case ipc::D_CMD_KDA_CKPT:             handle_kda_ckpt(cmd); break;
             case ipc::D_CMD_RUN_DSPARK_STEP:      handle_run_dspark_step(cmd); break;
             case ipc::D_CMD_RUN_SELF_SPEC_FORWARD: handle_run_self_spec_forward(cmd); break;
             case ipc::E_CMD_SEQ_CREATE:        handle_e_seq_create(cmd); break;
@@ -2064,6 +2344,94 @@ void CommandDispatcher::remove_nvme_token_mapping(uint64_t nvme_token) {
         cmd_seq_to_token_.erase(it->second);
         nvme_token_to_cmd_seq_.erase(it);
     }
+}
+
+// ── 44z: MoE dispatch quiesce point ────────────────────────────────────────
+// The rebalancer's step (3). This means "no MoE KERNEL is in flight", NOT
+// "the pipeline is idle".
+//
+// THE LIVELOCK that settled it (measured: engine wedged 9+ min, GPU 0%, the
+// drain stuck at START). This predicate ALSO required no active
+// progressive-MoE state. But a 20k-token prefill that stalls on a KV page
+// claim — because free slabs are under the low-water mark — keeps its
+// progressive state ACTIVE while it waits. So quiesce never became true, so
+// the drain never released the slabs, so the prefill never got its pages:
+// the drain waited on quiesce, quiesce waited on the prefill, and the
+// prefill waited on the drain. A self-inflicted instance of the very §5
+// hazard class the step exists to prevent.
+//
+// WHY DROPPING THE STATE CHECK IS SAFE. The daemon is SINGLE-THREADED and
+// the rebalancer ticks from DaemonLoop's background_fn, which runs only
+// AFTER advance_progressive_moe() has returned — it can never interleave
+// between a pointer-table fill and its kernel launch, because both happen
+// inside one dispatch call. And every cross-call surface is refreshed per
+// use rather than cached:
+//   · moe_big's host pointer vectors are per-call locals;
+//   · kEager refills the shared routed_b_ptrs device array in place right
+//     before each projection;
+//   · kGraph refills its pinned host buffers OUTSIDE capture and CAPTURES
+//     the H2D, so a replay pulls fresh routing/weights rather than a baked
+//     address (moe_driver.cpp, the emit()-mode note).
+// What genuinely outlives a call is only: (a) ENQUEUED KERNELS still reading
+// expert slots — covered here by pending_compute_count() == 0 and, belt and
+// braces, by the reclaim's kExpertFfn stream barrier, which orders after any
+// wave pass whether or not it was registered as pending compute; (b)
+// in-flight DMAs — covered by the reclaim's h2d stream barrier; and (c) the
+// persistent residency bitset in moe_scratch_, which the TD-91d guard and
+// the 44z tripwire handle by excluding the entry and degrading if routing
+// races an eviction.
+// An active-but-stalled progressive state is PRE-DISPATCH for its next
+// layer: its next fill re-reads the cache and simply sees evicted entries as
+// ordinary misses.
+//
+// WHAT A CALLER MUST NOT DROP. Host-side no stale pointer survives a call,
+// but the addresses staged during a call ARE dereferenced by the GPU after
+// it returns, so this predicate alone is NOT a licence to evict. It is safe
+// only for a reclaim that also (i) evicts through ExpertCache and skips
+// LOCKED or not-fully-arrived entries — an in-flight dispatch holds locks on
+// exactly the experts it is reading — and (ii) waits on a kExpertFfn stream
+// barrier before reusing the memory. The TD-91d guard cannot help here: it
+// runs at FILL time and cannot see an eviction that happens after the fill.
+// The 44z rebalancer does both; anything else built on this must too.
+bool CommandDispatcher::moe_dispatch_quiesced() const {
+    return pending_compute_count() == 0;
+}
+
+// TD-KVXP-PER-STEP-FLOOR: the per-step growth term of the rebalancer's
+// principled reserve. One growth event =
+//   * ensure_pages auto-growth: chunk_size_pages_ logical pages x every
+//     layer that takes a kMain page (glm5_next: the 12 sparse-MLA layers;
+//     the 34 KDA layers hold no KV), ceiled to whole slabs — floored at one
+//     slab so a chunk-disabled boot (page_growth_chunk_tokens 0, growth of
+//     one logical page at a time) still reserves the slab that claim needs;
+//   * plus one indexer-K page group on paged-indexer models: indexer pages
+//     are slab-granular (grow_indexer_pages claims pps pages per (group,
+//     layer)), so a group costs one slab per indexer-computing layer.
+// The full-length indexer admission RESERVATION (INV-DSA-RESERVE) is
+// request-sized and deliberately NOT in this constant: a typical
+// admission's reservation is a few groups (covered by the same seam the
+// bulk KV claim rides), and folding max_sequence_length's worth in would
+// re-create exactly the pessimistic standing reserve this floor removes.
+int64_t CommandDispatcher::growth_chunk_slabs() const {
+    auto* pa = deps_.page_allocator;
+    if (!pa) return 0;
+    const int pps = pa->pages_per_slab();
+    if (pps <= 0) return 0;  // unslabbed region — no slab-denominated floor
+    int kmain = 0;
+    const int L = kv_layers_ > 0 ? kv_layers_ : 1;
+    for (int l = 0; l < L; ++l)
+        if (layer_takes_kmain_page(l)) ++kmain;
+    const int64_t chunk_pages =
+        static_cast<int64_t>(std::max(1, chunk_size_pages_)) * kmain;
+    int64_t slabs = std::max<int64_t>(1, (chunk_pages + pps - 1) / pps);
+    if (model_has_paged_indexer() && deps_.live_config) {
+        model::ModelConfig mc(*deps_.live_config);
+        const int n_lay = deps_.live_config->model.num_hidden_layers
+                          + deps_.live_config->model.num_nextn_predict_layers;
+        for (int l = 0; l < n_lay; ++l)
+            if (mc.computes_indexer(l)) ++slabs;
+    }
+    return slabs;
 }
 
 }  // namespace layerstorm::daemon

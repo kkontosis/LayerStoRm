@@ -62,7 +62,9 @@ test('header has auto-generated marker', () => {
 });
 
 // 5. Enums present
-for (const e of ['GpuType', 'GpuRole', 'Architecture', 'WeightQuant', 'AttentionQuant',
+// GpuType was eliminated with GpuTopology (46360bf55): hardware.gpus[].type
+// is a free string x-override resolved by resolve_config, not an enum.
+for (const e of ['GpuRole', 'Architecture', 'WeightQuant', 'AttentionQuant',
                   'KvCacheQuant', 'GatingQuant', 'EvictionPolicy', 'IoEngine',
                   'RankingStrategy', 'LayerSkipMethod', 'GemmBackend']) {
   test(`enum class ${e} present`, () => {

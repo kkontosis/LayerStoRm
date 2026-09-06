@@ -71,15 +71,96 @@ if(UNIT_TEST_SOURCES)
     ":TqSm120AttentionDevice.*"
     ":CudaSm120ExpertDevice.*"
     ":GgufGroupedGemmGpu.*"
+    # P-29 step 13: per-row M-independence of the routed-expert grouped GGUF
+    # GEMM (gguf_grouped_row_identity_test.cu) — the verify batch's bitwise
+    # contract.
+    ":GgufGroupedRowIdentity.*"
+    # P-29 step 2: graph-node byte-mover kernels (graph_node_ops_test.cu).
+    ":GraphNodeOps.*"
+    # P-29 step 6: slim sparse-decode bit-identity (tq_sparse_decode_slim_test.cu).
+    ":TqSparseDecodeSlim.*"
+    # P-29 step 9: split-KV sparse-decode (tq_sparse_decode_splitkv_test.cu).
+    ":TqSparseDecodeSplitKv.*"
     ":GgufDenseGateUpSplitGpu.*"
     ":SamplingKernelTest.*"
     ":ConfidenceKernelTest.*"
     ":WeightFp8QuantTest.*"
+    # P-30 step 5: activation-quant rows > 65535 grid.y ceiling
+    # (TD-MOE-BIG-CHUNK-ROWS-KERNEL-CEILING, quant_rows_grid_ceiling_test.cu).
+    ":QuantRowsGridCeiling.*"
     ":KvBvExtractDequantTest.*"
     ":KvBvExtractDequantGgufGpu.*"
     ":QAbsorbGgufGpu.*"
     ":PinnedExpertArenaTest.*"
     ":GpuLoaderCalibration.*"
+    # 2026-08-27 (TD-UNIT-SUITE-NO-GREEN-BASELINE): every suite containing
+    # REQUIRES_GPU tests belongs here — suites below ran in the PARALLEL cpu
+    # bucket while touching the real GPU, producing roaming -j flakes
+    # (allocation failures under concurrent VRAM/stream pressure).
+    ":KvRowCopyKernel.*"
+    ":KvTieringManager.*"
+    ":KvTieringManagerReplicated.*"
+    ":KvTieringManagerSharded.*"
+    ":CsaHcaDevice.*"
+    ":DcpAttentionWrapper.*"
+    ":DcpCommunicator.*"
+    ":DcpExecutor.*"
+    ":DcpLseCorrect.*"
+    ":DsparkV4Kernel.*"
+    ":ExpertDeviceTest.*"
+    ":AttentionDeviceTest.*"
+    ":FusedSwigluTest.*"
+    ":ConfigValidatorGpu.*"
+    ":ConfigResolverGpu.*"
+    ":Fp8GroupedGemmTest.*"
+    ":Nvfp4GroupedGemmTest.*"
+    ":HashGatingTest.*"
+    ":MhcKernel.*"
+    ":MoePermuteTest.*"
+    ":V4Oproj.*"
+    ":V4Prep.*"
+    ":Bf16GemmSmallM.*"
+    ":DecodeLseUnits.*"
+    ":IndexerChunkAppend.*"
+    ":IndexerChunkTopk.*"
+    ":IndexerHadamard.*"
+    ":IndexerKpool.*"
+    ":IndexerPagedScore.*"
+    ":IndexerPrep.*"
+    ":IndexerShardTranslate.*"
+    # GF3.7 KDA (glm5_next) kernel suites — kda_kernels_test.cu; KdaDispatch is
+    # CPU-only refusals, parallel bucket.
+    ":KdaChunkCarry.*"
+    ":KdaChunkScan.*"
+    ":KdaConvKernel.*"
+    ":KdaDecodeKernel.*"
+    ":KdaGoldenReal.*"
+    ":KdaGoldenSynth.*"
+    ":KdaPrefillDecodeContinuity.*"
+    ":LightningIndexerMqa.*"
+    ":LightningTopkLongCtx.*"
+    ":LightningTopkMerge.*"
+    ":MlaAttention.*"
+    ":MlaAttentionPrep.*"
+    ":MoeBigChunkedIdentity.*"
+    # GF3.4 NoPE (GLM5N, D_QK 512) MLA suites — nope_mla_attention_test.cu.
+    # NopeMlaDispatch is CPU-only (geometry refusals throw before any launch)
+    # and deliberately stays in the parallel bucket.
+    ":NopeMlaDecode.*"
+    ":NopeMlaPrefill.*"
+    ":NopeMlaPrep.*"
+    # TD-SNAPMLA-ATCTX-DECODE-PATH budget-staged sparse decode suites —
+    # snapmla_budget_decode_test.cu (gather staging + hardened sparse FP8
+    # split-KV decode at the GLM5N NoPE geometry).
+    ":SnapmlaBudgetDecodeGather.*"
+    ":SnapmlaBudgetDecodeSparseFp8.*"
+    ":PrefillDenseCausal.*"
+    ":PrefillDenseLongCtx.*"
+    ":PrefillLseUnits.*"
+    ":PrefillSparseCausal.*"
+    ":PrefillSparseDetReduce.*"
+    ":TqLseUnits.*"
+    ":TqPrefillDetReduce.*"
   )
   string(CONCAT GPU_FILTER ${_GPU_FILTER})
 
@@ -91,10 +172,65 @@ if(UNIT_TEST_SOURCES)
       TIMEOUT 30
   )
 
+  # Suites that allocate large NUMA/pinned host arenas. They pass alone but
+  # fail spuriously under `ctest -j` when run CONCURRENTLY with each other:
+  # the box's HBM NUMA nodes are 16 GiB each, so parallel arena-sized
+  # allocations hit node-local exhaustion while system RAM is plentiful
+  # (TD-UNIT-SUITE-NO-GREEN-BASELINE, campaign dossier section 1). A shared
+  # RESOURCE_LOCK serializes them among themselves; they still run in
+  # parallel with the rest of the CPU bucket.
+  set(_HOSTARENA_FILTER
+    "ArenaMigratorTest.*"
+    ":ArenaLoaderTest.*"
+    ":ExpertPrepackerTest.*"
+    ":PrepackedSourceTest.*"
+    ":LivePrepackTest.*"
+    ":ValidatePlan.*"
+    ":MultiNumaCpuExpert.*"
+  )
+  string(CONCAT HOSTARENA_FILTER ${_HOSTARENA_FILTER})
+
+  # 180s: MultiNumaCpuExpert.EngineDimsParityChurn takes ~53s ALONE — the
+  # shared 60s ceiling made it a guaranteed flake the moment anything else
+  # competed for memory bandwidth.
+  # PROCESSORS 8: a big-memory test consumes every ctest -j8 slot, so it runs
+  # with the machine to itself (ValidatePlan builds a ~22 GB synthetic model;
+  # with the 504 GB arena holder resident the box has ~60 GB free — parallel
+  # neighbours turn into bare OOM SIGKILLs, seen as "Subprocess killed").
+  gtest_discover_tests(layerstorm_unit_tests
+    TEST_SUFFIX "_cpu"
+    TEST_FILTER "${HOSTARENA_FILTER}"
+    PROPERTIES
+      RESOURCE_LOCK "host_numa_arena"
+      PROCESSORS 8
+      TIMEOUT 180
+  )
+
+  # Opt-in real-hardware arms (spec/TESTING.md "Opt-in test arms"): they
+  # GTEST_SKIP in milliseconds unless their env var is set, so they cost the
+  # default suite nothing — but WHEN enabled they do the real thing (the loader
+  # calibration probes every NUMA/HBM bank with a 32 GiB rotating pinned
+  # footprint, for minutes). They therefore get the big-host-memory treatment
+  # plus an hour-scale timeout; a 60 s ceiling would make the documented opt-in
+  # invocation report a timeout instead of a result.
+  set(_OPTIN_FILTER
+    "GpuLoaderCalibrationSlow.*"
+  )
+  string(CONCAT OPTIN_FILTER ${_OPTIN_FILTER})
+
+  gtest_discover_tests(layerstorm_unit_tests
+    TEST_SUFFIX "_cpu"
+    TEST_FILTER "${OPTIN_FILTER}"
+    PROPERTIES
+      RESOURCE_LOCK "host_numa_arena"
+      PROCESSORS 8
+      TIMEOUT 3600
+  )
+
   # Everything else: CPU-only tests, run in parallel, 60s timeout.
   gtest_discover_tests(layerstorm_unit_tests
     TEST_SUFFIX "_cpu"
-    TEST_FILTER "-${GPU_FILTER}"
+    TEST_FILTER "-${GPU_FILTER}:${HOSTARENA_FILTER}:${OPTIN_FILTER}"
     PROPERTIES
       TIMEOUT 60
   )

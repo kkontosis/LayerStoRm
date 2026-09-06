@@ -46,17 +46,125 @@
 
 namespace layerstorm::daemon {
 
+// ── P-29 step 16: FAR MoE-prologue pre-issue (LS_FAR_PROLOGUE_PREISSUE) ─────
+// Read once: pre-issue the routing-independent MoE prologue at FAR
+// attention-dispatch time (before the routing-readback spin). Default ON;
+// =0 restores the post-readback emission byte-identically.
+bool CommandDispatcher::far_prologue_preissue_enabled() {
+    if (far_prologue_preissue_enabled_ < 0) {
+        const char* e = std::getenv("LS_FAR_PROLOGUE_PREISSUE");
+        far_prologue_preissue_enabled_ = (e && e[0] == '0') ? 0 : 1;
+        if (!far_prologue_preissue_enabled_)
+            spdlog::info("FAR prologue pre-issue DISABLED "
+                         "(LS_FAR_PROLOGUE_PREISSUE=0) — MoE prologue is "
+                         "emitted after the routing readback");
+    }
+    return far_prologue_preissue_enabled_ == 1;
+}
+
+// Pre-issue the routing-independent MoE prologue for a decode-shaped FAR
+// command: per TP rank, the prime_cpu_input_only pass (attn-event wait + mHC
+// collapse + ffn RMSNorm on the rank's kExpertFfn stream — a proven
+// no-side-effect input hoist, C-6 Task A), then the EP-XTP hidden+top-K
+// broadcast to ALL expert-only ranks (a superset of the finalize's
+// active-extras set; the extra copies write scratch nothing reads unless the
+// rank dispatches — values identical either way). Everything queues behind
+// attn_moe_event, which is recorded AFTER the fused gating top-K + routing
+// export on the attention stream, so no read precedes its producer. On ANY
+// failure the flags stay clear and the finalize re-emits byte-identically.
+bool CommandDispatcher::preissue_far_moe_prologue(uint32_t layer_idx,
+                                                  uint32_t num_seqs,
+                                                  uint32_t gpu_idx) {
+    clear_far_prologue();
+    if (!deps_.cuda_kernels_enabled || !deps_.stream_manager
+        || !deps_.dcp_executor || !deps_.live_config)
+        return false;
+    const auto& tp_gpus = deps_.dcp_executor->gpus();
+    if (tp_gpus.empty()) return false;
+    // Sub-knobs (P-29 step-16 bisect result): the PRIME half (per-rank collapse+
+    // norm + finalize skip) is the win — 8k 24.6 -> 25.8 (+4.7%) on its own.
+    // The BROADCAST half pre-issued alongside it measured a reproducible
+    // ~6.5% LOSS with the DRIVER-STAGED cross-device copies (P-29 step-16 legs) —
+    // OQ-9, RESOLVED in P-29 step 17: no P2P exists on this box, and staged
+    // copies enqueued behind an unfired event take a driver deferred path
+    // that inserts a ~50-85 us bubble ahead of everything behind them on
+    // the stream. With the explicit pinned-bounce broadcast
+    // (LS_MOE_XTP_BOUNCE, P-29 step 17) the same pre-issue position WINS
+    // (+0.7% @8k on top of the bounce itself), so the broadcast half
+    // defaults ON exactly when the bounce is available and OFF under the
+    // legacy staged copies. LS_FAR_PROLOGUE_BCAST=0/1 overrides either way
+    // (bit-identical — only enqueue time moves).
+    static const bool do_prime = [] {
+        const char* v = std::getenv("LS_FAR_PROLOGUE_PRIME");
+        return !(v && v[0] == '0');
+    }();
+    static const bool do_bcast = [] {
+        const char* v = std::getenv("LS_FAR_PROLOGUE_BCAST");
+        if (v && v[0]) return v[0] == '1';
+        const char* b = std::getenv("LS_MOE_XTP_BOUNCE");
+        return !(b && b[0] == '0');  // default: ON iff the bounce is on
+    }();
+    uint32_t mask = 0;
+    if (do_prime)
+    for (const auto& g : tp_gpus) {
+        if (g.position < 0 || g.position >= 32) return false;
+        InternalMoeParams pmp{};
+        pmp.layer_idx = layer_idx;
+        pmp.num_seqs  = num_seqs;
+        pmp.gpu_idx   = static_cast<uint32_t>(g.position);
+        pmp.use_precomputed_gating = true;   // top-K already in scratch
+        pmp.prime_cpu_input_only   = true;   // collapse + norm, then return
+        if (!dispatch_moe_internal(pmp)) return false;
+        mask |= 1u << (g.position & 31);
+    }
+    // Publish the primed set BEFORE the broadcast so ep_xtp_broadcast skips
+    // its own (idempotent) collapse+norm recompute and reads the primed
+    // normalized_hidden directly.
+    far_prologue_layer_    = layer_idx;
+    far_prologue_gpu_mask_ = mask;
+    if (do_bcast && !ep_xtp_gpus_.empty()) {
+        InternalMoeParams mpb{};
+        mpb.layer_idx = layer_idx;
+        mpb.num_seqs  = num_seqs;
+        mpb.gpu_idx   = gpu_idx;
+        mpb.use_precomputed_gating = true;
+        if (ep_xtp_broadcast(mpb, ep_xtp_gpus_,
+                             /*after_rank0_dispatch=*/false))
+            far_prologue_bcast_done_ = true;
+        // Broadcast failure is non-fatal: the finalize's own broadcast
+        // covers the extras (far_prologue_bcast_done_ stays false).
+    }
+    return true;
+}
+
 // ── KD-4g: Multi-rank MoE dispatch with TP allreduce ────────────────────────
 
 bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_template) {
-    if (!deps_.dcp_executor || !deps_.dcp_communicator) {
+    if (!deps_.dcp_executor) {
         return dispatch_moe_internal(mp_template);
     }
 
     const auto& tp_gpus = deps_.dcp_executor->gpus();
     const int dcp_size = deps_.dcp_executor->dcp_size();
 
-    if (dcp_size <= 1) {
+    // TD-GLM53-EP4-DEGENERATE-GENERATION: this function used to bail to the
+    // single-GPU path whenever dcp_size <= 1, which silently DROPPED every
+    // routed expert the loader had placed on an expert-only GPU on a ONE-TP-
+    // RANK / EP>1 topology (tp_array of size 1 + expert_streaming GPUs — the
+    // shape autoconfig derives for GLM-5.3-Flash).  Those experts are fetched,
+    // arrive, and are marked resident on their own GPU, but nothing ever
+    // computes or folds them: the finalize dispatches only rank0's bitset, so
+    // the token's MoE output is missing ~(EP-1)/EP of its top-K contributions
+    // with NO degraded/health signal (they arrived — nothing timed out).
+    // The cross-rank COLLECTIVE is what needs >= 2 ranks; the EP-xTP D2D fold
+    // does not.  So: run the multi-rank path whenever there are extra expert
+    // hosts, and gate only the collectives on `tp_collective`.
+    const bool tp_collective = dcp_size >= 2 && deps_.dcp_communicator
+        && deps_.dcp_communicator->is_active();
+    if (!tp_collective && ep_xtp_gpus_.empty()) {
+        return dispatch_moe_internal(mp_template);
+    }
+    if (tp_gpus.empty() || dcp_size < 1) {
         return dispatch_moe_internal(mp_template);
     }
 
@@ -248,7 +356,11 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
         //
         // LS_EP_DUP_DUMP: observe-only telemetry (default off) — counts cross-GPU
         // duplicate experts per (call,layer); pure visibility, no behavior effect.
-        if (ep_within_tp && dcp_size >= 2) {
+        // INV-MOE-EP-DISJOINT also binds the ONE-TP-RANK EP topology: a
+        // duplicate across rank0 and an extra host double-counts exactly
+        // the same way, so the dedup runs whenever a second holder can
+        // exist (>= 2 TP ranks OR any active extra).
+        if (ep_within_tp && (dcp_size >= 2 || !active_extras.empty())) {
             static constexpr int kMaxRanks = 8;  // mirrors kMaxTp (EP ≤ 8 ranks)
             uint8_t* bitset_ptrs[kMaxRanks] = {nullptr};
             int n_ranks = dcp_size < kMaxRanks ? dcp_size : kMaxRanks;
@@ -444,20 +556,32 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
     }
     void* buffers[kMaxTp];
     void* streams[kMaxTp];
+    // TD-GLM5-TP-COMBINE-PRECISION: the shared/dense FFN down GEMM wrote its
+    // row-parallel partial to the FP32 staging (moe_driver, kPreAllreduce) —
+    // allreduce THAT in fp32 and round to bf16 once (below) into the legacy
+    // buffer. Single-shot only: the chunked path accumulates bf16 into
+    // moe_output per chunk and keeps the legacy combine.
+    const bool ffn_fp32_combine =
+        deps_.dcp_executor && deps_.dcp_executor->tp_combine_fp32_active()
+        && !chunked;
     for (int r = 0; r < dcp_size; ++r) {
         const int gpu_pos = tp_gpus[r].position;
         if (gpu_pos < 0 || static_cast<size_t>(gpu_pos) >= moe_scratch_.size())
             return false;
         const auto& s = moe_scratch_[gpu_pos];
         // INV-MOE-BIG-4: chunked dense output lives in moe_output.
-        buffers[r] = is_dense ? (chunked ? s.moe_output : s.expert_output)
-                              : s.shared_expert_output;
+        buffers[r] = ffn_fp32_combine
+            ? s.ffn_combine_f32
+            : (is_dense ? (chunked ? s.moe_output : s.expert_output)
+                        : s.shared_expert_output);
         streams[r] = deps_.stream_manager->stream(
             gpu_pos, compute::StreamId::kExpertFfn);
     }
     // TD-74m: validate all buffers/streams before NCCL collective.
+    // `buffers` feeds the collective only; `streams` is also read by the EP
+    // combine below, so it is validated on every path.
     for (int r = 0; r < dcp_size; ++r) {
-        if (!buffers[r] || !streams[r]) {
+        if (!streams[r] || (tp_collective && !buffers[r])) {
             spdlog::error("dispatch_moe_all_ranks: rank {} has null buffer/stream", r);
             return false;
         }
@@ -476,7 +600,7 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
     }();
     const bool ep_combine_runs = ep_within_tp && !is_dense;
     bool combine_fused = false;
-    if (nccl_fuse && ep_combine_runs) {
+    if (tp_collective && nccl_fuse && ep_combine_runs) {
         void* combine_bufs[kMaxTp];
         bool bufs_ok = true;
         const bool bf16_payload = ep_combine_bf16_payload_;
@@ -524,7 +648,7 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
                         ops[r] = {
                             {buffers[r],
                              static_cast<size_t>(num_tokens) * hidden_f,
-                             false},
+                             /*fp32=*/ffn_fp32_combine},
                             {combine_bufs[r],
                              static_cast<size_t>(num_tokens) * b_rows * hidden_f,
                              b_fp32}};
@@ -557,14 +681,41 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
                 deps_.dcp_communicator->allreduce_hidden_fused(
                     buffers, combine_bufs, num_tokens, streams,
                     /*b_fp32=*/b_fp32,
-                    /*b_rows_per_token=*/b_rows);
+                    /*b_rows_per_token=*/b_rows,
+                    /*a_fp32=*/ffn_fp32_combine);
             }
             combine_fused = true;
         }
     }
-    if (!combine_fused) {
+    // ONE TP rank: the shared/dense FFN partial is already complete on rank0
+    // (nothing is row-parallel split), so there is no Phase-2 reduce to run.
+    if (tp_collective && !combine_fused) {
         deps_.dcp_communicator->allreduce_hidden(
-            buffers, num_tokens, streams);
+            buffers, num_tokens, streams, /*fp32=*/ffn_fp32_combine);
+    }
+
+    // TD-GLM5-TP-COMBINE-PRECISION: the ONE bf16 rounding of the FFN combine
+    // — fp32 sum -> legacy bf16 buffer (per rank, same kExpertFfn stream, so
+    // Phase 3 consumers are ordered behind it). Covers the fused, graph-
+    // replayed and plain arms alike.
+    if (ffn_fp32_combine) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            spdlog::warn("[tp-probe] FFN fp32 combine ENGAGED (is_dense={} "
+                         "layer={})", is_dense, mp_template.layer_idx);
+        }
+        const int hidden_c = deps_.live_config->model.hidden_size;
+        for (int r = 0; r < dcp_size; ++r) {
+            const int gpu_pos = tp_gpus[r].position;
+            const auto& s = moe_scratch_[gpu_pos];
+            void* dst = is_dense ? s.expert_output : s.shared_expert_output;
+            auto* be = deps_.device_backends[gpu_pos];
+            be->set_device();
+            be->cast_f32_to_bf16(dst, s.ffn_combine_f32,
+                                 static_cast<int64_t>(num_tokens) * hidden_c,
+                                 streams[r]);
+        }
     }
 
     if (std::getenv("LS_DEBUG_GATING") && !is_dense &&
@@ -620,7 +771,10 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
             // token count, not the slot-expanded count. fp32 payload → fp32
             // collective; bf16 payload → bf16 collective (half the bytes).
             // INV-NCCL-FUSE: already issued inside the Phase-2 group above.
-            if (!combine_fused)
+            // ONE TP rank: the extras already D2D-folded their per-slot rows
+            // into rank0's buffer, so the gather is complete without a
+            // collective — only the fixed-order slot reduce below is needed.
+            if (tp_collective && !combine_fused)
                 deps_.dcp_communicator->allreduce_hidden(
                     moe_buffers_perslot, num_tokens, streams,
                     /*fp32=*/!bf16_payload, /*rows_per_token=*/topk);
@@ -657,9 +811,11 @@ bool CommandDispatcher::dispatch_moe_all_ranks(const InternalMoeParams& mp_templ
                         moe_scratch_[gpu_pos].moe_output_fp32,
                         num_tokens, topk, hidden, streams[r]);
             }
-        } else if (!combine_fused) {
+        } else if (tp_collective && !combine_fused) {
             // INV-NCCL-FUSE: when fused, the mode-0 moe_output reduce already
             // rode in the Phase-2 group above — nothing left to do here.
+            // ONE TP rank: nothing to reduce; the extras folded straight into
+            // rank0's moe_output.
             void* moe_buffers[kMaxTp];
             for (int r = 0; r < dcp_size; ++r) {
                 const int gpu_pos = tp_gpus[r].position;
@@ -791,8 +947,16 @@ bool CommandDispatcher::ep_xtp_broadcast(const InternalMoeParams& mp_template,
     // hidden as-is), else the raw hidden (matching what rank0 itself feeds
     // its router/permute in that case).
     const void* src_hidden = raw_hidden;
+    // P-29 step 16 (LS_FAR_PROLOGUE_PREISSUE): the FAR pre-issue already
+    // enqueued this rank's collapse+norm on the same stream — consume the
+    // primed normalized_hidden instead of re-emitting (idempotent recompute,
+    // identical bytes; skipping only removes the duplicate).
+    const bool prologue_primed =
+        far_prologue_layer_ == mp_template.layer_idx
+        && ((far_prologue_gpu_mask_ >> (src & 31)) & 1u) != 0
+        && src < 32;
     if (norm_w && ss.normalized_hidden) {
-        if (!after_rank0_dispatch) {
+        if (!after_rank0_dispatch && !prologue_primed) {
             // Pre-Phase-1: order behind attention (KD-R2) and produce the
             // normalized hidden ourselves; rank0's own Phase-1 dispatch
             // recomputes it idempotently on the same stream.
@@ -804,7 +968,10 @@ bool CommandDispatcher::ep_xtp_broadcast(const InternalMoeParams& mp_template,
             // V4-5b mHC: collapse the hc-stream residual first (rank0's
             // own Phase-1 dispatch recomputes both idempotently).
             const void* bcast_rms_src = raw_hidden;
-            if (deps_.hc_streams > 1) {
+            // P-29 step 11: per-layer mHC (glm5_next MTP layers are non-mHC).
+            const int hc_layer = hc_streams_for_layer(
+                deps_.hc_streams, deps_.live_config->model, layer);
+            if (hc_layer > 1) {
                 const auto& lw0 = deps_.per_layer_attn_weights[layer]
                                       [deps_.hidden_state_pairs[pair0].rank];
                 if (!lw0.hc_ffn_fn || !ss.hc_x) {
@@ -818,7 +985,7 @@ bool CommandDispatcher::ep_xtp_broadcast(const InternalMoeParams& mp_template,
                     deps_.live_config->model.rms_norm_eps,
                     deps_.live_config->model.hc_eps, 2.0f,
                     deps_.live_config->model.hc_sinkhorn_iters,
-                    num_tokens, deps_.hc_streams, hidden, s_stream);
+                    num_tokens, hc_layer, hidden, s_stream);
                 bcast_rms_src = ss.hc_x;
             }
             compute::launch_rmsnorm(
@@ -838,6 +1005,113 @@ bool CommandDispatcher::ep_xtp_broadcast(const InternalMoeParams& mp_template,
         static_cast<size_t>(num_tokens) * topk * sizeof(float);
     const size_t topk_i_bytes =
         static_cast<size_t>(num_tokens) * topk * sizeof(int32_t);
+
+    // P-29 step 17 (LS_MOE_XTP_BOUNCE, default ON): explicit pinned-bounce
+    // instead of driver-staged cross-device copies (see the member comment in
+    // command_dispatcher.h — this box has no P2P, so the "D2D" copies bounce
+    // through a driver staging buffer, and OQ-9 measured a ~50-85 us stream
+    // bubble when they are enqueued behind an unfired event). Same bytes to
+    // the same extra-rank destinations; the extras' consumers are ordered
+    // behind their OWN H2Ds on their own kExpertFfn streams (replacing the
+    // legacy one-event fence with an equivalent per-extra chain).
+    static const bool bounce_on = [] {
+        const char* v = std::getenv("LS_MOE_XTP_BOUNCE");
+        const bool on = !(v && v[0] == '0');
+        if (!on)
+            spdlog::info("EP-XTP pinned-bounce broadcast DISABLED "
+                         "(LS_MOE_XTP_BOUNCE=0) — legacy staged cross-device "
+                         "copies");
+        return on;
+    }();
+    const size_t bounce_need = hidden_bytes + topk_w_bytes + topk_i_bytes;
+    if (bounce_on && num_tokens <= 8) {
+        if (!xtp_bounce_host_[0]) {
+            // First use: two rotating pinned slots sized for the largest
+            // decode/small-M shape (num_tokens <= 8).
+            const size_t slot = static_cast<size_t>(8) * hidden * 2
+                + static_cast<size_t>(8) * topk * sizeof(float)
+                + static_cast<size_t>(8) * topk * sizeof(int32_t);
+            xtp_bounce_slot_bytes_ = slot;
+            xtp_bounce_host_[0] = be_src->host_alloc_pinned(slot);
+            xtp_bounce_host_[1] = be_src->host_alloc_pinned(slot);
+            xtp_bounce_src_gpu_ = src;
+            if (!xtp_bounce_host_[0] || !xtp_bounce_host_[1]) {
+                spdlog::warn("LS_MOE_XTP_BOUNCE: pinned slot alloc failed — "
+                             "falling back to staged cross-device copies");
+                xtp_bounce_slot_bytes_ = 0;
+            }
+        }
+        if (bounce_need <= xtp_bounce_slot_bytes_) {
+            const int slot = xtp_bounce_slot_next_;
+            xtp_bounce_slot_next_ ^= 1;
+            // Slot-reuse back-edge: the D2H into this slot must not start
+            // before the slot's previous consumers (extras' H2Ds, two
+            // broadcasts ago) have read it. In practice those fired long ago;
+            // the waits are correctness insurance and cost enqueue-only.
+            auto& cons = xtp_bounce_cons_evs_[slot];
+            for (auto& [ev, evg] : cons) {
+                deps_.stream_manager->wait_event(
+                    src, compute::StreamId::kExpertFfn, ev);
+                deps_.stream_manager->destroy_event(ev, evg);
+            }
+            cons.clear();
+            uint8_t* hb = static_cast<uint8_t*>(xtp_bounce_host_[slot]);
+            const size_t off_w = hidden_bytes;
+            const size_t off_i = hidden_bytes + topk_w_bytes;
+            be_src->memcpy_async(hb, src_hidden, hidden_bytes, s_stream);
+            be_src->memcpy_async(hb + off_w, ss.topk_weights, topk_w_bytes,
+                                 s_stream);
+            be_src->memcpy_async(hb + off_i, ss.topk_indices, topk_i_bytes,
+                                 s_stream);
+            void* d2h_ev = create_and_record_event(
+                src, compute::StreamId::kExpertFfn);
+            if (!d2h_ev) {
+                spdlog::error("LS_MOE_XTP_BOUNCE: event create failed on gpu "
+                              "{}", src);
+                return false;
+            }
+            bool ok = true;
+            for (int g : extras) {
+                if (g < 0 || static_cast<size_t>(g) >= moe_scratch_.size()
+                    || static_cast<size_t>(g)
+                           >= deps_.fused_moe_hidden_states.size()
+                    || !deps_.fused_moe_hidden_states[g]
+                    || static_cast<size_t>(g) >= deps_.device_backends.size()
+                    || !deps_.device_backends[g]) {
+                    spdlog::error("ep_xtp_broadcast: extra gpu {} has no MoE "
+                                  "hidden buffer", g);
+                    ok = false;
+                    break;
+                }
+                const auto& sg = moe_scratch_[g];
+                if (!sg.topk_weights || !sg.topk_indices) {
+                    spdlog::error("ep_xtp_broadcast: extra gpu {} scratch not "
+                                  "ready", g);
+                    ok = false;
+                    break;
+                }
+                auto* be_g = deps_.device_backends[g];
+                be_g->set_device();
+                deps_.stream_manager->wait_event(
+                    g, compute::StreamId::kExpertFfn, d2h_ev);
+                void* g_stream = deps_.stream_manager->stream(
+                    g, compute::StreamId::kExpertFfn);
+                be_g->memcpy_async(deps_.fused_moe_hidden_states[g], hb,
+                                   hidden_bytes, g_stream);
+                be_g->memcpy_async(sg.topk_weights, hb + off_w, topk_w_bytes,
+                                   g_stream);
+                be_g->memcpy_async(sg.topk_indices, hb + off_i, topk_i_bytes,
+                                   g_stream);
+                if (void* cev = create_and_record_event(
+                        g, compute::StreamId::kExpertFfn))
+                    cons.emplace_back(cev, g);
+            }
+            deps_.stream_manager->destroy_event(d2h_ev, src);
+            be_src->set_device();
+            return ok;
+        }
+    }
+
     for (int g : extras) {
         if (g < 0 || static_cast<size_t>(g) >= moe_scratch_.size()
             || static_cast<size_t>(g) >= deps_.fused_moe_hidden_states.size()

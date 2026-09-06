@@ -40,7 +40,8 @@ public:
                             bool& moe_valid, bool& return_early,
                             void* stream) override;
 
-    void residual_update(uint32_t gpu, void* hidden_input, void* add_src,
+    void residual_update(int layer_idx, uint32_t gpu,
+                         void* hidden_input, void* add_src,
                          int num_tokens, int hidden, int pair_idx,
                          void* stream) override;
 };

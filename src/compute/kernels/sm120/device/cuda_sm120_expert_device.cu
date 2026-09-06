@@ -6,6 +6,7 @@
 #include "compute/cuda_sm120_expert_device.h"
 #include "sm120/gemm/grouped_gemm.h"
 #include "sm120/gemm/gguf/gguf_grouped_gemm.h"
+#include "sm120/gemm/gguf/gguf_gemm_f32c.h"   // TD-GLM5-TP-COMBINE-PRECISION
 #include "smxx/activation/fused_swiglu.h"
 #include "smxx/permute/moe_permute.h"
 
@@ -16,6 +17,26 @@
 #include <memory>
 
 namespace layerstorm::compute {
+
+// Ordinal contract, third leg (TD-GGUF-ENUM-MXFP4-DIVERGENCE): the engine
+// GgufQuantType and the kernel GgufType MUST share the canonical value order
+// {Q2_K=0..Q8_0=5, MXFP4=6}. Pinned per-enumerator here (the kernel header
+// needs CUDA, so the CUDA-free bridge gguf_compute_cast.h cannot see it); a
+// kernel-side rename/reorder or a missing enumerator breaks THIS build, not
+// the numerics.
+#define LS_GGUF_KERNEL_ENUM_PIN(name)                                   \
+    static_assert(static_cast<int>(GgufQuantType::name) ==              \
+                      static_cast<int>(GgufType::name),                 \
+                  "engine GgufQuantType::" #name                        \
+                  " diverged from kernel GgufType::" #name)
+LS_GGUF_KERNEL_ENUM_PIN(Q2_K);
+LS_GGUF_KERNEL_ENUM_PIN(Q3_K);
+LS_GGUF_KERNEL_ENUM_PIN(Q4_K);
+LS_GGUF_KERNEL_ENUM_PIN(Q5_K);
+LS_GGUF_KERNEL_ENUM_PIN(Q6_K);
+LS_GGUF_KERNEL_ENUM_PIN(Q8_0);
+LS_GGUF_KERNEL_ENUM_PIN(MXFP4);
+#undef LS_GGUF_KERNEL_ENUM_PIN
 
 class CudaSm120ExpertDevice final : public ExpertDevice {
 public:
@@ -49,15 +70,46 @@ public:
 
     // GGUF grouped GEMM (quant_mode==2). Bridges the engine's POD params to the
     // kernel-side GgufGroupedGemmParams: the engine GgufQuantType and the kernel
-    // GgufType share the SAME canonical value order (Q2_K=0 .. Q8_0=5), and the
-    // engine GgufGemmStrategy mirrors the kernel GgufGroupedStrategy, so both map
-    // by value. The kernel runs a per-expert dispatch loop over the scattered
-    // ExpertCache B_ptrs (mmvq / mmq_mma / dequant by strategy + per-expert M).
+    // GgufType share the SAME canonical value order (Q2_K=0 .. MXFP4=6; pinned
+    // by the static_asserts above), and the engine GgufGemmStrategy mirrors the
+    // kernel GgufGroupedStrategy, so both map by value. The kernel runs a
+    // per-expert dispatch loop over the scattered ExpertCache B_ptrs
+    // (mmvq / mmq_mma / dequant by strategy + per-expert M).
     void gguf_grouped_gemm(
         const GgufGroupedGemmParams& params,
         void* workspace, size_t workspace_bytes,
         void* stream) override
     {
+        // TD-GLM5-TP-COMBINE-PRECISION: fp32-out dense/shared 1-expert
+        // partial. The call site knows the weight pointer on host (B0_host)
+        // and total_tokens, so this dispatches the SINGLE-expert f32c
+        // launchers directly — same strategy split and the grouped Auto
+        // M-crossover (avg_m > 8 -> mmq), no D2H of B_ptrs, no host sync.
+        if (params.d_fp32) {
+            if (params.num_experts != 1 || !params.B0_host
+                || params.total_tokens <= 0)
+                throw std::runtime_error(
+                    "gguf_grouped_gemm: d_fp32 requires the dense/shared "
+                    "1-expert shape (num_experts==1, B0_host, total_tokens)");
+            compute::GgufGemmF32cParams fp{};
+            fp.M = params.total_tokens;
+            fp.N = params.N;
+            fp.K = params.K;
+            fp.A = static_cast<const __nv_bfloat16*>(params.A_base);
+            fp.B = params.B0_host;
+            fp.C = static_cast<float*>(params.D_base);
+            fp.type = static_cast<GgufType>(static_cast<int>(params.type));
+            auto cs = static_cast<cudaStream_t>(stream);
+            if (params.strategy == GgufGemmStrategy::dequant) {
+                launch_gguf_dequant_gemm_f32c(fp, cs);
+            } else if (fp.M <= 8) {
+                launch_gguf_mmvq_f32c(fp, workspace, cs);
+            } else {
+                launch_gguf_mmq_mma_f32c(fp, workspace, cs);
+            }
+            return;
+        }
+
         compute::GgufGroupedGemmKernelParams kp{};
         kp.type        = static_cast<GgufType>(static_cast<int>(params.type));
         kp.strategy    = (params.strategy == GgufGemmStrategy::dequant)

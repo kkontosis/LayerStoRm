@@ -14,10 +14,18 @@
 
 #include <spdlog/spdlog.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -64,10 +72,55 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
     // KV at dcp >= 2 (round-robin cold owner) instead of one per rank.
     dedup_ = opts_.replica_cold_dedup && !sharded_ && R >= 2;
 
+    // S3 (tiering by slab): cross-layer per-step demotion deferral, gated
+    // on the slab geometry being known (see Options::pages_per_slab) and
+    // the ops kill switch.
+    {
+        const char* sd = std::getenv("LS_KVT_SLAB_DEMOTE");
+        slab_demote_ = opts_.pages_per_slab > 0 && !(sd && *sd == '0');
+        if (!opts_.slab_span_pages.empty()
+            && static_cast<int>(opts_.slab_span_pages.size()) != R) {
+            throw std::invalid_argument(
+                "KvTieringManager: slab_span_pages must be empty or have "
+                "dcp_size entries");
+        }
+        if (opts_.pages_per_slab > 0) {
+            spdlog::info("KvTiering: slab-cohort demotion {} "
+                         "(pages_per_slab={})",
+                         slab_demote_ ? "ON" : "OFF (LS_KVT_SLAB_DEMOTE=0)",
+                         opts_.pages_per_slab);
+        }
+    }
+
+    // TD-PREFIX-TIDY-COLD-SPILL: expand "~" and pick a boot-unique file
+    // nonce.  The directory itself is created lazily at the first spill.
+    if (!opts_.spill_dir.empty() && opts_.spill_max_bytes > 0) {
+        if (opts_.spill_dir[0] == '~') {
+            const char* home = std::getenv("HOME");
+            if (home && (opts_.spill_dir.size() == 1
+                         || opts_.spill_dir[1] == '/')) {
+                opts_.spill_dir = std::string(home)
+                    + opts_.spill_dir.substr(1);
+            }
+        }
+        spill_nonce_ =
+            (static_cast<uint64_t>(::getpid()) << 32)
+            ^ static_cast<uint64_t>(
+                  std::chrono::steady_clock::now().time_since_epoch()
+                      .count());
+        spdlog::info("KvTiering: holder cold-spill ON — dir '{}', cap "
+                     "{:.1f} GiB (TD-PREFIX-TIDY-COLD-SPILL)",
+                     opts_.spill_dir,
+                     static_cast<double>(opts_.spill_max_bytes)
+                         / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        opts_.spill_dir.clear();  // disabled: either knob unset
+    }
+
     hot_slots_ = opts_.hot_buffer_slots > 0 ? opts_.hot_buffer_slots
                                             : 2 * opts_.index_topk;
     retention_tokens_ = hot_slots_;
-    const int ITK = opts_.index_topk;
+    const int ITK = opts_.index_topk_rows();  // GF3.5: ROW capacity
     const int PS = opts_.page_size;
     n_fake_pages_ = (ITK + PS - 1) / PS;
     // Cold pool per rank: host_to_device_ratio × per-layer hot buffer,
@@ -112,10 +165,20 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
             || (l < static_cast<int>(opts_.indexer_full_layers.size())
                 && opts_.indexer_full_layers[static_cast<size_t>(l)]);
     };
+    // GF3.9: attention-type gating — non-KV-bearing (KDA) layers never
+    // participate in tiering: they are neither full layers nor countable
+    // shared successors (a lookahead prefetch over their empty/sentinel
+    // page lists would be walking layers that own no pages at all).
+    // Empty mask = all bearing = legacy byte-identical.
+    first_bearing_layer_ = 0;
     for (int l = 0; l < opts_.kv_layers; ++l) {
-        if (!layer_is_full(l)) continue;
+        if (layer_bears_kv(l)) { first_bearing_layer_ = l; break; }
+    }
+    for (int l = 0; l < opts_.kv_layers; ++l) {
+        if (!layer_bears_kv(l) || !layer_is_full(l)) continue;
         int c = 0;
-        for (int m = l + 1; m < opts_.kv_layers && !layer_is_full(m); ++m) ++c;
+        for (int m = l + 1; m < opts_.kv_layers && !layer_is_full(m); ++m)
+            if (layer_bears_kv(m)) ++c;
         share_succ_[static_cast<size_t>(l)] = c;
     }
 
@@ -187,9 +250,41 @@ KvTieringManager::KvTieringManager(Options opts) : opts_(std::move(opts)) {
                 CRMu * static_cast<size_t>(u_pages_cap_) * sizeof(int));
             if (!us.scratch || !us.cold_incoming || !us.dev_src_ptrs
                 || !rb.dev_uidx || !rb.dev_useq || !rb.dev_union_bt) {
+                // Fail LOUD with the arithmetic: the union staging is the
+                // one tiering buffer set that scales with
+                // serving.max_sequence_length (union_rows_max =
+                // min(cohort_rows_max x index_topk_rows, rank-local
+                // prefix)), so a long-context recipe can push it past what
+                // the box affords — the sizes must be in the message, not
+                // rediscovered by hand (TD-KVXP-FAT-KV-ARM redo, 2026-09-02).
+                const auto b = [](bool ok) { return ok ? "ok" : "FAILED"; };
+                const int cuda_err = be->peek_last_error();
                 throw std::runtime_error(
                     "KvTieringManager: union staging device_alloc failed "
-                    "(rank " + std::to_string(r) + ")");
+                    "(rank " + std::to_string(r) + ", cuda_err="
+                    + std::to_string(cuda_err) + "): union_rows="
+                    + std::to_string(union_cap_) + " fake_pages="
+                    + std::to_string(u_pages_cap_) + " cohort_rows="
+                    + std::to_string(CRMu) + " row_B=" + std::to_string(row)
+                    + " blk_B=" + std::to_string(blk)
+                    + " | scratch " + std::to_string(
+                        static_cast<size_t>(u_pages_cap_) * blk) + " B "
+                    + b(us.scratch != nullptr)
+                    + ", cold_incoming " + std::to_string(
+                        static_cast<size_t>(union_cap_) * row) + " B "
+                    + b(us.cold_incoming != nullptr)
+                    + ", src_ptrs " + std::to_string(
+                        static_cast<size_t>(union_cap_) * sizeof(void*))
+                    + " B " + b(us.dev_src_ptrs != nullptr)
+                    + ", uidx " + std::to_string(
+                        CRMu * static_cast<size_t>(ITK) * sizeof(int))
+                    + " B " + b(rb.dev_uidx != nullptr)
+                    + ", useq " + std::to_string(CRMu * sizeof(int)) + " B "
+                    + b(rb.dev_useq != nullptr)
+                    + ", union_bt " + std::to_string(
+                        CRMu * static_cast<size_t>(u_pages_cap_)
+                        * sizeof(int)) + " B "
+                    + b(rb.dev_union_bt != nullptr));
             }
             // Every cohort row shares the same identity fake pages: the
             // block table is CRMu replicated iota rows (row stride =
@@ -664,6 +759,9 @@ const void* KvTieringManager::cold_page_host_ptr(uint64_t seq_id, int layer,
 }
 
 void KvTieringManager::drain_demotions() {
+    // S3: a deferred batch must go out before the drain — callers rely on
+    // "drained" meaning every eligible page is HOT or COLD, never pending.
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
     for (int spin = 0; !inflight_.empty() && spin < 1000000; ++spin) {
         poll_demotions();
         if (!inflight_.empty()) std::this_thread::yield();
@@ -682,7 +780,23 @@ bool KvTieringManager::begin_layer(int layer, uint64_t seq_id,
                                    const int* const* host_block_tables,
                                    int rows) {
     poll_demotions();
+    // S3: the deferred demote batch flushes at a STEP BOUNDARY — a
+    // foreign sequence's dispatch, or a layer-0 dispatch arriving while
+    // the batch holds candidates from layers PAST 0 (the pass moved on,
+    // so a new layer-0 arrival is a NEW step/superchunk).  A batch whose
+    // newest candidates are still layer 0's is the same layer-outer
+    // superchunk pass — it keeps accumulating (flushing per sub-chunk
+    // fragments the slab runs).  Later layers of the current pass go
+    // through untouched.
+    if (slab_demote_ && !pend_.empty()
+        && (pend_seq_ != seq_id
+            || (layer == first_bearing_layer_
+                && pend_last_layer_ > first_bearing_layer_)))
+        flush_pending(/*fair_share=*/true);
     if (layer < 0 || layer >= opts_.kv_layers) return false;
+    // GF3.9: a KDA linear layer has no KV to tier — refuse the gate (the
+    // arch never calls it, this is belt-and-braces attention-type gating).
+    if (!layer_bears_kv(layer)) return false;
     // TD-KVT-ADMISSION-UPFRONT: a chunk cohort (rows > 1) writes
     // [token_pos, token_pos + rows) — legality below is checked against the
     // FIRST write position; the cohort staging must fit the rows.
@@ -728,28 +842,31 @@ bool KvTieringManager::begin_layer(int layer, uint64_t seq_id,
                 ? host_block_tables[r] : nullptr;
         return true;
     }
+    // INV-KVT-2 write legality, UNCONDITIONAL: this step's k_append
+    // REWRITES position token_pos (the slot mapping targets its page), so
+    // it is legal only while every position at/after token_pos is HOT
+    // (demoted_frontier <= token_pos); [0, token_pos) is the immutable
+    // cold prefix (TD-KVT-SPEC).  Historically only a REWIND
+    // (token_pos + 1 < max_pos_seen) could reach a frontier above the
+    // write position, but an R4a TRUNCATED fork child legitimately starts
+    // with max_pos_seen == prefix_len BELOW a cold straddling page's
+    // frontier — a plain first append there is the same neutralized-handle
+    // write hazard, so the guard must not key off rewind classification.
+    // The dispatcher lifts both cases BEFORE the step (repromote_for_rewind
+    // pre-kv-meta hook; fork-time straddle re-promotion) — reaching this
+    // throw means that hook did not run or failed (INV-KVT-2 fail-loud,
+    // TD-KVT-SPEC-FORK).
+    if (ss.demoted_frontier > token_pos) {
+        throw std::runtime_error(
+            "KvTiering: step writing pos " + std::to_string(token_pos)
+            + " (seen " + std::to_string(ss.max_pos_seen)
+            + ") reaches demoted territory (frontier "
+            + std::to_string(ss.demoted_frontier)
+            + ") without cold-page re-promotion "
+              "(TD-KVT-SPEC-FORK / INV-KVT-2)");
+    }
     if (token_pos + 1 < ss.max_pos_seen) {
-        // Rollback/rewind (speculation truncation).  TD-KVT-SPEC: cold rows
-        // are immutable PREFIX content.  This step's k_append REWRITES
-        // position token_pos (slot mapping targets its page), so the rewind
-        // is legal only while every position at/after token_pos is HOT
-        // (demoted_frontier <= token_pos); [0, token_pos) is the kept
-        // prefix.  Rewinding INTO demoted territory needs cold-page
-        // re-promotion FIRST — the dispatcher runs repromote_for_rewind()
-        // BEFORE the kv-meta build so this step's block tables / slot
-        // mappings already carry the fresh VRAM handles.  Reaching this
-        // guard with a frontier above token_pos means that hook did not run
-        // or failed — fail loudly rather than score stale KV or write
-        // through a neutralized handle (INV-KVT-2, TD-KVT-SPEC-FORK).
-        if (ss.demoted_frontier > token_pos) {
-            throw std::runtime_error(
-                "KvTiering: sequence rewind (pos " + std::to_string(token_pos)
-                + " < seen " + std::to_string(ss.max_pos_seen)
-                + ") reaches demoted territory (frontier "
-                + std::to_string(ss.demoted_frontier)
-                + ") without cold-page re-promotion "
-                  "(TD-KVT-SPEC-FORK / INV-KVT-2)");
-        }
+        // Rollback/rewind (speculation truncation) over the hot suffix.
         ss.max_pos_seen = token_pos + 1;  // demoted prefix intact — safe
     }
     ss.max_pos_seen = std::max(
@@ -769,8 +886,407 @@ void KvTieringManager::after_attention(int layer, uint64_t seq_id,
                                        uint32_t token_pos,
                                        const memory::PageHandle* pages,
                                        int num_logical, int handle_stride) {
-    if (layer < 0 || layer >= opts_.kv_layers || !pages) return;
-    if (layer_dense_[static_cast<size_t>(layer)]) return;  // sticky-dense
+    // GF3.9: attention-type gating twin of begin_layer's.
+    if (!layer_bears_kv(layer)) return;
+    const int PS = opts_.page_size;
+    // Window demotion: pages fully behind the retention window, never the
+    // append frontier.
+    const int64_t demote_end =
+        static_cast<int64_t>(token_pos) + 1 - retention_tokens_;
+    const int frontier = static_cast<int>(token_pos) / PS;
+    if (!slab_demote_) {
+        // Legacy per-call demotion (unslabbed models / kill switch).
+        demote_layer_range(layer, seq_id, pages, num_logical, handle_stride,
+                           demote_end, frontier);
+        return;
+    }
+    // S3 slab-cohort demotion: DEFER this layer's candidates; the batch
+    // flushes at the NEXT STEP BOUNDARY (begin_layer's trigger), so all
+    // layers of the behind-window token range demote together — under the
+    // S2 position-major packing exactly a run of complete slabs, one
+    // contiguous D2H per run instead of one per page.  There is
+    // deliberately NO in-step flush at the last kv layer: the superchunk
+    // executor walks LAYER-OUTER over sub-chunks, so at (last, c0) the
+    // last layer's later sub-chunks are still outstanding and an early
+    // flush punches a stride-kv_layers hole into every cohort (measured
+    // 25.8 pages/run vs slab-sized on the champion ladder).  Deferral is
+    // safe: a pending page stays HOT (state unchanged) and every
+    // state-mutating entry point (fork/free/repromote/pressure/hibernate/
+    // drain) flushes or discards first — demotion lands at most one
+    // DISPATCH later than the pre-S3 per-layer sweep.
+    collect_layer_range(layer, seq_id, pages, num_logical, handle_stride,
+                        demote_end, frontier);
+}
+
+int KvTieringManager::hibernate_layer(int layer, uint64_t seq_id,
+                                      const memory::PageHandle* pages,
+                                      int num_logical, int handle_stride,
+                                      int frontier_logical) {
+    // R3 holder hibernation (TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE): a
+    // FROZEN sequence never steps, so the window demotion above never runs
+    // for it.  Demote everything STRICTLY BELOW frontier_logical (the
+    // caller passes the holder's coverage-end page kv_len/page_size —
+    // INV-KVT-4's frontier rule generalized: the write-frontier page and
+    // the parent's over-allocated pages beyond it stay hot so a later
+    // fork's CoW split and the hit-child's first k_append stay on the
+    // proven hot path; -1 = keep only the last allocated logical page,
+    // the pre-kv_len fallback used by unit fixtures).  Same body as
+    // window demotion — stream-ordered D2H, refcount-aware free (a page the
+    // live parent still holds hot stays resident until the parent's own
+    // demotion/free drops the last ref), pool-capacity fail-safe.
+    const int PS = opts_.page_size;
+    // Mark the sequence hibernated FIRST — the fair-share census must
+    // exclude it from nseq_cold even when nothing is eligible below.
+    {
+        auto [sit, inserted] = seqs_.try_emplace(seq_id);
+        if (inserted)
+            sit->second.pages.assign(static_cast<size_t>(opts_.kv_layers),
+                                     {});
+        sit->second.hibernated = true;
+    }
+    // fair_share=false: the per-seq cold cap exists to stop one LIVE
+    // sequence monopolizing the shared pool, and it counts fork-family
+    // holders as independent sequences — a chained holder's INHERITED
+    // refcounted slots already exceed capacity/nseq, so the cap would
+    // veto exactly the deep holders hibernation exists for.  Hibernated
+    // cold usage is bounded by holder EVICTION (the prefix cache's own
+    // budget), and pool exhaustion still fail-safes (pages stay hot).
+    const int frontier = frontier_logical >= 0
+        ? std::min(frontier_logical, num_logical - 1)
+        : num_logical - 1;
+    return demote_layer_range(layer, seq_id, pages, num_logical,
+                              handle_stride,
+                              static_cast<int64_t>(num_logical) * PS,
+                              frontier, /*fair_share=*/false);
+}
+
+namespace {
+/// mkdir -p for the spill directory (each component, 0700).
+bool mkdir_p(const std::string& dir) {
+    std::string cur;
+    for (size_t i = 0; i <= dir.size(); ++i) {
+        if (i < dir.size() && dir[i] != '/') { cur += dir[i]; continue; }
+        if (i < dir.size()) cur += '/';
+        if (cur.empty() || cur == "/") continue;
+        if (::mkdir(cur.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool KvTieringManager::seq_spilled(uint64_t seq_id) const {
+    const SeqState* ss = find_seq(seq_id);
+    if (!ss) return false;
+    return !ss->spill_path.empty();
+}
+
+int KvTieringManager::spill_seq(uint64_t seq_id) {
+    if (opts_.spill_dir.empty() || spill_disabled_) return 0;
+    SeqState* ss = find_seq(seq_id);
+    if (!ss || !ss->hibernated) return 0;      // live sequences never spill
+    if (!ss->spill_path.empty()) return 0;     // already spilled
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
+    if (ss->inflight > 0) drain_demotions();   // cold set must be settled
+
+    // Collect the cold set POSITION-MAJOR (logical outer, layer inner) so
+    // the file is sequential in the same order unspill reloads it.
+    struct Item { int layer; int logical; };
+    std::vector<Item> items;
+    size_t max_logical = 0;
+    for (const auto& lv : ss->pages)
+        max_logical = std::max(max_logical, lv.size());
+    for (size_t j = 0; j < max_logical; ++j)
+        for (int l = 0; l < static_cast<int>(ss->pages.size()); ++l) {
+            const auto& lv = ss->pages[static_cast<size_t>(l)];
+            if (j < lv.size() && lv[j].state == PageState::kCold)
+                items.push_back(Item{l, static_cast<int>(j)});
+        }
+    if (items.empty()) return 0;
+
+    const int64_t blk = opts_.stride_block;
+    const int64_t projected = static_cast<int64_t>(items.size()) * blk;
+    // MANDATORY byte cap, enforced BEFORE the write.
+    if (spilled_total_ + projected > opts_.spill_max_bytes) {
+        ++stats_.spill_cap_refusals;
+        spdlog::info("KvTiering: spill of seq {} REFUSED by the byte cap "
+                     "({} + {} > {} B) — caller may evict spilled holders "
+                     "and retry", seq_id, spilled_total_, projected,
+                     opts_.spill_max_bytes);
+        return -1;
+    }
+
+    if (!mkdir_p(opts_.spill_dir)) {
+        spill_disabled_ = true;
+        spdlog::error("KvTiering: cannot create spill dir '{}' ({}) — "
+                      "holder cold-spill DISABLED for this boot",
+                      opts_.spill_dir, std::strerror(errno));
+        return 0;
+    }
+    const std::string path = opts_.spill_dir + "/ls-spill-"
+        + std::to_string(spill_nonce_) + "-seq" + std::to_string(seq_id)
+        + ".kvspill";
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        spill_disabled_ = true;
+        spdlog::error("KvTiering: cannot create spill file '{}' ({}) — "
+                      "holder cold-spill DISABLED for this boot", path,
+                      std::strerror(errno));
+        return 0;
+    }
+    // ONE copy per page: replicas are byte-identical (INV-KV-REP), so the
+    // source is the dedup/shard owner's slot, rank 0's otherwise — the
+    // same rule as cold_page_host_ptr / the snapshot path.
+    int64_t off = 0;
+    bool io_ok = true;
+    for (const auto& it : items) {
+        auto& pst = ss->pages[static_cast<size_t>(it.layer)]
+                             [static_cast<size_t>(it.logical)];
+        const int owner = cold_owner_rank(it.logical);
+        const int src_rank = owner >= 0 ? owner : 0;
+        const int slot = src_rank < static_cast<int>(pst.cold_slot.size())
+            ? pst.cold_slot[static_cast<size_t>(src_rank)] : -1;
+        if (slot < 0) {
+            throw std::runtime_error(
+                "KvTiering: cold page without a source slot at spill "
+                "(layer " + std::to_string(it.layer) + ", logical "
+                + std::to_string(it.logical) + ")");
+        }
+        const char* src = ranks_[static_cast<size_t>(src_rank)].cold_base
+            + static_cast<int64_t>(slot) * blk;
+        if (::pwrite(fd, src, static_cast<size_t>(blk), off)
+            != static_cast<ssize_t>(blk)) {
+            io_ok = false;
+            break;
+        }
+        pst.spill_off = off;  // committed only if the whole file lands
+        off += blk;
+    }
+    ::close(fd);
+    if (!io_ok) {
+        ::unlink(path.c_str());
+        for (const auto& it : items)
+            ss->pages[static_cast<size_t>(it.layer)]
+                     [static_cast<size_t>(it.logical)].spill_off = -1;
+        spill_disabled_ = true;
+        spdlog::error("KvTiering: spill write to '{}' failed ({}) — file "
+                      "removed, slots kept (pages stay COLD), holder "
+                      "cold-spill DISABLED for this boot", path,
+                      std::strerror(errno));
+        return 0;
+    }
+
+    // Whole file landed: release every cold slot (fork-family refcounts —
+    // a shared slot survives for its other holders and frees no RAM) and
+    // flip the pages kSpilled.  demoted_or_inflight / demoted_frontier
+    // stay: the positions remain demoted, only the tier moved.
+    for (const auto& it : items) {
+        auto& pst = ss->pages[static_cast<size_t>(it.layer)]
+                             [static_cast<size_t>(it.logical)];
+        for (int r = 0; r < static_cast<int>(pst.cold_slot.size()); ++r) {
+            const int sl = pst.cold_slot[static_cast<size_t>(r)];
+            if (sl < 0) continue;
+            release_cold_slot(r, sl);
+            if (r < static_cast<int>(ss->cold_used.size())
+                && ss->cold_used[static_cast<size_t>(r)] > 0)
+                --ss->cold_used[static_cast<size_t>(r)];
+        }
+        pst.cold_slot.clear();
+        pst.state = PageState::kSpilled;
+    }
+    ss->spill_path = path;
+    ss->spill_bytes = off;
+    spilled_total_ += off;
+    stats_.spill_files += 1;
+    stats_.spill_pages += items.size();
+    stats_.spill_bytes += static_cast<uint64_t>(off);
+    spdlog::info("KvTiering: spilled seq {} — {} cold pages, {:.1f} MiB → "
+                 "'{}' (live spill total {:.1f} MiB) "
+                 "[TD-PREFIX-TIDY-COLD-SPILL]",
+                 seq_id, items.size(),
+                 static_cast<double>(off) / (1024.0 * 1024.0), path,
+                 static_cast<double>(spilled_total_) / (1024.0 * 1024.0));
+    return static_cast<int>(items.size());
+}
+
+bool KvTieringManager::unspill_seq(uint64_t seq_id) {
+    SeqState* ss = find_seq(seq_id);
+    if (!ss || ss->spill_path.empty()) return true;  // nothing spilled
+    const int fd = ::open(ss->spill_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        spdlog::error("KvTiering: unspill of seq {} cannot open '{}' ({}) "
+                      "— holder data lost; caller must treat as evicted",
+                      seq_id, ss->spill_path, std::strerror(errno));
+        return false;
+    }
+    const int64_t blk = opts_.stride_block;
+    const int R = static_cast<int>(ranks_.size());
+    bool ok = true;
+    int reloaded = 0;
+    int64_t reloaded_bytes = 0;
+    for (size_t l = 0; ok && l < ss->pages.size(); ++l) {
+        auto& lv = ss->pages[l];
+        for (size_t j = 0; ok && j < lv.size(); ++j) {
+            auto& pst = lv[j];
+            if (pst.state != PageState::kSpilled) continue;
+            // Storing-rank rule as at demotion; fair-share-cap exempt
+            // (holder reload, like hibernation).
+            const int owner = cold_owner_rank(static_cast<int>(j));
+            const int s_begin = owner >= 0 ? owner : 0;
+            const int s_end = owner >= 0 ? owner + 1 : R;
+            std::vector<int> slots(static_cast<size_t>(R), -1);
+            bool got = true;
+            for (int r = s_begin; r < s_end; ++r) {
+                if (ranks_[r].cold_free.empty()) { got = false; break; }
+                slots[r] = ranks_[r].cold_free.back();
+                ranks_[r].cold_free.pop_back();
+                ranks_[r].cold_ref[static_cast<size_t>(slots[r])] = 1;
+            }
+            if (!got) {
+                for (int r = s_begin; r < s_end; ++r)
+                    if (slots[r] >= 0) {
+                        ranks_[r].cold_ref[static_cast<size_t>(slots[r])]
+                            = 0;
+                        ranks_[r].cold_free.push_back(slots[r]);
+                    }
+                ok = false;  // partial progress kept; caller retries
+                break;
+            }
+            // Read the single file copy into the FIRST storing rank's
+            // slot, then fan out host-side (replicated non-dedup).
+            char* first = ranks_[static_cast<size_t>(s_begin)].cold_base
+                + static_cast<int64_t>(slots[s_begin]) * blk;
+            if (::pread(fd, first, static_cast<size_t>(blk), pst.spill_off)
+                != static_cast<ssize_t>(blk)) {
+                for (int r = s_begin; r < s_end; ++r) {
+                    ranks_[r].cold_ref[static_cast<size_t>(slots[r])] = 0;
+                    ranks_[r].cold_free.push_back(slots[r]);
+                    ranks_[r].cold_free_dirty = true;
+                }
+                spdlog::error("KvTiering: unspill read failed for seq {} "
+                              "(layer {}, logical {}) from '{}' ({})",
+                              seq_id, l, j, ss->spill_path,
+                              std::strerror(errno));
+                ok = false;
+                break;
+            }
+            for (int r = s_begin + 1; r < s_end; ++r)
+                std::memcpy(ranks_[static_cast<size_t>(r)].cold_base
+                                + static_cast<int64_t>(slots[r]) * blk,
+                            first, static_cast<size_t>(blk));
+            for (int r = s_begin; r < s_end; ++r)
+                if (slots[r] >= 0
+                    && r < static_cast<int>(ss->cold_used.size()))
+                    ++ss->cold_used[static_cast<size_t>(r)];
+            pst.cold_slot = std::move(slots);
+            pst.state = PageState::kCold;
+            pst.spill_off = -1;
+            ++reloaded;
+            reloaded_bytes += blk;
+        }
+    }
+    ::close(fd);
+    stats_.unspill_pages += static_cast<uint64_t>(reloaded);
+    stats_.unspill_bytes += static_cast<uint64_t>(reloaded_bytes);
+    if (ok) {
+        ::unlink(ss->spill_path.c_str());
+        spilled_total_ -= ss->spill_bytes;
+        spdlog::info("KvTiering: unspilled seq {} — {} pages, {:.1f} MiB "
+                     "reloaded from '{}' [TD-PREFIX-TIDY-COLD-SPILL]",
+                     seq_id, reloaded,
+                     static_cast<double>(reloaded_bytes)
+                         / (1024.0 * 1024.0),
+                     ss->spill_path);
+        ss->spill_path.clear();
+        ss->spill_bytes = 0;
+        return true;
+    }
+    // Partial: keep the file; the bytes still on disk stay accounted.
+    spdlog::warn("KvTiering: unspill of seq {} INCOMPLETE ({} pages "
+                 "reloaded; cold pool exhausted or I/O error) — retryable",
+                 seq_id, reloaded);
+    return false;
+}
+
+int KvTieringManager::hibernate_seq(uint64_t seq_id,
+                                    const memory::PageHandle* pages,
+                                    int num_logical, int frontier_logical) {
+    // S3: whole-sequence hibernation — the per-layer hibernate_layer sweep
+    // collected into ONE slab-grouped flush, so a holder's cold token
+    // range leaves as contiguous slab runs (position-major packing) under
+    // one attention-order fence.  Demote set and frontier rule are
+    // IDENTICAL to looping hibernate_layer over every layer.
+    {
+        auto [sit, inserted] = seqs_.try_emplace(seq_id);
+        if (inserted)
+            sit->second.pages.assign(static_cast<size_t>(opts_.kv_layers),
+                                     {});
+        sit->second.hibernated = true;
+    }
+    if (!pages || num_logical <= 0) return 0;
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
+    const int PS = opts_.page_size;
+    const int L = opts_.kv_layers;
+    const int frontier = frontier_logical >= 0
+        ? std::min(frontier_logical, num_logical - 1)
+        : num_logical - 1;
+    for (int l = 0; l < L; ++l)
+        collect_layer_range(l, seq_id, pages + l, num_logical, L,
+                            static_cast<int64_t>(num_logical) * PS, frontier);
+    return flush_pending(/*fair_share=*/false);
+}
+
+int KvTieringManager::pressure_demote(uint64_t seq_id,
+                                      const memory::PageHandle* pages,
+                                      int num_logical) {
+    // TD-KVT-COLD-FULL-HOT-WEDGE: out-of-step re-run of the window sweep for
+    // every layer at the sequence's high-water position.  Only pages fully
+    // behind the retention window and strictly below the append-frontier
+    // page are eligible (INV-KVT-4 unchanged — the collect predicate
+    // enforces both), so this can never demote a page the next step writes;
+    // the fair-share cap stays live (fair_share=true).  Hibernated holders
+    // have nothing eligible left and their frontier must stay hot — skip.
+    // S3: any deferred in-step batch is flushed FIRST (with its own window
+    // fair-share semantics), then all layers' backlog goes out as one
+    // slab-grouped flush.
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
+    const SeqState* ss = find_seq(seq_id);
+    if (!ss || ss->hibernated || !pages || num_logical <= 0) return 0;
+    if (ss->max_pos_seen == 0) return 0;  // never stepped — no backlog
+    const uint32_t pos = ss->max_pos_seen - 1;  // highest written position
+    const int L = opts_.kv_layers;
+    for (int l = 0; l < L; ++l)
+        collect_layer_range(
+            l, seq_id, pages + l, num_logical, L,
+            static_cast<int64_t>(pos) + 1 - retention_tokens_,
+            static_cast<int>(pos) / opts_.page_size);
+    const int enq = flush_pending(/*fair_share=*/true);
+    stats_.pressure_demoted += static_cast<uint64_t>(enq);
+    return enq;
+}
+
+int KvTieringManager::demote_layer_range(int layer, uint64_t seq_id,
+                                         const memory::PageHandle* pages,
+                                         int num_logical, int handle_stride,
+                                         int64_t demote_end_tok,
+                                         int frontier, bool fair_share) {
+    const int n = collect_layer_range(layer, seq_id, pages, num_logical,
+                                      handle_stride, demote_end_tok,
+                                      frontier);
+    if (n == 0 && pend_.empty()) return 0;
+    return flush_pending(fair_share);
+}
+
+int KvTieringManager::collect_layer_range(int layer, uint64_t seq_id,
+                                          const memory::PageHandle* pages,
+                                          int num_logical, int handle_stride,
+                                          int64_t demote_end_tok,
+                                          int frontier) {
+    if (layer < 0 || layer >= opts_.kv_layers || !pages) return 0;
+    if (layer_dense_[static_cast<size_t>(layer)]) return 0;  // sticky-dense
+    // One batch, one sequence: a foreign pending tail flushes first (its
+    // step is over — interleaved B==1 traffic).
+    if (!pend_.empty() && pend_seq_ != seq_id)
+        flush_pending(/*fair_share=*/true);
     auto [sit, inserted] = seqs_.try_emplace(seq_id);
     SeqState& ss = sit->second;
     if (inserted)
@@ -780,75 +1296,134 @@ void KvTieringManager::after_attention(int layer, uint64_t seq_id,
     auto& ls = ss.pages[static_cast<size_t>(layer)];
 
     const int PS = opts_.page_size;
-    const int64_t demote_end_tok =
-        static_cast<int64_t>(token_pos) + 1 - retention_tokens_;
-    const int frontier = static_cast<int>(token_pos) / PS;
+    int collected = 0;
+    for (int j = 0; j < num_logical && j < static_cast<int>(ls.size()); ++j) {
+        if (static_cast<int64_t>(j + 1) * PS > demote_end_tok) break;
+        if (j >= frontier) break;  // never demote the append frontier page
+        auto& pst = ls[static_cast<size_t>(j)];
+        if (pst.state != PageState::kHot || pst.pending_demote) continue;
+        const memory::PageHandle& h =
+            pages[static_cast<size_t>(j) * handle_stride];
+        if (h.page_idx < 0 || !h.gpu_ptr) continue;
+        pst.pending_demote = true;
+        pend_.push_back(PendingDemote{layer, j, h});
+        ++collected;
+    }
+    if (collected > 0) {
+        pend_seq_ = seq_id;
+        pend_last_layer_ = layer;
+    }
+    return collected;
+}
+
+int KvTieringManager::flush_pending(bool fair_share) {
+    if (pend_.empty()) return 0;
+    const uint64_t seq_id = pend_seq_;
+    SeqState* ssp = find_seq(seq_id);
+    if (!ssp) {  // sequence vanished (defensive; discard_pending covers it)
+        pend_.clear();
+        return 0;
+    }
+    SeqState& ss = *ssp;
+    const int PS = opts_.page_size;
     const int R = static_cast<int>(ranks_.size());
 
     // TD-KVT-BATCH cold fair-share: with N demoting sequences, cap this
     // sequence's per-rank cold slots at capacity / N — one sequence can
     // never monopolize the shared pool.  Over-cap demotions are skipped
     // (fail-safe: pages stay hot), placement-only.  A single demoting
-    // sequence keeps the full pool (Phase-1 behavior).  Existing over-cap
-    // holders keep their slots (no reclaim without re-promotion); the cap
-    // only gates NEW demotions.
+    // sequence keeps the full pool.  Existing over-cap holders keep their
+    // slots (no reclaim without re-promotion); the cap only gates NEW
+    // demotions.
     int nseq_cold = 0;
     for (const auto& [q, s2] : seqs_)
-        if (s2.demoted_or_inflight > 0 || q == seq_id) ++nseq_cold;
-    const int cold_cap = nseq_cold > 1
+        if ((s2.demoted_or_inflight > 0 || q == seq_id) && !s2.hibernated)
+            ++nseq_cold;
+    nseq_cold = std::max(nseq_cold, 1);
+    const int cold_cap = !fair_share ? cold_pool_pages_
+        : nseq_cold > 1
         ? std::max(cold_pool_pages_ / nseq_cold, 1)
         : cold_pool_pages_;
     if (static_cast<int>(ss.cold_used.size()) < R)
         ss.cold_used.resize(static_cast<size_t>(R), 0);
 
-    InflightDemotion group;
-    group.seq = seq_id;
-    std::vector<uint8_t> order_recorded(static_cast<size_t>(R), 0);
-    std::vector<uint8_t> participated(static_cast<size_t>(R), 0);
-    for (int j = 0; j < num_logical && j < static_cast<int>(ls.size()); ++j) {
-        if (static_cast<int64_t>(j + 1) * PS > demote_end_tok) break;
-        if (j >= frontier) break;  // never demote the append frontier page
-        auto& pst = ls[static_cast<size_t>(j)];
-        if (pst.state != PageState::kHot) continue;
-        const memory::PageHandle& h =
-            pages[static_cast<size_t>(j) * handle_stride];
-        if (h.page_idx < 0 || !h.gpu_ptr) continue;
+    // S3: sort by (storing owner, physical page index) so the physically
+    // contiguous position-major cohorts (INV-SLAB-2) come out as single
+    // D2H runs below.  Owner-major keeps dedup/sharded round-robin pages
+    // from interleaving into runs they cannot share.
+    std::stable_sort(
+        pend_.begin(), pend_.end(),
+        [this](const PendingDemote& a, const PendingDemote& b) {
+            const int oa = cold_owner_rank(a.logical);
+            const int ob = cold_owner_rank(b.logical);
+            if (oa != ob) return oa < ob;
+            return a.handle.page_idx < b.handle.page_idx;
+        });
+
+    // Keep the cold free lists sorted DESCENDING (pops hand out ascending
+    // slot runs — contiguous destinations for the coalesced copies).  Only
+    // re-sorted after out-of-order releases (teardown / re-promotion).
+    for (auto& rb : ranks_) {
+        if (rb.cold_free_dirty) {
+            std::sort(rb.cold_free.begin(), rb.cold_free.end(),
+                      std::greater<int>());
+            rb.cold_free_dirty = false;
+        }
+    }
+
+    // Phase 1 — per-page cold-slot acquisition (all-or-nothing per page,
+    // exactly the pre-S3 rules: budget skip continues, pool exhaustion
+    // fail-safes the batch tail — pages stay hot, TD-KVT-COLD-FULL-HOT-
+    // WEDGE recovers out of step).
+    struct Accepted {
+        int layer;
+        int logical;
+        int owner;
+        memory::PageHandle handle;
+        std::vector<int> slots;
+    };
+    std::vector<Accepted> acc;
+    acc.reserve(pend_.size());
+    bool pool_full = false;
+    for (auto& pd : pend_) {
+        auto& lv = ss.pages[static_cast<size_t>(pd.layer)];
+        if (pd.logical >= static_cast<int>(lv.size())) continue;
+        auto& pst = lv[static_cast<size_t>(pd.logical)];
+        pst.pending_demote = false;
+        if (pool_full) continue;              // fail-safe: stays hot
+        if (pst.state != PageState::kHot) continue;  // belt + braces
 
         // STORING ranks (cold slot + D2H copy): every rank under replicated
         // non-dedup KV; ONLY the round-robin cold owner under replicated
         // dedup (TD-KVT-REPLICA-COLD-DEDUP, INV-KVT-11 — replicas are
         // byte-identical, one copy suffices); ONLY the chunk owner under
         // sharded KV (INV-4.9e — the page physically exists on that rank's
-        // GPU alone).  FENCING ranks (completion event before the free):
-        // every rank whose VRAM replica the free releases — under dedup the
-        // non-storing ranks still fence behind their attention streams so
-        // in-flight reads of their replica never outlive the free.
-        const int owner = cold_owner_rank(j);
+        // GPU alone).
+        const int owner = cold_owner_rank(pd.logical);
         int s_begin = 0;
         int s_end = R;
         if (owner >= 0) {
             if (sharded_
-                && h.gpu_idx
+                && pd.handle.gpu_idx
                        != opts_.gpus[static_cast<size_t>(owner)].position) {
                 // Ownership sanity: the handle's GPU must be the owner
                 // rank's (allocation routed by the same rule) — never D2H
                 // from a pool the page does not live in.
                 throw std::runtime_error(
                     "KvTiering: sharded page ownership mismatch (layer "
-                    + std::to_string(layer) + ", logical " + std::to_string(j)
-                    + ": handle gpu " + std::to_string(h.gpu_idx)
-                    + " != owner rank " + std::to_string(owner) + " gpu "
+                    + std::to_string(pd.layer) + ", logical "
+                    + std::to_string(pd.logical) + ": handle gpu "
+                    + std::to_string(pd.handle.gpu_idx) + " != owner rank "
+                    + std::to_string(owner) + " gpu "
                     + std::to_string(opts_.gpus[owner].position) + ")");
             }
             s_begin = owner;
             s_end = owner + 1;
         }
-        const int f_begin = sharded_ ? s_begin : 0;
-        const int f_end = sharded_ ? s_end : R;
 
-        // Per-seq cold fair-share cap (storing ranks only).  `continue`, not
-        // `break`: under dedup/sharded the next page's storing rank differs
-        // (round-robin) and may still have budget headroom.
+        // Per-seq cold fair-share cap (storing ranks only).  `continue`,
+        // not `break`: under dedup/sharded the next page's storing rank
+        // differs (round-robin) and may still have budget headroom.
         bool over_budget = false;
         for (int r = s_begin; r < s_end; ++r)
             if (ss.cold_used[static_cast<size_t>(r)] >= cold_cap)
@@ -874,67 +1449,174 @@ void KvTieringManager::after_attention(int layer, uint64_t seq_id,
                     ranks_[r].cold_ref[static_cast<size_t>(slots[r])] = 0;
                     ranks_[r].cold_free.push_back(slots[r]);
                 }
+            ++stats_.cold_full_skips;
             if (!cold_pool_full_warned_) {
                 cold_pool_full_warned_ = true;
-                spdlog::warn("KvTiering: cold pool full — further demotions "
-                             "skipped (pages stay hot; raise "
-                             "host_to_device_ratio)");
+                spdlog::warn("KvTiering: cold pool full — demotions skipped "
+                             "in-step (pages stay hot; the hot backlog is "
+                             "recovered out-of-step by the kMain-pressure "
+                             "sweep + holder eviction, "
+                             "TD-KVT-COLD-FULL-HOT-WEDGE)");
             }
-            break;
-        }
-
-        for (int r = f_begin; r < f_end; ++r) {
-            auto* be = backend(r);
-            be->set_device();
-            auto& rb = ranks_[r];
-            if (!order_recorded[static_cast<size_t>(r)]
-                && opts_.stream_manager) {
-                // All prior attention-stream work (k_append writes, this
-                // layer's reads) must precede the D2H reads on storing
-                // ranks AND the page free on fence-only ranks (dedup).
-                const int gpu_pos = opts_.gpus[r].position;
-                opts_.stream_manager->record_event(
-                    rb.ev_attn_order, gpu_pos, compute::StreamId::kAttention);
-                be->stream_wait_event(rb.d2h_stream, rb.ev_attn_order);
-            }
-            order_recorded[static_cast<size_t>(r)] = 1;
-            participated[static_cast<size_t>(r)] = 1;
-            if (slots[r] < 0) continue;  // fence-only rank (dedup non-owner)
-            const char* src = static_cast<const char*>(opts_.kv_main_bases[r])
-                + static_cast<int64_t>(h.page_idx) * opts_.stride_block;
-            char* dst = rb.cold_base
-                + static_cast<int64_t>(slots[r]) * opts_.stride_block;
-            be->memcpy_d2h_async(dst, src,
-                                 static_cast<size_t>(opts_.stride_block),
-                                 rb.d2h_stream);
+            pool_full = true;
+            continue;
         }
 
         for (int r = s_begin; r < s_end; ++r)
             ++ss.cold_used[static_cast<size_t>(r)];
+        acc.push_back(Accepted{pd.layer, pd.logical, owner, pd.handle,
+                               std::move(slots)});
+    }
+    pend_.clear();
+    if (acc.empty()) return 0;
+
+    // Phase 2 — issue the D2H as physically-contiguous runs.  A run
+    // extends while the source page indices are consecutive (same storing
+    // owner, never across the slab-span boundary — a LOOSE page lives in a
+    // different physical region) AND every storing rank's cold slots are
+    // consecutive.  Under the S2 position-major packing a fully-cold token
+    // range is exactly a run of complete slabs, so the common case is one
+    // memcpy per slab run instead of one per page; a fragmented pool
+    // degrades gracefully to per-page copies.
+    const auto span_of = [this](int owner) {
+        if (opts_.slab_span_pages.empty()) return INT32_MAX;
+        if (owner >= 0) return opts_.slab_span_pages[owner];
+        int m = INT32_MAX;
+        for (int v : opts_.slab_span_pages) m = std::min(m, v);
+        return m;
+    };
+    const auto chains = [&](const Accepted& a, const Accepted& b) {
+        if (a.owner != b.owner) return false;
+        if (b.handle.page_idx != a.handle.page_idx + 1) return false;
+        const int span = span_of(a.owner);
+        if ((a.handle.page_idx < span) != (b.handle.page_idx < span))
+            return false;  // never coalesce across the slab/loose boundary
+        const int s_begin = a.owner >= 0 ? a.owner : 0;
+        const int s_end = a.owner >= 0 ? a.owner + 1 : R;
+        for (int r = s_begin; r < s_end; ++r)
+            if (b.slots[static_cast<size_t>(r)]
+                != a.slots[static_cast<size_t>(r)] + 1)
+                return false;
+        return true;
+    };
+
+    InflightDemotion group;
+    group.seq = seq_id;
+    std::vector<uint8_t> order_recorded(static_cast<size_t>(R), 0);
+    std::vector<uint8_t> participated(static_cast<size_t>(R), 0);
+    const auto fence_rank = [&](int r) {
+        participated[static_cast<size_t>(r)] = 1;
+        if (order_recorded[static_cast<size_t>(r)]) return;
+        order_recorded[static_cast<size_t>(r)] = 1;
+        if (!opts_.stream_manager) return;
+        auto* be = backend(r);
+        be->set_device();
+        auto& rb = ranks_[static_cast<size_t>(r)];
+        // All prior attention-stream work (k_append writes, this step's
+        // reads) must precede the D2H reads on storing ranks AND the page
+        // free on fence-only ranks (dedup).
+        const int gpu_pos = opts_.gpus[r].position;
+        opts_.stream_manager->record_event(rb.ev_attn_order, gpu_pos,
+                                           compute::StreamId::kAttention);
+        be->stream_wait_event(rb.d2h_stream, rb.ev_attn_order);
+    };
+
+    int nruns = 0;
+    int longest_run = 0;
+    int whole_slabs = 0;
+    const int pps = opts_.pages_per_slab;
+    size_t i = 0;
+    while (i < acc.size()) {
+        size_t j = i + 1;
+        while (j < acc.size() && chains(acc[j - 1], acc[j])) ++j;
+        const int len = static_cast<int>(j - i);
+        ++nruns;
+        longest_run = std::max(longest_run, len);
+        const int owner = acc[i].owner;
+        const int s_begin = owner >= 0 ? owner : 0;
+        const int s_end = owner >= 0 ? owner + 1 : R;
+        const int f_begin = sharded_ ? s_begin : 0;
+        const int f_end = sharded_ ? s_end : R;
+        if (pps > 0 && acc[i].handle.page_idx + len <= span_of(owner)) {
+            // Whole slabs fully inside this contiguous run — the "slabs,
+            // not pages" witness (a partial-tail slab of a sequence can
+            // complete across flushes and is not counted; honest lower
+            // bound).
+            const int lo = (acc[i].handle.page_idx + pps - 1) / pps;
+            const int hi = (acc[i].handle.page_idx + len) / pps;
+            whole_slabs += std::max(0, hi - lo);
+        }
+        for (int r = f_begin; r < f_end; ++r) {
+            fence_rank(r);
+            if (acc[i].slots[static_cast<size_t>(r)] < 0)
+                continue;  // fence-only rank (dedup non-owner)
+            auto* be = backend(r);
+            be->set_device();
+            auto& rb = ranks_[static_cast<size_t>(r)];
+            const char* src =
+                static_cast<const char*>(
+                    opts_.kv_main_bases[static_cast<size_t>(r)])
+                + static_cast<int64_t>(acc[i].handle.page_idx)
+                      * opts_.stride_block;
+            char* dst = rb.cold_base
+                + static_cast<int64_t>(acc[i].slots[static_cast<size_t>(r)])
+                      * opts_.stride_block;
+            be->memcpy_d2h_async(dst, src,
+                                 static_cast<size_t>(opts_.stride_block)
+                                     * static_cast<size_t>(len),
+                                 rb.d2h_stream);
+        }
+        i = j;
+    }
+
+    // Phase 3 — bookkeeping (identical to the pre-S3 per-page flips).
+    for (auto& a : acc) {
+        auto& pst = ss.pages[static_cast<size_t>(a.layer)]
+                            [static_cast<size_t>(a.logical)];
         pst.state = PageState::kD2hInflight;
-        pst.cold_slot = std::move(slots);
+        pst.cold_slot = std::move(a.slots);
         ss.demoted_frontier = std::max(
-            ss.demoted_frontier, static_cast<uint32_t>(j + 1) * PS);
-        group.handles.push_back(h);
-        group.pages_ll.emplace_back(layer, j);
+            ss.demoted_frontier, static_cast<uint32_t>(a.logical + 1) * PS);
+        group.handles.push_back(a.handle);
+        group.pages_ll.emplace_back(a.layer, a.logical);
         ++ss.demoted_or_inflight;
         ++ss.inflight;
         ++total_demoted_or_inflight_;
     }
 
-    if (!group.handles.empty()) {
-        // One completion event per PARTICIPATING rank covers the whole
-        // batch (non-participants keep nullptr — poll skips them).
-        group.events.resize(static_cast<size_t>(R), nullptr);
-        for (int r = 0; r < R; ++r) {
-            if (!participated[static_cast<size_t>(r)]) continue;
-            auto* be = backend(r);
-            be->set_device();
-            group.events[r] = be->create_event();
-            be->record_event(group.events[r], ranks_[r].d2h_stream);
-        }
-        inflight_.push_back(std::move(group));
+    // One completion event per PARTICIPATING rank covers the whole batch
+    // (non-participants keep nullptr — poll skips them).
+    group.events.resize(static_cast<size_t>(R), nullptr);
+    for (int r = 0; r < R; ++r) {
+        if (!participated[static_cast<size_t>(r)]) continue;
+        auto* be = backend(r);
+        be->set_device();
+        group.events[r] = be->create_event();
+        be->record_event(group.events[r], ranks_[r].d2h_stream);
     }
+    const int enqueued = static_cast<int>(acc.size());
+    inflight_.push_back(std::move(group));
+
+    ++stats_.slab_flushes;
+    stats_.slab_runs += static_cast<uint64_t>(nruns);
+    stats_.slab_pages += static_cast<uint64_t>(enqueued);
+    stats_.slabs_demoted_whole += static_cast<uint64_t>(whole_slabs);
+    spdlog::debug("KvTiering: demote flush seq={} pages={} runs={} "
+                  "whole_slabs={} longest_run={}",
+                  seq_id, enqueued, nruns, whole_slabs, longest_run);
+    return enqueued;
+}
+
+void KvTieringManager::discard_pending(uint64_t seq_id) {
+    if (pend_.empty() || pend_seq_ != seq_id) return;
+    if (SeqState* ss = find_seq(seq_id)) {
+        for (const auto& pd : pend_) {
+            auto& lv = ss->pages[static_cast<size_t>(pd.layer)];
+            if (pd.logical < static_cast<int>(lv.size()))
+                lv[static_cast<size_t>(pd.logical)].pending_demote = false;
+        }
+    }
+    pend_.clear();
 }
 
 void KvTieringManager::poll_demotions() {
@@ -977,6 +1659,20 @@ void KvTieringManager::release_seq(uint64_t seq_id) {
     auto it = seqs_.find(seq_id);
     if (it == seqs_.end()) return;
     SeqState& ss = it->second;
+    // TD-PREFIX-TIDY-COLD-SPILL: holder eviction IS the spill-directory
+    // eviction — the file dies with the sequence (the directory is a
+    // cache; INV-KVT-17 extended to the disk hop).
+    if (!ss.spill_path.empty()) {
+        ::unlink(ss.spill_path.c_str());
+        spilled_total_ -= ss.spill_bytes;
+        spdlog::info("KvTiering: seq {} freed — spill file '{}' deleted "
+                     "({:.1f} MiB returned to the cap)", seq_id,
+                     ss.spill_path,
+                     static_cast<double>(ss.spill_bytes)
+                         / (1024.0 * 1024.0));
+        ss.spill_path.clear();
+        ss.spill_bytes = 0;
+    }
     // Release the sequence's cold-slot holds (its in-flight demotions were
     // drained by the caller — every cold_slot is settled).  A slot shared
     // with a fork family returns to the pool only when the LAST holder
@@ -1048,6 +1744,9 @@ void KvTieringManager::release_seq(uint64_t seq_id) {
 }
 
 void KvTieringManager::on_seq_free(uint64_t seq_id) {
+    // S3: never start D2H for a dying sequence — its pages are freed by
+    // ordinary teardown; a foreign pending batch is left accumulating.
+    discard_pending(seq_id);
     auto it = seqs_.find(seq_id);
     if (it == seqs_.end()) return;
     // Drain in-flight demotions so their device pages are freed exactly once
@@ -1069,19 +1768,41 @@ void KvTieringManager::release_cold_slot(int rank, int slot) {
             "KvTiering: cold slot double release (rank " + std::to_string(rank)
             + ", slot " + std::to_string(slot) + ")");
     }
-    if (--ref == 0) rb.cold_free.push_back(slot);
+    if (--ref == 0) {
+        rb.cold_free.push_back(slot);
+        rb.cold_free_dirty = true;  // S3: re-sort before the next flush so
+                                    // slot runs stay contiguous
+        // A freed slot ends the cold-full episode — re-arm the once-per-
+        // episode warning so the NEXT full pool is visible in the log.
+        cold_pool_full_warned_ = false;
+    }
 }
 
 // ── TD-KVT-SPEC-FORK: fork interop + cold-page re-promotion ────────────────
 
-void KvTieringManager::on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id) {
+void KvTieringManager::on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id,
+                                   uint32_t prefix_len) {
     if (src_seq_id == dst_seq_id) return;  // dispatcher rejects; belt+braces
+    // S3: flush any deferred batch first so the child inherits SETTLED
+    // slot-refcounted cold state exactly as pre-S3 (a pending page copied
+    // as hot would demote per lineage later, forfeiting the dedup share).
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
     auto it = seqs_.find(src_seq_id);
     if (it == seqs_.end()) return;  // parent never tiered — child starts fresh
     // Settle the parent's in-flight demotions first: the copied state must
     // hold only HOT/COLD pages (an inherited kD2hInflight entry would let
     // the child read a cold slot whose D2H has not landed).
     if (it->second.inflight > 0) drain_demotions();
+    // TD-PREFIX-TIDY-COLD-SPILL: the dispatcher unspills BEFORE forking
+    // (retryable there); a spilled page here would hand the child a slot-
+    // less cold state — fail loud rather than corrupt (INV-KVT-2 class).
+    if (!it->second.spill_path.empty()) {
+        throw std::runtime_error(
+            "KvTiering: on_seq_fork from SPILLED seq "
+            + std::to_string(src_seq_id)
+            + " — dispatcher must unspill_seq first "
+              "(TD-PREFIX-TIDY-COLD-SPILL)");
+    }
     if (it->second.demoted_or_inflight == 0) return;  // nothing to share
     if (seqs_.count(dst_seq_id)) on_seq_free(dst_seq_id);  // stale id reuse
                                                            // (drains first)
@@ -1089,6 +1810,47 @@ void KvTieringManager::on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id) {
     // (the child holds the same slots).  The child's row cache starts empty
     // (entries are (seq, position)-keyed); its cold reads warm it lazily.
     SeqState child = it->second;
+    // R3: the fork child is LIVE (it will step and demote) even when the
+    // parent is a hibernated holder — it re-enters the fair-share census.
+    child.hibernated = false;
+    // S3 belt+braces: the parent's batch was flushed above, so no copied
+    // pending flag can be live — but a stale flag would silently exempt a
+    // page from demotion forever, so clear defensively.
+    for (auto& lv : child.pages)
+        for (auto& cp : lv) cp.pending_demote = false;
+    // R4a TRUNCATING fork: the child took only logical pages
+    // [0, ceil(prefix_len / page_size)) — drop the tail of every layer's
+    // page-state vector BEFORE the slot-sharing walk below, so only the
+    // KEPT cold slots gain a ref (release_seq walks the child's own
+    // vectors; a full-copy share would leak the parent's tail slots), and
+    // recompute the derived accounting from what remains.
+    if (prefix_len > 0) {
+        const size_t keep_logical =
+            (static_cast<size_t>(prefix_len)
+             + static_cast<size_t>(opts_.page_size) - 1)
+            / static_cast<size_t>(opts_.page_size);
+        for (auto& lv : child.pages)
+            if (lv.size() > keep_logical) lv.resize(keep_logical);
+        child.demoted_or_inflight = 0;
+        child.demoted_frontier = 0;
+        child.max_pos_seen = std::min(child.max_pos_seen, prefix_len);
+        std::fill(child.cold_used.begin(), child.cold_used.end(), 0);
+        for (auto& lv : child.pages) {
+            for (size_t j = 0; j < lv.size(); ++j) {
+                if (lv[j].state != PageState::kCold) continue;
+                ++child.demoted_or_inflight;  // inflight drained above
+                child.demoted_frontier = std::max(
+                    child.demoted_frontier,
+                    static_cast<uint32_t>(j + 1)
+                        * static_cast<uint32_t>(opts_.page_size));
+                for (size_t r = 0; r < lv[j].cold_slot.size(); ++r)
+                    if (lv[j].cold_slot[r] >= 0
+                        && r < child.cold_used.size())
+                        ++child.cold_used[r];
+            }
+        }
+        if (child.demoted_or_inflight == 0) return;  // prefix is all-hot
+    }
     int shared_slots = 0;
     for (auto& lv : child.pages) {
         for (auto& p : lv) {
@@ -1106,12 +1868,16 @@ void KvTieringManager::on_seq_fork(uint64_t src_seq_id, uint64_t dst_seq_id) {
     const int demoted = child.demoted_or_inflight;
     seqs_[dst_seq_id] = std::move(child);
     spdlog::info("KvTiering: fork seq {} -> {} shares {} cold pages "
-                 "({} refcounted slots)", src_seq_id, dst_seq_id, demoted,
-                 shared_slots);
+                 "({} refcounted slots){}", src_seq_id, dst_seq_id, demoted,
+                 shared_slots,
+                 prefix_len > 0 ? " [truncated]" : "");
 }
 
 bool KvTieringManager::repromote_for_rewind(uint64_t seq_id,
                                             uint32_t token_pos) {
+    // S3: settle the deferred batch so the demoted_frontier the legality
+    // check reads is the settled one (pre-S3 timing).
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
     const SeqState* ss = find_seq(seq_id);
     // The step's k_append rewrites token_pos — legal without re-promotion
     // only while no cold page holds a position >= token_pos.
@@ -1120,6 +1886,13 @@ bool KvTieringManager::repromote_for_rewind(uint64_t seq_id,
 }
 
 bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
+    // S3: a deferred batch (this or any sequence) flushes before the
+    // repromote reads/reshapes cold state.
+    if (!pend_.empty()) flush_pending(/*fair_share=*/true);
+    // TD-PREFIX-TIDY-COLD-SPILL: spilled pages come back through the cold
+    // pool first (disk → pinned slot → the H2D below); a reload failure
+    // keeps the repromote fail-closed (capacity, not correctness).
+    if (seq_spilled(seq_id) && !unspill_seq(seq_id)) return false;
     SeqState* ss = find_seq(seq_id);
     if (!ss || ss->demoted_or_inflight == 0) return true;
     // Settle in-flight demotions: every demoted page becomes COLD (host copy
@@ -1135,14 +1908,21 @@ bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
         memory::PageHandle handle{};
     };
     std::vector<Job> jobs;
-    for (int l = 0; l < static_cast<int>(ss->pages.size()); ++l) {
-        const auto& lv = ss->pages[static_cast<size_t>(l)];
-        for (int j = 0; j < static_cast<int>(lv.size()); ++j) {
-            if (lv[static_cast<size_t>(j)].state != PageState::kCold) continue;
-            if (static_cast<uint32_t>(j + 1) * static_cast<uint32_t>(PS)
-                <= keep_frontier)
-                continue;  // fully inside the kept prefix — stays cold
-            jobs.push_back(Job{l, j, {}});
+    // S3: enumerate POSITION-MAJOR (logical-outer, layer-inner) — the same
+    // order the S2 bump allocator packs (INV-SLAB-2), so Phase A's
+    // position-matched-hole / fresh-slab claims come back physically
+    // contiguous per cohort and Phase B can coalesce the H2D into runs.
+    size_t max_logical = 0;
+    for (const auto& lv : ss->pages)
+        max_logical = std::max(max_logical, lv.size());
+    for (size_t j = 0; j < max_logical; ++j) {
+        if (static_cast<uint32_t>(j + 1) * static_cast<uint32_t>(PS)
+            <= keep_frontier)
+            continue;  // fully inside the kept prefix — stays cold
+        for (int l = 0; l < static_cast<int>(ss->pages.size()); ++l) {
+            const auto& lv = ss->pages[static_cast<size_t>(l)];
+            if (j >= lv.size() || lv[j].state != PageState::kCold) continue;
+            jobs.push_back(Job{l, static_cast<int>(j), {}});
         }
     }
     if (jobs.empty()) return true;
@@ -1224,40 +2004,79 @@ bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
     // (INV-KVT-4 inverse: a cold slot frees only after every holder's H2D
     // completed).
     const size_t blk = static_cast<size_t>(opts_.stride_block);
-    const size_t stage_cap = static_cast<size_t>(opts_.index_topk)
+    const size_t stage_cap = static_cast<size_t>(opts_.index_topk_rows())
                            * static_cast<size_t>(opts_.stride_row);
     uint64_t h2d_bytes = 0;
+    // S3 promotion batching: walk jobs in ascending destination page index
+    // and coalesce (contiguous VRAM dst, contiguous cold-slot src) pairs
+    // into single H2D copies — a re-promoted token range rebuilt into its
+    // cohort slabs goes back as slab runs, mirroring the demote side.
+    std::vector<size_t> order(jobs.size());
+    for (size_t k = 0; k < order.size(); ++k) order[k] = k;
+    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+        return jobs[x].handle.page_idx < jobs[y].handle.page_idx;
+    });
     for (int r = 0; r < R && !jobs.empty(); ++r) {
         auto* be = backend(r);
         be->set_device();
         auto& rb = ranks_[static_cast<size_t>(r)];
+        const int span = opts_.slab_span_pages.empty()
+            ? INT32_MAX : opts_.slab_span_pages[static_cast<size_t>(r)];
         bool pending = false;
-        for (const auto& job : jobs) {
-            const int owner = cold_owner_rank(job.logical);
-            if (sharded_ && owner != r) continue;  // not a holder (INV-KVT-9)
-            const auto& pst =
-                ss->pages[static_cast<size_t>(job.layer)]
-                         [static_cast<size_t>(job.logical)];
+        // This rank's receiving jobs, ascending dst page index.
+        std::vector<size_t> mine;
+        mine.reserve(order.size());
+        for (size_t k : order) {
+            if (sharded_ && cold_owner_rank(jobs[k].logical) != r)
+                continue;  // not a holder (INV-KVT-9)
+            mine.push_back(k);
+        }
+        const auto slot_of = [&](const Job& jb) {
+            const auto& pst = ss->pages[static_cast<size_t>(jb.layer)]
+                                       [static_cast<size_t>(jb.logical)];
+            return r < static_cast<int>(pst.cold_slot.size())
+                ? pst.cold_slot[static_cast<size_t>(r)] : -1;
+        };
+        for (size_t mi = 0; mi < mine.size();) {
+            const Job& job = jobs[mine[mi]];
             char* dst =
                 static_cast<char*>(opts_.kv_main_bases[static_cast<size_t>(r)])
                 + static_cast<int64_t>(job.handle.page_idx)
                       * opts_.stride_block;
-            const int own_slot = r < static_cast<int>(pst.cold_slot.size())
-                ? pst.cold_slot[static_cast<size_t>(r)] : -1;
+            const int own_slot = slot_of(job);
             if (own_slot >= 0) {
-                // Node-local pinned source — direct batched async H2D.
+                // Node-local pinned source — direct async H2D, coalesced
+                // while dst pages and src slots stay consecutive (never
+                // across the slab-span/loose boundary).
+                size_t mj = mi + 1;
+                while (mj < mine.size()) {
+                    const Job& pj = jobs[mine[mj - 1]];
+                    const Job& nj = jobs[mine[mj]];
+                    if (nj.handle.page_idx != pj.handle.page_idx + 1) break;
+                    if ((pj.handle.page_idx < span)
+                        != (nj.handle.page_idx < span)) break;
+                    const int ns = slot_of(nj);
+                    if (ns < 0 || ns != slot_of(pj) + 1) break;
+                    ++mj;
+                }
+                const size_t len = mj - mi;
                 be->memcpy_h2d_async(
                     dst,
                     rb.cold_base
                         + static_cast<int64_t>(own_slot) * opts_.stride_block,
-                    blk, rb.h2d_stream);
+                    blk * len, rb.h2d_stream);
                 pending = true;
-                h2d_bytes += blk;
+                h2d_bytes += blk * len;
+                ++stats_.promote_runs;
+                mi = mj;
                 continue;
             }
             // Replicated dedup non-owner: the single cold copy lives in the
             // round-robin owner's pool (possibly another NUMA node) — stage
             // through THIS rank's node-local pinned staging (INV-KVT-11).
+            const int owner = cold_owner_rank(job.logical);
+            const auto& pst = ss->pages[static_cast<size_t>(job.layer)]
+                                       [static_cast<size_t>(job.logical)];
             const int cslot =
                 owner >= 0 && owner < static_cast<int>(pst.cold_slot.size())
                     ? pst.cold_slot[static_cast<size_t>(owner)] : -1;
@@ -1284,6 +2103,7 @@ bool KvTieringManager::repromote_seq(uint64_t seq_id, uint32_t keep_frontier) {
                 off += piece;
                 h2d_bytes += piece;
             }
+            ++mi;
         }
         if (pending) {
             be->record_event(rb.mat[0].ev_h2d, rb.h2d_stream);
@@ -1420,7 +2240,8 @@ void KvTieringManager::prepare(int rank, int layer_idx,
     be->set_device();
     auto& rb = ranks_[static_cast<size_t>(rank)];
     be->memcpy_d2h_async(rb.h_indices, sparse_indices_dev,
-                         static_cast<size_t>(opts_.index_topk) * sizeof(int),
+                         static_cast<size_t>(opts_.index_topk_rows())
+                             * sizeof(int),
                          stream);
     be->memcpy_d2h_async(rb.h_topk_len, topk_lengths_dev, sizeof(int), stream);
     be->record_event(rb.ev_sync, stream);
@@ -1443,7 +2264,7 @@ int KvTieringManager::ensure_selection(int rank, int layer_idx,
     auto* be = backend(rank);
     auto& rb = ranks_[static_cast<size_t>(rank)];
     auto& sc = sel_[static_cast<size_t>(rank)];
-    const int ITK = opts_.index_topk;
+    const int ITK = opts_.index_topk_rows();  // GF3.5: ROW capacity
 
     const bool step_match = sc.seq == ctx_seq_ && sc.pos == ctx_pos_
         && sc.prepared_layer == layer_idx;
@@ -1497,7 +2318,7 @@ void KvTieringManager::prefetch_successors(int rank, int layer_idx, int n,
     auto* be = backend(rank);
     auto& rb = ranks_[static_cast<size_t>(rank)];
     const int PS = opts_.page_size;
-    const int ITK = opts_.index_topk;
+    const int ITK = opts_.index_topk_rows();  // GF3.5: ROW capacity
     const size_t row = static_cast<size_t>(opts_.stride_row);
     SeqState* ssp = find_seq(ctx_seq_);
     if (!ssp) return;
@@ -1710,7 +2531,7 @@ void KvTieringManager::materialize_selection(
     // prefill wall at rung-0).
     auto& ms = rb.mat[static_cast<size_t>(rb.mat_parity)];
     rb.mat_parity ^= 1;
-    gather_selection(rank, layer_idx, ms, opts_.index_topk, h_idx, n,
+    gather_selection(rank, layer_idx, ms, opts_.index_topk_rows(), h_idx, n,
                      /*cache_insert=*/true, stream);
 
     // 6) Fake paged view: identity indices over the dense scratch.
@@ -1789,6 +2610,16 @@ void KvTieringManager::gather_selection(int rank, int layer_idx, MatSet& ms,
         const int jl = pos / PS;
         const int j = global_page_of_index(rank, pos);
         const int rw = pos % PS;
+        if (j < static_cast<int>(ls.size())
+            && ls[static_cast<size_t>(j)].state == PageState::kSpilled) {
+            // A spilled page on a read path means an unspill gate was
+            // skipped — the VRAM handle is neutralized and the cold slot
+            // gone, so any read would be garbage (INV-KVT-2 fail-loud).
+            throw std::runtime_error(
+                "KvTiering: materialize touched a SPILLED page (logical "
+                + std::to_string(j) + ") — unspill_seq gate missed "
+                  "(TD-PREFIX-TIDY-COLD-SPILL)");
+        }
         const bool cold = j < static_cast<int>(ls.size())
             && ls[static_cast<size_t>(j)].state == PageState::kCold;
         if (!cold) {
@@ -1973,7 +2804,7 @@ void KvTieringManager::ensure_cohort_selection(int rank, int layer_idx,
     auto* be = backend(rank);
     auto& rb = ranks_[static_cast<size_t>(rank)];
     auto& sc = sel_[static_cast<size_t>(rank)];
-    const int ITK = opts_.index_topk;
+    const int ITK = opts_.index_topk_rows();  // GF3.5: ROW capacity
 
     const bool identity = sc.valid && sc.seq == ctx_seq_ && sc.pos == ctx_pos_
         && sc.rows == ctx_rows_;
@@ -2078,14 +2909,14 @@ bool KvTieringManager::materialize_row(int rank, int layer_idx, int row,
     auto& rb = ranks_[static_cast<size_t>(rank)];
     const int n = rb.h_topk_len[row];
     if (n <= 0) return false;  // empty local selection (INV-KVS-EMPTY class)
-    if (n > opts_.index_topk) {
+    if (n > opts_.index_topk_rows()) {
         throw std::runtime_error("KvTiering: cohort topk_length "
                                  + std::to_string(n) + " > index_topk "
-                                 + std::to_string(opts_.index_topk));
+                                 + std::to_string(opts_.index_topk_rows()));
     }
     materialize_selection(
         rank, layer_idx,
-        rb.h_indices + static_cast<size_t>(row) * opts_.index_topk, n,
+        rb.h_indices + static_cast<size_t>(row) * opts_.index_topk_rows(), n,
         topk_lengths_dev + row, stream, out);
 
     ++stats_.materializations;
@@ -2162,7 +2993,7 @@ bool KvTieringManager::materialize_cohort(int rank, int layer_idx, int rows,
     ensure_cohort_selection(rank, layer_idx, sparse_indices_dev,
                             topk_lengths_dev, selection_fresh, stream);
     auto& rb = ranks_[static_cast<size_t>(rank)];
-    const int ITK = opts_.index_topk;
+    const int ITK = opts_.index_topk_rows();  // GF3.5: ROW capacity
 
     // Union build + order-preserving rewrite (selection-only — reused across
     // IndexShare shared layers under the step identity, INV-KVT-6 extended).
@@ -2288,6 +3119,25 @@ void KvTieringManager::on_dense_layer(int layer_idx) {
     // step 1 — mark sticky BEFORE any demotion so this layer never demotes.
     if (layer_idx >= 0 && layer_idx < static_cast<int>(layer_dense_.size()))
         layer_dense_[static_cast<size_t>(layer_idx)] = 1;
+    // S3: drop the layer's deferred candidates — a sticky-dense layer's
+    // pages must never demote (dense staging reads the full prefix through
+    // the real block tables), and a pending entry collected before the
+    // dense fallback would otherwise flush at step end.
+    if (!pend_.empty()) {
+        SeqState* ss = find_seq(pend_seq_);
+        auto keep = pend_.begin();
+        for (auto& pd : pend_) {
+            if (pd.layer != layer_idx) {
+                *keep++ = pd;
+                continue;
+            }
+            if (ss && pd.logical < static_cast<int>(
+                          ss->pages[static_cast<size_t>(pd.layer)].size()))
+                ss->pages[static_cast<size_t>(pd.layer)]
+                    [static_cast<size_t>(pd.logical)].pending_demote = false;
+        }
+        pend_.erase(keep, pend_.end());
+    }
 }
 
 void KvTieringManager::log_stats() const {
@@ -2306,22 +3156,30 @@ void KvTieringManager::log_stats() const {
         "cache_hits={} cold_misses={} (hot hit-rate {:.2f}%) "
         "cold_fetch={:.2f} MiB in {} bursts, demoted_pages={}, "
         "repromoted_pages={} ({:.2f} MiB), "
-        "budget_skips={}, "
+        "budget_skips={} cold_full_skips={} pressure_demoted={}, "
         "cache_evictions={} | sync: overlapped={} reuses={} fallbacks={} "
         "wait={} us ({:.2f} us/mat) guard={} us | prefetch: rows={} "
         "bursts={} {:.2f} MiB hits={} | cohort: readbacks={} rows_tiered={} "
-        "unions={} union_rows={} rewrites={}",
+        "unions={} union_rows={} rewrites={} | slab: flushes={} runs={} "
+        "pages={} whole_slabs={} promote_runs={} | spill: files={} "
+        "pages={} {:.1f} MiB cap_refusals={} unspilled={} ({:.1f} MiB)",
         s.materializations, s.rows_gathered, s.pool_hits, s.cache_hits,
         s.cold_misses, hit_rate,
         static_cast<double>(s.cold_fetch_bytes) / (1024.0 * 1024.0),
         s.h2d_bursts, s.demoted_pages, s.repromoted_pages,
         static_cast<double>(s.repromote_bytes) / (1024.0 * 1024.0),
-        s.budget_skips, s.cache_evictions,
+        s.budget_skips, s.cold_full_skips, s.pressure_demoted,
+        s.cache_evictions,
         s.sync_overlapped, s.sync_reuses, s.sync_fallbacks, s.sync_wait_us,
         avg_sync_us, s.guard_wait_us, s.prefetch_rows, s.prefetch_bursts,
         static_cast<double>(s.prefetch_bytes) / (1024.0 * 1024.0),
         s.prefetch_hits, s.cohort_readbacks, s.cohort_rows_tiered,
-        s.cohort_unions, s.cohort_union_rows, s.cohort_union_rewrites);
+        s.cohort_unions, s.cohort_union_rows, s.cohort_union_rewrites,
+        s.slab_flushes, s.slab_runs, s.slab_pages, s.slabs_demoted_whole,
+        s.promote_runs, s.spill_files, s.spill_pages,
+        static_cast<double>(s.spill_bytes) / (1024.0 * 1024.0),
+        s.spill_cap_refusals, s.unspill_pages,
+        static_cast<double>(s.unspill_bytes) / (1024.0 * 1024.0));
 }
 
 }  // namespace layerstorm::daemon

@@ -107,10 +107,17 @@ class TestIpcRegion:
 class TestDaemonLoop:
     def test_daemon_cycle_count_advances(self, engine):
         """Daemon loop should be running and incrementing cycle count."""
-        time.sleep(0.02)
+        # Poll: the FIRST daemon cycle carries 44z's boot grant since it went
+        # default-ON (2026-09-03) — ~54 ms on this fixture's pool. This asserts
+        # daemon LIVENESS, not first-cycle latency
+        # (TD-KVXP-BOOT-OVERGRANT-FIRST-ADMISSION).
         snap_addr = engine.ipc_base + engine.state_offset
         tx = SnapshotTransaction(snap_addr)
+        deadline = time.monotonic() + 2.0
         cycle = tx.read_u64(64)   # daemon_cycle_count offset
+        while cycle == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+            cycle = tx.read_u64(64)
         assert cycle > 0
         ts = tx.read_u64(72)      # timestamp_ns offset
         assert ts > 0
@@ -130,8 +137,16 @@ class TestDaemonLoop:
         cmd.cmd_seq = 1
         assert writer.write(bytes(cmd))
 
-        time.sleep(0.02)
+        # Poll rather than sleep a fixed 20 ms: since 44z went default-ON
+        # (2026-09-03) the FIRST daemon cycle carries the boot grant, which on
+        # this fixture's 1.58M-slab pool takes ~54 ms. The test asserts daemon
+        # LIVENESS, not first-cycle latency — see
+        # TD-KVXP-BOOT-OVERGRANT-FIRST-ADMISSION for the greedy-boot-grant class.
+        deadline = time.monotonic() + 2.0
         cycle2 = tx.read_u64(64)
+        while cycle2 <= cycle1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+            cycle2 = tx.read_u64(64)
         assert cycle2 > cycle1
 
 

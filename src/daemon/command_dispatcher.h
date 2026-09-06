@@ -21,6 +21,7 @@
 #include <optional>
 #include <thread>
 #include <tuple>
+#include <map>          // P-29 step 24: SequenceState::kda_ckpts
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -34,6 +35,7 @@
 #include "core/gpu_loader/loader_evict_scores.h"  // I8: per-GPU evict-score board (hot path)
 #include "core/gpu_loader/loader_place_cons.h"    // I8: place_cons table (hot path)
 #include "core/gpu_loader/loader_place_sum.h"     // residency-reframe weighted-sum place_cons
+#include "core/memory/numa_manager.h"  // GF3.12: NumaBuffer (KDA holder spill)
 #include "core/memory/page_allocator.h"
 #include "core/transfer/host_source.h"
 #include "daemon/ipc_protocol.h"
@@ -151,6 +153,14 @@ struct PendingCompute {
     float    entropy = 0.0f;
     bool     has_confidence = false;
     uint8_t  routed_miss_count = 0;  // TD-89m/89n: top-K experts not resident
+    // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: 1 = the progressive MoE finalize
+    // that produced this completion was DEGRADED (see ProgressiveMoeState::
+    // degraded). Propagated into Completion.compute.moe_degraded at reap.
+    uint8_t  moe_degraded = 0;
+    // TD-INDEXER-NO-DENSE-FALLBACK: 1 = the attention step this completion
+    // covers ran (some row) DSA-DENSE due to dead indexer coverage.
+    // Propagated into Completion.compute.indexer_dense at reap.
+    uint8_t  indexer_dense = 0;
 
     // Union-aware cache partitioning: GPUs whose streaming-zone residents are
     // released when this completion is reaped (transient union fetches,
@@ -478,11 +488,58 @@ public:
         lifecycle_pump_ = std::move(pump);
     }
 
+    /// 44z step (3): true iff no MoE KERNEL is in flight — i.e. no dispatched
+    /// compute command is still unreaped. This is deliberately NOT
+    /// "the pipeline is idle": requiring no ACTIVE progressive-MoE state
+    /// deadlocked a memory-stalled prefill against its own drain (the drain
+    /// waited on quiesce, quiesce waited on the prefill, the prefill waited
+    /// on the drain's slabs). The single-threaded-daemon argument for why the
+    /// weaker predicate is sufficient is at the definition — read it before
+    /// strengthening this again. Daemon-thread only.
+    bool moe_dispatch_quiesced() const;
+
+    /// TD-KVXP-PER-STEP-FLOOR: slabs ONE incremental growth event claims —
+    /// one KV auto-growth chunk (chunk_size_pages_ logical pages x the
+    /// kMain-KV-bearing layer count, ceiled to slabs, min 1) plus one
+    /// indexer-K growth group (one slab per indexer-computing layer on
+    /// paged-indexer models; indexer pages are slab-granular). This is the
+    /// per-step term of the rebalancer's principled reserve
+    /// (ExpertZoneRebalancerDeps::per_step_growth_slabs): decode grows KV
+    /// incrementally, so the standing reserve holds growth headroom, not a
+    /// whole admission's KV. 0 when the allocator is unslabbed/unwired.
+    int64_t growth_chunk_slabs() const;
+
+    /// 44z: invoked at the write_error CHOKE POINT for every RETRYABLE
+    /// kKvPoolExhausted refusal, with the refusing GPU index and the
+    /// refusal's slab SHORTFALL (0 = unknown; sites that can size it set
+    /// pool_refusal_shortfall_slabs_ just before their write_error). Hooking
+    /// the choke point rather than per-site calls is what INV-KVXP (b)'s
+    /// "every retryable pool-exhaustion admission site" requires — the
+    /// per-site form missed the seq_create bulk-KV path and a 97k prefill's
+    /// 189 refusals never armed the eager drain
+    /// (TD-KVXP-BOOT-OVERGRANT-FIRST-ADMISSION). The rebalancer treats the
+    /// call as a policy failure (it was still holding KV slabs when a
+    /// request was turned away) and arms a demand-aware eager reclaim.
+    /// Nullable — unset means no rebalancer is running.
+    void set_pool_pressure_callback(std::function<void(int, int64_t)> cb) {
+        pool_pressure_cb_ = std::move(cb);
+    }
+
     /// TD-GLM-INDEXER-COV/-PREFILL: per-sequence indexer-K coverage
     /// introspection (tests + diagnostics). Returns {mode, next_pos} with
-    /// mode 0=unset, 1=paged, 2=arena, 3=dead; {-1, 0} for an untracked
-    /// sequence.
+    /// mode 0=unset, 1=paged, 2=dead; {-1, 0} for an untracked sequence.
     std::pair<int, uint32_t> indexer_coverage(uint64_t seq_id) const;
+
+    /// TD-INDEXER-NO-DENSE-FALLBACK: monotonic count of kDead transitions
+    /// (indexer_mark_dead) — test / introspection witness that the number
+    /// is ZERO with reserve-at-admission live.
+    uint64_t indexer_dense_total() const { return indexer_dense_total_; }
+
+    /// TD-INDEXER-STEPKEY-TOKEN-BLIND: introspection (tests + diagnostics)
+    /// — the IndexShare step fingerprint of the most recent MLA attention
+    /// dispatch (0 when that dispatch was not sparse-blessed). Written by
+    /// ArchMla::stage_step on every staged step; V4 never sets it.
+    uint64_t last_indexer_step_key() const { return last_indexer_step_key_; }
 
     /// TD-PREFILL-SUPERCHUNK: effective MoE token-batch capacity — the max
     /// num_seqs accepted by RUN_MOE / FETCH_AND_RUN_MOE[_BIG] and the row bound
@@ -501,6 +558,60 @@ public:
     /// moe_batch_capacity() when prefill_moe_big is off (chunking never
     /// engages).
     int moe_chunk_capacity() const { return moe_chunk_capacity_; }
+
+    /// R4b capability (INV-SEQ-FORK-TRUNC): can CMD_SEQ_FORK honour a
+    /// prefix_len truncation on this boot's architecture?  False iff the
+    /// active AttentionArch carries lossy position-indexed per-sequence
+    /// state (AttentionArch::lossy_position_indexed_state — V4 in-place
+    /// rings).  Queried by handle_seq_fork's per-architecture gate and
+    /// published to the orchestrator as EngineInfo::seq_fork_truncatable,
+    /// so mid-edge prefix reuse follows the ARCH PROPERTY, never a model
+    /// name.  Non-const: constructs the arch facades on first use (same
+    /// lazy init as the attention driver).
+    bool seq_fork_truncatable();
+
+    /// GF3.12 (tests + diagnostics): per-sequence KDA state placement —
+    /// {VRAM slot handles held, host-spilled rank buffers held}. {0,0}
+    /// for an unknown or stateless sequence. A live/registered holder is
+    /// {tp,0}; a hibernated (spilled) holder is {0,tp}.
+    std::pair<int, int> kda_seq_slots(uint64_t seq_id) const;
+    /// Test/debug: the sequence's KDA state handle device pointers in
+    /// [rank][unit] order (TD-KDA-STATE-MAPPED-SLABS: 1 unit/rank carve,
+    /// num_layers units/rank mapped). Empty when the sequence carries no
+    /// VRAM state (spilled or stateless).
+    std::vector<void*> kda_seq_unit_ptrs(uint64_t seq_id) const;
+    /// Test/debug (TD-KDA-MAPPED-MULTIGPU): the GPU index behind each of
+    /// those handles, same [rank][unit] order. The RANK AXIS of a mapped
+    /// claim is otherwise unobservable — kda_seq_unit_ptrs returns bare
+    /// device pointers, and comparing them against another GPU's region
+    /// base is a cross-allocation pointer comparison. Same test-only
+    /// contract as the rest of this kda_seq_* family; no production caller.
+    std::vector<int> kda_seq_unit_gpus(uint64_t seq_id) const;
+
+    /// Test/debug (TD-KVXP-CAPACITY-REPUBLISH): the lazily-built REEF
+    /// decision service, or nullptr before the first REEF command / after a
+    /// construction failure. Read-only observation of the live caps — the
+    /// re-freeze regression test asserts svc->cap tracks
+    /// ExpertCache::total_slots across elastic grants/drains. No production
+    /// caller mutates through this.
+    const gpu_loader::ReefOrch* reef_service_for_test() const {
+        return reef_service_.get();
+    }
+
+    /// GF3.12 (tests + diagnostics): the sequence's KDA state frontier
+    /// (first linear layer's kda_next_pos; all layers agree between
+    /// steps). UINT32_MAX for an unknown sequence or an unsized frontier
+    /// (never stepped and never restored).
+    uint32_t kda_seq_frontier(uint64_t seq_id) const;
+
+    /// GF3.12 (tests ONLY): advance every linear layer's KDA state
+    /// frontier of `seq_id` to `pos` — emulates what a completed
+    /// prefill/decode of `pos` tokens does through ArchGlm5Next::stage
+    /// (per-layer kda_next_pos, INV-KDA-REWIND enforcement point), so
+    /// checkpoint tests can exercise seq_snapshot's frontier==count
+    /// precondition without a full attention stack. Production frontiers
+    /// advance exclusively in the arch stage; no production caller.
+    void kda_test_set_frontier(uint64_t seq_id, uint32_t pos);
 
     /// KVS-2 (tests + diagnostics): read-only view of one rank's HOST KV
     /// metadata staging as built by the last build_kv_metadata call. Layer l,
@@ -553,9 +664,19 @@ private:
     void handle_compute_affinity_hints(const ipc::Command& cmd);
     void handle_numa_migrate(const ipc::Command& cmd);
     void handle_compute_command(const ipc::Command& cmd);
+    /// GF3.8: claim + zero one KDA state slot per engaged GPU for a new
+    /// sequence (TP set when configured, else default_gpu; no-op — empty
+    /// out — when the model has no KDA pool). All-or-nothing: on
+    /// exhaustion frees partial claims and returns false with a
+    /// retryable-exhaustion message (category kKvPoolExhausted at the
+    /// caller). Zeroing rides the per-GPU kAttention stream.
+    bool claim_kda_state(uint64_t seq_id, int default_gpu,
+                         std::vector<memory::PageHandle>& out,
+                         std::string& err);
     void handle_seq_create(const ipc::Command& cmd);
     void handle_seq_free(const ipc::Command& cmd);
     void handle_seq_fork(const ipc::Command& cmd);
+    void handle_seq_hibernate(const ipc::Command& cmd);
     void handle_nvme_read(const ipc::Command& cmd);
     void handle_nvme_write(const ipc::Command& cmd);
     void handle_nvme_evict_host(const ipc::Command& cmd);
@@ -592,6 +713,11 @@ private:
         // relaxes the indexer coverage `repeat` guard to the superchunk window
         // (a later layer replays sub-chunks BEHIND the advanced frontier).
         bool     superchunk = false;
+        // P-29 step 13 phase B: run_attention.spec_flags passthrough. bit0 =
+        // spec-verify row (routing export lands at sideband dst row ==
+        // row_offset, cumulative header; span-graph bypass is bracketed by
+        // the FAR verify loop, not here).
+        uint8_t  spec_flags = 0;
     };
 
     // KD-4g: phase control for TP>1 MoE dispatch.
@@ -731,6 +857,15 @@ private:
         // guided-decoding single-row layout byte-identical.  Points at
         // logits_readback_host_ for the ring path.
         uint8_t* logits_host_dst = nullptr;
+
+        // P-29 step 13 (MTP prompt prefill): run ONLY the mHC collapse + final
+        // RMSNorm over num_tokens rows into output_norm_scratch — no head
+        // GEMM, no confidence, no sampling, no readback. Feeds the
+        // MTP_PROJECT prev_src=1 rows for a prefill chunk.
+        bool norm_only = false;
+        // P-29 step 13: input ROW offset (trunk hc-wide stride) — a sliced
+        // norm_only pass reads hidden rows [input_row, input_row+n).
+        int input_row = 0;
     };
 
     bool dispatch_attention_internal(const InternalAttentionParams& p);
@@ -743,8 +878,14 @@ private:
     friend class AttentionArch;
     friend class ArchMla;
     friend class ArchDeepseekV4;
+    friend class ArchGlm5Next;  // GF3.2
     std::unique_ptr<AttentionArch> arch_mla_;
     std::unique_ptr<AttentionArch> arch_v4_;
+    std::unique_ptr<AttentionArch> arch_glm5_next_;  // GF3.2
+    /// Lazy-construct (if needed) and select the arch facade for the live
+    /// config's architecture — the single selection point shared by the
+    /// attention driver and the arch-capability queries (seq_fork gate).
+    AttentionArch& active_attention_arch();
 
     // MoE by-model split (moe/arch_base.h): same pattern for the MoE driver
     // (INV-MOE-ARCH) — constructed lazily on the first MoE dispatch and
@@ -755,6 +896,15 @@ private:
     friend class ArchDeepseekV4Moe;
     std::unique_ptr<MoeArch> moe_arch_mla_;
     std::unique_ptr<MoeArch> moe_arch_v4_;
+    /// MoE arch selection — the ONE capability predicate shared by the
+    /// single-shot driver (moe_driver.cpp) and the chunked sibling
+    /// (moe_big.cpp). TD-MOE-BIG-GLM5NEXT-MHC-POST: the chunked path once
+    /// re-derived `is_v4` locally WITHOUT the `|| hc_streams > 1` clause,
+    /// so a chunked glm5_next batch would have routed hc_post through the
+    /// plain residual add (~8x residual inflation). Selection lives here so
+    /// the two paths cannot diverge again. Lazily constructs the arch
+    /// facades on first use.
+    MoeArch& select_moe_arch();
 
     /// TD-PREFILL-NONDET diagnostic (LS_SEAM_DUMP=<path>, off by default):
     /// D2H + append one binary record of a hidden-state buffer at a named
@@ -903,7 +1053,8 @@ private:
     // and the attention producer (F-3); no-op if sideband/scratch unavailable.
     void publish_routing_export(uint32_t gpu, int num_tokens, int topk,
                                 uint32_t layer_idx, void* stream,
-                                int src_row_offset = 0);
+                                int src_row_offset = 0,
+                                int dst_row = 0);
     bool forward_one_layer(const ForwardLayerOpts& opts);
     bool dispatch_output_head(const OutputHeadOpts& opts);
     bool dispatch_output_head_tp(const OutputHeadOpts& opts);
@@ -922,6 +1073,17 @@ private:
     /// Returns false when the page pool is exhausted (partial logical page
     /// rolled back); true otherwise (including unknown seq_id — caller checks).
     bool ensure_pages(uint64_t seq_id, uint32_t token_pos);
+
+    /// TD-KVT-COLD-FULL-HOT-WEDGE: out-of-step tiering pressure reclaim on
+    /// kMain exhaustion.  pressure_demote()s the requesting sequence's
+    /// behind-window hot backlog (then every other live sequence's when the
+    /// requester yields nothing), drains the D2H copies so the freed pages
+    /// are back in the allocator, and returns pages reclaimed.  0 = nothing
+    /// demotable right now — the caller surfaces the retryable
+    /// kKvPoolExhausted error unchanged, the orchestrator's holder-eviction
+    /// seam frees cold slots (INV-KVT-17), and the re-issued step's reclaim
+    /// drains the backlog.  No-op without a live tiering manager.
+    int tiering_pressure_reclaim(uint64_t seq_id);
 
     void run_mtp_pipeline(const ipc::Command& cmd);
     void run_self_spec_pipeline(const ipc::Command& cmd);
@@ -943,10 +1105,23 @@ private:
     /// verify leaves the K-token trunk hiddens in rows [0..K); MTP steps
     /// write only row 0, so a sequential catch-up chain can consume rows
     /// in ascending order).  0 = historical single-row behavior.
+    /// prev_src: 0 = prev_hidden read from attn_buf row `hidden_row`
+    /// (historical; GLM-5.2 pre-final-norm trunk hidden). 1 = prev_hidden
+    /// read from output_norm_scratch_ row 0 — the mean-collapsed,
+    /// final-normed hidden the OUTPUT_HEAD that ran immediately before
+    /// produced (P-29 step 11: the vLLM glm5next MTP reference feeds the target
+    /// model's POST-final-norm return value; under mHC attn_buf holds the
+    /// raw 4-stream residual, which hnorm must not read). tp==1 only;
+    /// refused loudly otherwise.
+    /// P-29 step 13: prev_src=1 is valid at ANY tp (the TP-split head computes
+    /// output_norm_scratch on every rank) and row-selectable (hidden_row);
+    /// dest_row lands the projected hidden at an H-stride attn_buf row for
+    /// batched MTP prefill chains (staging moves to a high trunk row).
     bool dispatch_mtp_projection(uint32_t cmd_seq, uint32_t gpu,
                                  uint32_t token_id, int mtp_layer_idx,
-                                 int hidden_row,
-                                 void*& stream_out, int& pair_idx_out);
+                                 int hidden_row, int prev_src,
+                                 void*& stream_out, int& pair_idx_out,
+                                 int dest_row = 0);
 
     /// TD-GOLDEN-EMB-OOB: embedding TP degree (config override or dcp_size).
     /// > 1 means the embedding table is vocab-sharded across TP ranks.
@@ -973,6 +1148,25 @@ private:
     void handle_run_adapter_forward(const ipc::Command& cmd);
     void handle_run_mtp_step(const ipc::Command& cmd);
     void handle_mtp_project(const ipc::Command& cmd);
+    // P-29 step 13 phase B: KDA anchor-and-replay (INV-KDA-REWIND).
+    struct SequenceState;  // fwd (defined below with the per-seq aggregate)
+    void handle_kda_snapshot(const ipc::Command& cmd);
+    void handle_kda_restore(const ipc::Command& cmd);
+    /// Copy one linear layer's KDA state span between the live slot and an
+    /// anchor slot (direction per to_anchor) for every rank, on kAttention.
+    /// Mapped-mode only (the default); returns false on shape mismatch.
+    bool kda_anchor_copy_layer(SequenceState& st, int anchor_slot,
+                               int linear_ord, bool to_anchor);
+    /// Whole-slot anchor copy (all linear layers, all ranks); claims the
+    /// anchor lazily on first use. Returns false + writes no completion on
+    /// failure (caller reports).
+    bool kda_anchor_copy_all(SequenceState& st, uint64_t seq_id,
+                             int anchor_slot, bool to_anchor,
+                             const char** why);
+    // P-29 step 24 (LS_KDA_PREFIX_CKPT / GF3.12 realized): position-keyed
+    // host-RAM KDA prefix checkpoints — capture during prefill, consumed
+    // by a truncating fork at exactly the checkpoint position.
+    void handle_kda_ckpt(const ipc::Command& cmd);
     void handle_run_dspark_step(const ipc::Command& cmd);  // DSP-3
     void handle_run_self_spec_forward(const ipc::Command& cmd);
     void handle_forward_one_layer(const ipc::Command& cmd);
@@ -1340,10 +1534,15 @@ private:
     /// lookup fails (error written to completion ring). On success, stream_out
     /// and pair_idx_out are populated.
     struct SpecScratch;  // defined below (near spec_scratch_ member)
+    /// stage_row (P-29 step 13): TRUNK-stride attn_buf row used as the embedding
+    /// staging destination (sharded lookup rows / broadcast copy). 0 =
+    /// historical row 0. A batched MTP prefill chain passes a high staging
+    /// row so the serial PROJECT loop's staging never clobbers the H-stride
+    /// projected rows it already landed.
     bool setup_spec_pipeline(uint32_t cmd_seq, uint32_t gpu,
                              uint32_t token_id, const char* pipeline_name,
                              SpecScratch& ss, void*& stream_out,
-                             int& pair_idx_out);
+                             int& pair_idx_out, int stage_row = 0);
 
     // ── Completion helpers ──────────────────────────────────────────────
 
@@ -1355,7 +1554,9 @@ private:
                                   uint32_t data_bytes = 0,
                                   float top1_prob = 0.0f,
                                   float entropy = 0.0f,
-                                  uint8_t routed_miss_count = 0);
+                                  uint8_t routed_miss_count = 0,
+                                  uint8_t moe_degraded = 0,
+                                  uint8_t indexer_dense = 0);
     void write_checkpoint_completion(uint32_t orig_cmd_type, uint32_t cmd_seq,
                                      uint32_t gpu_idx, uint32_t layer_idx,
                                      uint8_t checkpoint_type,
@@ -1368,7 +1569,8 @@ private:
     void write_gpu_fatal(uint32_t gpu_idx, int vendor_error_code, const char* msg);
     void write_seq_completion(uint32_t cmd_seq, uint32_t gpu_idx,
                               uint64_t seq_id, uint32_t page_count,
-                              uint32_t status);
+                              uint32_t status,
+                              uint32_t reserved_tokens = 0);
     void write_nvme_completion(uint32_t cmd_seq, uint32_t gpu_idx,
                                uint32_t layer_idx, uint16_t expert_idx,
                                uint8_t op, uint32_t status);
@@ -1488,6 +1690,12 @@ private:
         // Only allocated when deterministic_ep_combine_ is on AND the precision is
         // bf16 (default off / fp32 ⇒ nullptr, zero VRAM cost).
         void* moe_output_bf16_perslot = nullptr;
+        // TD-GLM5-TP-COMBINE-PRECISION: FP32 [B, H] staging for the
+        // shared-expert / dense-FFN TP partial (down-GEMM fp32-out ->
+        // fp32 allreduce -> ONE bf16 round back into the legacy buffer).
+        // Allocated only when the executor's fp32 TP combine is active
+        // (glm5_next at tp>=2 ⇒ nullptr everywhere else, zero VRAM cost).
+        void* ffn_combine_f32    = nullptr;
         void* normalized_hidden  = nullptr;
         // V4-5b mHC FFN-stage scratch (allocated only when Deps::hc_streams>1):
         // hc_x [B, H] BF16 collapsed module input; hc_post [B, hc] F32;
@@ -1560,11 +1768,36 @@ private:
         const void** g_b_ptrs_host_w[3]  = {nullptr, nullptr, nullptr};  // pinned
         const void** g_sb_ptrs_host_w[3] = {nullptr, nullptr, nullptr};  // pinned
 
+        // P-29 step 17 (LS_FAR_ISSUE_SLIM): fused single-pass b_ptr staging
+        // fill with live-index tracking. Per staging set ([0]=kNone/kFinal,
+        // [1]=kPartial wave), `g_bptr_live` holds the expert indices whose
+        // staging entries are currently NON-excluded (they are reset to the
+        // excluded value at the start of the next fill, so a full 3×E walk
+        // is never needed once initialized). `g_bptr_excluded` is the
+        // excluded-pointer value the set was last normalized to; a sentinel
+        // or a value flip (null-skip decode vs zero-buf small-M) forces one
+        // full re-initialization. Host-only bookkeeping — the staged BYTES
+        // are identical to the legacy per-projection walks.
+        mutable std::vector<uint16_t> g_bptr_live[2];
+        mutable const void* g_bptr_excluded[2] = {
+            reinterpret_cast<const void*>(~uintptr_t{0}),
+            reinterpret_cast<const void*>(~uintptr_t{0})};
+
         // GG-5b: 1-element device B_ptrs array for dense/shared GGUF GEMMs
         // (num_experts==1). The GGUF grouped kernel has NO B_base — only a device
         // B_ptrs array — so the single dense/shared weight pointer is H2D'd here.
         // Only allocated for GGUF weights.
         void* gguf_single_b_ptr      = nullptr;  // [1] void* — device array
+
+        // MPOKE (P-29 step 3): dense/shared GGUF B_ptrs bind-cache arena —
+        // device [num_layers][3] void* + host mirror (slot 0 gate/fused,
+        // 1 up-split, 2 down) so steady-state decode skips the per-token
+        // 8-byte binds (see dispatch_detail.h moe_meta_cache_enabled()).
+        void* gguf_layer_b_ptrs      = nullptr;
+        mutable std::vector<const void*> gguf_layer_b_host;
+        // MPOKE: last {0,B} uploaded to shared_expert_offsets (-1 = never).
+        // (mutable: pure host-side upload caches — dispatch holds const refs.)
+        mutable int32_t shared_offsets_last_b = -1;
 
         // GG-5c: dense/shared GGUF gate_up SPLIT path scratch (gate_gguf_type !=
         // up_gguf_type). A dedicated [B, I_dense] BF16 buffer holds the up GEMM's
@@ -1707,6 +1940,26 @@ private:
     // empty otherwise (⇒ every EP-XTP hook is a structural no-op and the
     // TP-only paths stay byte-identical).
     std::vector<int> ep_xtp_gpus_;
+
+    // P-29 step 17 (LS_MOE_XTP_BOUNCE): explicit pinned-bounce staging for the
+    // decode-shape EP-XTP broadcast. Cross-device cudaMemcpyAsync on this box
+    // is a driver-STAGED host-bounce copy (no P2P on GeForce; peer access is
+    // never enabled in-tree), and OQ-9 measured that such staged copies
+    // enqueued behind an UNFIRED event insert a ~50-85 us bubble ahead of
+    // everything behind them on the stream (the P-29 step-16 broadcast pre-issue
+    // loss). The bounce replaces each staged cross-device copy with explicit
+    // single-engine DMAs: rank0 D2H into a pinned slot, event, per-extra H2D
+    // from the slot — same destination bytes, plain event-gated engine work,
+    // no driver deferred path. Two rotating slots; a slot's next D2H waits
+    // the previous consumers' events (recorded on the extras' streams after
+    // their H2Ds). Decode/small-M shapes only (num_tokens <= 8); larger
+    // single-shot broadcasts keep the legacy staged copies.
+    void* xtp_bounce_host_[2] = {nullptr, nullptr};   // pinned slots
+    size_t xtp_bounce_slot_bytes_ = 0;
+    int xtp_bounce_slot_next_ = 0;
+    int xtp_bounce_src_gpu_ = -1;                     // pinned-alloc owner
+    std::array<std::vector<std::pair<void*, int>>, 2>
+        xtp_bounce_cons_evs_;                         // per slot: (event, gpu)
 
     // I8 P1: persistent solver (holds ~16 KiB scratch; one per dispatcher) +
     // shadow gate (LS_LOADER_SHADOW, read once in ctor). Shadow-only today.
@@ -1975,6 +2228,11 @@ private:
         // cmp_data_bytes (the deduped entry count) in data_bytes.
         uint32_t cmp_cmd_type_override = 0;
         uint32_t cmp_data_bytes = 0;
+        // TD-INDEXER-NO-DENSE-FALLBACK witness: FAR fused layers run their
+        // attention half under the SAME command, and this state's finalize
+        // writes the command's only completion — capture the step flag at
+        // state build (finalize may run many dispatches later).
+        uint8_t  cmp_indexer_dense = 0;
 
         // TD-PREFILL-MOE-BIG: E_CMD_FETCH_AND_RUN_MOE_BIG — enables the
         // double-buffered wave pipeline (half-budget first wave + next-wave
@@ -2004,6 +2262,19 @@ private:
         // Timeout
         uint64_t deadline_ns = 0;      // steady_clock deadline (0 = no timeout)
         bool timed_out = false;
+
+        // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: the finalize was DEGRADED —
+        // experts the router selected were left out of the computed FFN
+        // output for a capacity/deadline reason, not because the decider or
+        // quiescence logic proved them un-needed. Set on (a) the no-capacity
+        // wave stall (nothing computable, nothing issuable), (b) the
+        // fetch-deadline timeout with fetches still genuinely in flight, and
+        // (c) the 0-slot-stable-zone target skip. NOT set by the F-6 decider
+        // skip or the quiescence finalize (those compute the correct routed
+        // subset). Propagated to Completion.compute.moe_degraded so the
+        // orchestrator can count degraded layers per request (retry /
+        // identity-gate discard) instead of trusting a log line.
+        bool degraded = false;
 
         // F-6: selective-fetch decider — count of missing experts deliberately
         // skipped (not fetched) by the decider. These degrade gracefully exactly
@@ -2069,6 +2340,16 @@ private:
     // so every later command fails fast with the remembered reason.
     std::unique_ptr<gpu_loader::ReefOrch> reef_service_;
     bool reef_service_failed_ = false;
+    // TD-KVXP-CAPACITY-REPUBLISH: the ExpertCache elastic topology
+    // generation the service's per-GPU caps were last derived from. Every
+    // REEF command passes through ensure_reef_service, which compares this
+    // against ExpertCache::elastic_generation() and re-reads
+    // total_slots(kStable) (+ re-arms the XTP route caps) on any change —
+    // so 44z grants/reclaims reach the placement model at the next solve,
+    // strictly before reclaimed slabs return to KV (begin_drain bumps at
+    // ratchet step 1; slabs move at step 5). With the rebalancer OFF the
+    // generation never changes and the caps are byte-identical boot-frozen.
+    uint64_t reef_caps_generation_ = 0;
     // LS_REEF_RELOC_TRACE=1: arena location-change sink installed (writes
     // "M <solve> <kind> <layer> <expert> <old> <new>" into the reef
     // decision dump); cleared in the destructor (the arena outlives us).
@@ -2120,7 +2401,9 @@ private:
     bool run_moe_wave_pass(ProgressiveMoeState& st);
 
     /// INV-MOE-OVERLAP (decode fetch-overlap split, env LS_MOE_RESIDENT_OVERLAP,
-    /// default ON): right after the missing-expert H2Ds are ISSUED, enqueue a
+    /// default OFF since P-29 step 18 — the split loses 1.4-1.8% @8k on the
+    /// fetch-hidden champion; =1 re-arms): right after the missing-expert
+    /// H2Ds are ISSUED, enqueue a
     /// wave-partial pass (Steps 2..5 + accumulate) over the experts that are
     /// ALREADY resident — on the TP ranks AND the EP-XTP extra ranks (after
     /// the rank0 hidden/top-K broadcast) — so resident-expert compute overlaps
@@ -2198,11 +2481,42 @@ private:
     /// (same passes, same kernels — only enqueue time changes).
     int moe_gated_final_enabled_ = -1;  // -1 unread, 0 off, 1 on
     bool moe_gated_final_enabled();
+
+    /// LS_FAR_PROLOGUE_PREISSUE (P-29 step 16): pre-issue the routing-
+    /// independent MoE prologue — the per-TP-rank mHC collapse + ffn RMSNorm
+    /// (via the existing prime_cpu_input_only pass) and the EP-XTP
+    /// hidden+top-K broadcast — at FAR attention-dispatch time, BEFORE the
+    /// routing-readback spin, so it executes on the kExpertFfn streams during
+    /// the host's union/REEF/decider window instead of serializing after it
+    /// (the measured ~70 us readback->first-MoE-kernel box-empty gap, ~29x/
+    /// token). Bit-identical: same kernels, same inputs, same per-stream
+    /// order; the finalize Phase-1 skips the (idempotent) recompute and
+    /// consumes the primed buffers. Safe device-side because attn_moe_event
+    /// is recorded AFTER the fused gating top-K + routing export on the
+    /// attention stream (attention_driver.cpp F-3 block), so the primed
+    /// prologue and broadcast order behind everything they read. Default ON;
+    /// =0 restores the post-readback emission byte-identically.
+    int far_prologue_preissue_enabled_ = -1;  // -1 unread, 0 off, 1 on
+    bool far_prologue_preissue_enabled();
+    uint32_t far_prologue_layer_ = 0xffffffffu;  // layer with live pre-issue
+    uint32_t far_prologue_gpu_mask_ = 0;  // gpu positions primed (collapse+norm)
+    bool far_prologue_bcast_done_ = false;  // EP-XTP broadcast pre-issued
+    bool preissue_far_moe_prologue(uint32_t layer_idx, uint32_t num_seqs,
+                                   uint32_t gpu_idx);
+    void clear_far_prologue() {
+        far_prologue_layer_ = 0xffffffffu;
+        far_prologue_gpu_mask_ = 0;
+        far_prologue_bcast_done_ = false;
+    }
     uint64_t gated_final_engaged_ = 0;        // fetch layers device-gated
     uint64_t gated_final_fb_unissued_ = 0;    // wave split → host path
     uint64_t gated_final_fb_not_transferring_ = 0;  // ELM not kTransferring
     uint64_t gated_final_fb_not_dispatched_ = 0;    // DMA staged, not on-stream
     uint64_t gated_final_fb_other_ = 0;       // null deps / no vram / barrier fail
+    // P-29 step 19 (LS_FAR_GATE_DISPATCH): staged demand copy force-dispatched
+    // past the inflight cap inside the commit — layer stayed device-gated
+    // (these engagements would have been fb_not_dispatched before step 19).
+    uint64_t gated_final_force_dispatched_ = 0;
 
     // ── ExpertStats recency feed (FETCH_AND_RUN_MOE path) ───────────────
     // Monotonic per-TOKEN id handed to ExpertStats::update() so last_used_token /
@@ -2229,6 +2543,16 @@ private:
     /// falls back to the legacy reject). Daemon-thread only.
     bool drain_progressive_moe(const char* ctx);
     std::function<void()> lifecycle_pump_;
+
+    /// 44z: retryable-admission-refusal sink (set_pool_pressure_callback).
+    /// Fired from write_error whenever the category is kKvPoolExhausted.
+    std::function<void(int, int64_t)> pool_pressure_cb_;
+    /// 44z demand plumbing: a refusal site that can size its shortage sets
+    /// this (in SLABS) immediately before its write_error; write_error
+    /// consumes it (always reset, passed to pool_pressure_cb_ only on the
+    /// kKvPoolExhausted category). Set-and-consume within one dispatch —
+    /// never read across commands.
+    int64_t pool_refusal_shortfall_slabs_ = 0;
 
     /// TD-far: true iff at least one requested-but-not-arrived expert is still
     /// genuinely progressing toward residency (slot reserved, H2D in flight, or
@@ -2358,8 +2682,8 @@ private:
     ///
     /// TD-INDEXER-POOL-EVICT: the failure REASON is part of the contract.
     /// kUnavailable (beyond the serving window, bad slot, dcp mismatch) is
-    /// permanent for this shape — the producer downgrades (B==1 arena, B>1
-    /// dense) exactly as before. kExhausted is TRANSIENT CAPACITY: the pool
+    /// permanent for this shape — refusal for a reserved sequence, loud
+    /// dense downgrade for an unreserved one. kExhausted is TRANSIENT CAPACITY: the pool
     /// is merely full of OTHER live sequences (prefix-cache holders pin a
     /// CoW frontier page group each), so the caller may surface it as a
     /// RETRYABLE pool-exhaustion error and let the orchestrator evict a
@@ -2378,6 +2702,29 @@ private:
     IndexerPageResult ensure_indexer_pages(uint64_t seq_id,
                                            uint32_t token_pos,
                                            int batch_slot, int dcp_size);
+
+    /// TD-INDEXER-NO-DENSE-FALLBACK (Route 1): pool-growth half of
+    /// ensure_indexer_pages — allocates kIndexerK page groups for seq_id
+    /// covering token_pos WITHOUT touching the per-batch host page tables
+    /// (those are (re)written per dispatched step by ensure_indexer_pages).
+    /// Used by the admission-time reservation (handle_seq_create /
+    /// handle_seq_fork) so provisioning can never fail mid-request.
+    IndexerPageResult grow_indexer_pages(uint64_t seq_id, uint32_t token_pos,
+                                         int dcp_size);
+
+    /// True iff the live model provisions the DSA PAGED indexer-K pool
+    /// through ensure_indexer_pages (index_topk > 0, non-V4 — V4 manages
+    /// its own LID tier — and a valid indexer_k_page_size_tokens).
+    bool model_has_paged_indexer() const;
+
+    /// TD-INDEXER-NO-DENSE-FALLBACK witness: a sequence transitioned to
+    /// IndexerSeqMode::kDead (permanent DSA dense). With reservation live
+    /// this is a BUG, never an accepted degradation: log at ERROR with the
+    /// full why, bump the monotonic total, and flag the in-flight step so
+    /// the completion carries Completion.compute.indexer_dense.
+    void indexer_mark_dead(uint64_t seq_id, int layer, uint32_t pos,
+                           uint32_t next_pos, const char* why);
+
 
     /// ── V4-7b (ticket H): per-seq V4 side-tier pages ─────────────────────
     /// kSwa: ONE ring page per layer (window == page_tokens ⇒ decode-exact);
@@ -2418,6 +2765,13 @@ private:
     std::vector<std::vector<const void*>> indexer_page_table_;
     std::vector<const void* const*> indexer_table_bases_;
     std::vector<uint8_t> indexer_computes_;        ///< layer → computes-indexer mask
+    /// GF3.9: the step's FIRST indexer-computing layer — the INV-DSA-EPOCH
+    /// re-feed detection point (arch_mla stage_step): legacy models compute
+    /// on layer 0 (full ∪ {0}) so this is 0 = byte-identical; glm5_next's
+    /// first sparse layer is 3 (layers 0-2 are KDA with no indexer).
+    /// Lazily derived; -1 = not yet computed.
+    int indexer_first_compute_layer_ = -1;
+    int indexer_first_compute_layer();  // defined in page_provision.cpp
     int indexer_page_stride_ = 0;                  ///< logical pages per layer row
     int indexer_batch_stride_ = 0;                 ///< n_layers * page_stride
 
@@ -2428,15 +2782,31 @@ private:
     /// (TD-GLM-INDEXER-PREFILL: the executor's chunk appender appends every
     /// chunk position — coverage advances by chunk_len). A non-appending
     /// step (graph replay, draft, pool exhaustion at B>1, position jump,
-    /// unsupported prefill shape) leaves garbage at the skipped positions,
-    /// and switching arena→paged mid-sequence would score never-written
-    /// pages. The guard pins each sequence to one storage mode on first use
-    /// and permanently downgrades it to DENSE (kDead) on any gap. Erased at
-    /// seq_free.
-    enum class IndexerSeqMode : uint8_t { kUnset, kPaged, kArena, kDead };
+    /// unsupported prefill shape) leaves garbage at the skipped positions.
+    /// The guard permanently downgrades a sequence to DENSE (kDead) on any
+    /// gap. Erased at seq_free. Storage is ALWAYS the paged Pool::kIndexerK
+    /// path: S4 deleted the legacy B==1 executor arena — INV-DSA-RESERVE
+    /// made it dead code (a reserved sequence can never fail per-step
+    /// provisioning, so the only reachable arena producers were unreserved
+    /// legacy/test callers, whose honest failure mode is the loud kDead
+    /// witness, not a silent 128K-capped side store).
+    enum class IndexerSeqMode : uint8_t { kUnset, kPaged, kDead };
     struct IndexerCov {
         uint32_t next_pos = 0;              ///< next position that must append
         IndexerSeqMode mode = IndexerSeqMode::kUnset;
+        /// TD-INDEXER-STEPKEY-TOKEN-BLIND (INV-DSA-EPOCH): rewind epoch mixed
+        /// into the IndexShare step fingerprint. The positional (seq_id,
+        /// token_pos) key hashes WHERE, never WHAT — a blessed overwrite
+        /// re-feed (INV-DSA-REWIND) reproduces an earlier step's position
+        /// set with possibly DIFFERENT tokens and would collide with that
+        /// step's key. The epoch is drawn from the dispatcher's monotonic
+        /// counter (indexer_epoch_next_) at seq create / restore /
+        /// fork-child construction and re-drawn whenever a step's FIRST
+        /// layer (layer 0) sees this sequence BEHIND its coverage frontier
+        /// (an overwrite re-feed), so a stale IndexShare selection can never
+        /// validate across an overwrite or a recycled seq_id. Bumping never
+        /// touches `mode` — it invalidates reuse, not coverage.
+        uint64_t epoch = 0;
     };
 
     /// ── SequenceState: THE per-sequence aggregate (INV-SEQ-FORK-STATE) ───
@@ -2477,6 +2847,122 @@ private:
         /// V4 side-tier pages (kSwa/kHca/LID; V4-7b). swa.empty() ⇔ never
         /// provisioned (ensure_v4_tier_pages resizes swa first).
         V4SeqTiers v4_tiers;
+        /// TD-INDEXER-NO-DENSE-FALLBACK (Route 1): GRANTED indexer-K
+        /// reservation in tokens — indexer pages covering [0, this) were
+        /// committed at seq_create/seq_fork, so provisioning inside the
+        /// window cannot fail. 0 = unreserved (legacy producer / non-DSA).
+        /// A RESERVED sequence must never downgrade to dense: any
+        /// provisioning failure raises an ERROR (retryable kKvPoolExhausted
+        /// for pool exhaustion) instead of IndexerSeqMode::kDead.
+        uint32_t indexer_reserved_tokens = 0;
+        /// GF3.8: KDA per-request state slots (glm5_next), one
+        /// Pool::kKdaState handle per engaged GPU (TP rank order; non-TP:
+        /// one, on the create-command GPU). Empty == non-KDA model or
+        /// draft (kSpeculation) sequence — the MTP draft is sparse MLA and
+        /// carries NO recurrent state (MODELINFO section 5). Claimed and
+        /// ZEROED at seq_create (INV-V4-DET obligation (2): pool reuse
+        /// must never hand a sequence the previous holder's residue),
+        /// D2D-copied on EVERY fork — frozen included: a frozen holder
+        /// never steps, but the live parent keeps mutating ITS slot, so
+        /// refcount sharing is never safe (INV-PREFIX-CACHE-3 third cost
+        /// class) — and freed at seq_free. The slot IS the GF3.6
+        /// checkpoint unit: a GF3.12 state checkpoint is a whole-slot byte
+        /// copy through these handles (kda_state_slot_bytes()), nothing
+        /// else participates, and fp32 round-trips replay bit-exactly
+        /// (INV-KDA-REWIND / INV-KDA-CARRY).
+        std::vector<memory::PageHandle> kda_state;
+        /// GF3.9: per-LINEAR-layer KDA state frontier — next_pos[ordinal]
+        /// is the position the layer's recurrent state has advanced to
+        /// (== tokens absorbed). Sized lazily (num_linear_attention_layers)
+        /// at the first KDA stage; copied on fork (the slot D2D copies the
+        /// state AT this frontier); empty on non-KDA models. The
+        /// INV-KDA-REWIND enforcement point: a KDA launch whose start is
+        /// not EXACTLY this frontier is refused (kComputeValidation) —
+        /// re-applying tokens to a mutate-in-place recurrent state is
+        /// never idempotent (unlike position-keyed KV overwrites), so a
+        /// retry seam that re-feeds a chunk must never silently reach the
+        /// scan. Per-LAYER (not per-seq) because the superchunk layer
+        /// sweep advances each layer's state at a different time within
+        /// one step.
+        std::vector<uint32_t> kda_next_pos;
+        /// GF3.12: host-spilled KDA state (hibernated prefix holders).
+        /// One entry per engaged GPU in the same rank order kda_state
+        /// held. Non-empty <=> the holder's VRAM slots were RELEASED at
+        /// CMD_SEQ_HIBERNATE and the whole-slot bytes live in host RAM
+        /// (NUMA-local to the source GPU via NumaManager when available,
+        /// heap fallback otherwise) — the INV-PREFIX-CACHE-3 third cost
+        /// class moved off VRAM. Only a FROZEN holder may be spilled (it
+        /// never steps; a step through arch_glm5_next refuses a slotless
+        /// sequence loudly). Every fork FROM a spilled holder claims
+        /// fresh child slots and H2D-restores from these bytes on the
+        /// kAttention stream (bit-exact: the spill is a whole-slot fp32
+        /// byte round-trip, the same unit as the GF3.12 checkpoint).
+        /// kda_next_pos is retained across the spill (the child's
+        /// frontier). Freed at seq_free. Truncating forks reject on this
+        /// exactly as on kda_state (INV-SEQ-FORK-TRUNC belt-and-braces).
+        struct KdaSpillRank {
+            memory::NumaBuffer buf{};      ///< NumaManager storage (owned)
+            std::vector<std::byte> heap;   ///< fallback storage (owned)
+            int gpu_idx = -1;              ///< source/destination gpu pos
+            void* data() noexcept {
+                return buf.data ? buf.data
+                                : (heap.empty() ? nullptr
+                                                : static_cast<void*>(heap.data()));
+            }
+            const void* data() const noexcept {
+                return buf.data ? buf.data
+                                : (heap.empty() ? nullptr
+                                                : static_cast<const void*>(heap.data()));
+            }
+        };
+        std::vector<KdaSpillRank> kda_spill;
+        /// P-29 step 24 (LS_KDA_PREFIX_CKPT, GF3.12 realized — the
+        /// arch_glm5_next clause (b) "reuse points exist only where a
+        /// CHECKPOINT was taken", now taken): position-keyed host-RAM KDA
+        /// prefix checkpoints. Each entry is the per-rank whole-slot blob
+        /// set (KdaSpillRank layout, identical bytes to kda_spill — the
+        /// bit-exact fp32 checkpoint unit) captured by D_CMD_KDA_CKPT at a
+        /// 64-aligned uniform frontier during PREFILL (prefill-state class
+        /// only in phases 1–3: TD-GLM5-PREFILL-RECURRENT-DRIFT /
+        /// TD-PREFIX-EOR-HOLDER). Consumed by a TRUNCATING fork at exactly
+        /// that position (the gate rework below admits it); MOVED whole to
+        /// the frozen holder child at a registration fork (blobs belong to
+        /// the prefix entry); freed at seq_free (NumaManager buffers
+        /// released, byte counter decremented). Never captured from a
+        /// decode-produced state by the orchestrator's cadence policy.
+        std::map<uint32_t, std::vector<KdaSpillRank>> kda_ckpts;
+        /// P-29 step 13 phase B: MTP-layer indexer coverage (layers >=
+        /// num_hidden_layers). The MTP layer's KV/indexer store lags the
+        /// trunk by design (catch-up rows land one round late), so it
+        /// tracks its OWN frontier: against it every MTP append is
+        /// advancing or the single-position `repeat` overshoot of the
+        /// chained draft row — the trunk's pool-safety interaction never
+        /// applies. Epoch stays the SEQ epoch (indexer_cov.epoch), bumped
+        /// by trunk re-feeds before MTP rows run.
+        IndexerCov mtp_indexer_cov;
+        /// P-29 step 13 phase B (INV-DSA-REWIND contiguity window): a pooled
+        /// rewind row inside [start, end+1] is legal because the run began
+        /// at a statically-legal start (pool boundary / frontier pool); a
+        /// statically-legal row outside re-bases it. start > end = none.
+        struct RewindRun {
+            uint32_t start = 1;
+            uint32_t end = 0;
+        };
+        RewindRun rewind_run;
+        /// P-29 step 13 phase B: KDA anchor slots (INV-KDA-REWIND anchor-and-
+        /// replay). Two whole-slot copies of kda_state taken at pool-
+        /// boundary crossings during speculative verify rows; RESTORE
+        /// copies one back and rolls kda_next_pos. Claimed lazily from
+        /// Pool::kKdaState at the first snapshot (same slab pool as the
+        /// live slot — no VRAM carve change); freed at seq_free; EXCLUDED
+        /// from fork (round-transient — a fork child re-anchors).
+        struct KdaAnchors {
+            static constexpr uint32_t kNone = 0xFFFFFFFFu;
+            std::array<std::vector<memory::PageHandle>, 2> slots;
+            std::array<uint32_t, 2> pos{kNone, kNone};
+            uint8_t next = 0;  ///< alternator
+        };
+        KdaAnchors kda_anchors;
     };
     std::unordered_map<uint64_t, SequenceState> sequences_;
     SequenceState* find_seq(uint64_t seq_id) {
@@ -2487,6 +2973,28 @@ private:
         auto it = sequences_.find(seq_id);
         return it == sequences_.end() ? nullptr : &it->second;
     }
+
+    /// P-29 step 24: shared D2H whole-slot gather (see handle_kda_ckpt).
+    /// Declared here because it names the nested KdaSpillRank type.
+    bool kda_gather_slot_to_host(
+        const SequenceState& seq,
+        std::vector<SequenceState::KdaSpillRank>& out);
+    /// P-29 step 24: total host bytes held by live KDA prefix checkpoints
+    /// (all sequences). Budget enforcement lives in the ORCHESTRATOR (it
+    /// sees the config); this counter is observability + test surface.
+    size_t kda_ckpt_host_bytes_ = 0;
+
+public:
+    /// P-29 step 24 (tests + diagnostics): number of host KDA checkpoints
+    /// held by seq_id (SIZE_MAX for an unknown sequence), and the global
+    /// checkpoint host-byte counter.
+    size_t kda_ckpt_count(uint64_t seq_id) const {
+        const auto* st = find_seq(seq_id);
+        return st ? st->kda_ckpts.size() : static_cast<size_t>(-1);
+    }
+    size_t kda_ckpt_host_bytes() const { return kda_ckpt_host_bytes_; }
+
+private:
 
     /// INV-DSA-REWIND (config compute.dsa_indexer_rewind, env
     /// LS_INDEXER_REWIND overrides either way; read once at construction;
@@ -2502,6 +3010,19 @@ private:
     /// scored). Gaps, mixed-sequence chunks, foreign sequences, and
     /// superchunk shapes stay fail-closed unchanged.
     bool indexer_rewind_ok_ = false;
+
+    /// TD-INDEXER-STEPKEY-TOKEN-BLIND (INV-DSA-EPOCH): monotonic source for
+    /// IndexerCov::epoch — advanced at seq create / restore / fork-child and
+    /// at every layer-0 overwrite re-feed detection, never reset for the
+    /// dispatcher's lifetime (a recycled seq_id must not reproduce a dead
+    /// incarnation's fingerprints). Values are a function of the command
+    /// stream: identical runs yield identical keys (identity gates hold),
+    /// and key EQUALITY is per-sequence deterministic regardless of
+    /// cross-sequence interleaving (epochs are compared only via keys of
+    /// the same sequence's steps).
+    uint64_t indexer_epoch_next_ = 0;
+    /// Introspection backing store for last_indexer_step_key().
+    uint64_t last_indexer_step_key_ = 0;
 
     /// LS_ATTN_CHUNK_PROF=1 (read once at construction; opt-in DIAGNOSTIC,
     /// default OFF = zero overhead): per-command dispatch x-ray for
@@ -2525,6 +3046,17 @@ private:
     /// stack local).
     std::vector<uint8_t> indexer_row_dense_;
 
+    /// TD-INDEXER-NO-DENSE-FALLBACK witness plumbing: step_indexer_dense_
+    /// is cleared at the top of dispatch_attention_internal and set by
+    /// stage_step whenever the step runs (any row) DSA-DENSE because of a
+    /// dead coverage; the command handler that owns the step's completion
+    /// reads-and-clears it into Completion.compute.indexer_dense (RUN_
+    /// ATTENTION directly; FAR fused layers via the progressive-MoE state,
+    /// whose finalize writes the completion). indexer_dense_total_ counts
+    /// kDead TRANSITIONS monotonically (introspection witness).
+    uint8_t  step_indexer_dense_ = 0;
+    uint64_t indexer_dense_total_ = 0;
+
     /// TD-GOLDEN-KV-EXHAUST: specific error from the innermost dispatch helper,
     /// consumed by the command-level handlers when an internal dispatch returns
     /// false. msg == nullptr means "no specific error" (use the generic one).
@@ -2540,22 +3072,26 @@ private:
     /// position (pos 0 accidentally worked — read right after own write).
     int      kv_layers_ = 1;
 
-    /// TD-V4-KMAIN-SIZING (INV-KV-LAYER refined for V4): per-layer kMain-page
-    /// mask. Non-empty only for deepseek_v4: v4_kmain_layer_[l] != 0 iff
-    /// layer l's main tier lives in the kMain (CSA) bucket. HCA/SWA layers
-    /// (and the SWA-only MTP layers) keep their KV in the kv_hca/kv_swa side
-    /// pools (ensure_v4_tier_pages) — their layer-major seq_pages_ slots hold
+    /// TD-V4-KMAIN-SIZING (INV-KV-LAYER refined for V4; generalized for
+    /// glm5_next by GF3.9, TD-KV-POOL-SIZED-OVER-ALL-LAYERS): per-layer
+    /// kMain-page mask. Non-empty for deepseek_v4 (kmain_layer_[l] != 0 iff
+    /// layer l's main tier lives in the kMain (CSA) bucket; HCA/SWA layers
+    /// and the SWA-only MTP layers keep their KV in the kv_hca/kv_swa side
+    /// pools, ensure_v4_tier_pages) and for glm5_next (mask set on the 11
+    /// sparse-MLA layers + the sparse-MLA MTP layer; the 34 KDA linear
+    /// layers carry per-request recurrent state — Pool::kKdaState — and no
+    /// KV pages at all). Unmasked layers' layer-major seq_pages_ slots hold
     /// SENTINEL handles (page_idx == -1, gpu_ptr == nullptr; the tiering
     /// neutralization convention) so the [j * kv_layers_ + l] indexing and
-    /// block-table layout stay intact without consuming CSA-bucket pages.
-    /// The V4 auto-sizer funds kMain for num_csa_layers only — allocating
-    /// real pages for all layers exhausts the pool (the 759-vs-4000 prefill
-    /// boundary).
-    std::vector<uint8_t> v4_kmain_layer_;
+    /// block-table layout stay intact without consuming kMain pages.
+    /// The auto-sizer funds kMain for the masked layer count only (V4:
+    /// num_csa_layers — the 759-vs-4000 prefill boundary; glm5_next:
+    /// num_kv_layers() + nextn — a ~4x over-carve otherwise).
+    std::vector<uint8_t> kmain_layer_;
     bool layer_takes_kmain_page(int l) const {
-        return v4_kmain_layer_.empty()
-            || (l >= 0 && l < static_cast<int>(v4_kmain_layer_.size())
-                && v4_kmain_layer_[l] != 0);
+        return kmain_layer_.empty()
+            || (l >= 0 && l < static_cast<int>(kmain_layer_.size())
+                && kmain_layer_[l] != 0);
     }
 
     /// Runtime page budget tracker — counts active sequences/forks for

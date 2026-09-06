@@ -88,7 +88,11 @@ bool CommandDispatcher::forward_one_layer(const ForwardLayerOpts& opts) {
     mp.gpu_idx       = opts.gpu_idx;
     mp.topk_override = opts.topk_override;
     mp.store_gating  = opts.store_gating;
-    const bool moe_ok = tp_active
+    // TD-GLM53-EP4-DEGENERATE-GENERATION: expert-only (non-TP) GPUs make the
+    // MoE multi-rank even with ONE TP rank — their partials must be dispatched
+    // and folded by dispatch_moe_all_ranks or they are silently dropped.
+    const bool moe_multi_rank = tp_active || !ep_xtp_gpus_.empty();
+    const bool moe_ok = moe_multi_rank
         ? dispatch_moe_all_ranks(mp)
         : dispatch_moe_internal(mp);
     if (!moe_ok)
@@ -151,6 +155,12 @@ bool CommandDispatcher::dispatch_output_head(const OutputHeadOpts& opts) {
 
     const auto& mc = deps_.live_config->model;
     const void* head_input = opts.input;
+    // P-29 step 13: sliced norm_only passes read hidden rows at an offset
+    // (trunk hc-wide stride).
+    if (opts.input_row > 0 && head_input)
+        head_input = static_cast<const char*>(head_input)
+            + static_cast<size_t>(opts.input_row) * mc.hidden_size
+              * std::max(1, deps_.hc_streams) * 2;
 
     // Ticket J: V4 dflash final-residual aux tap (before the collapse
     // consumes the hc-wide rows; no-op unless the runtime wants it).
@@ -160,7 +170,14 @@ bool CommandDispatcher::dispatch_output_head(const OutputHeadOpts& opts) {
 
     // V4-5b mHC: the input buffer holds the hc-stream residual — collapse it
     // with the output_hc weights (build_hc_head) before norm + head GEMM.
-    if (deps_.hc_streams > 1) {
+    // P-29 step 11 (#16 MTP): a glm5_next MTP head consumes the MTP block's
+    // SINGLE-stream output (MTP layers are non-mHC) — collapsing it would
+    // stream-mean garbage, so the mtp_head path skips straight to
+    // shared_head.norm + head GEMM (vLLM glm5next mtp.py shape).
+    const bool mtp_single_stream =
+        opts.mtp_head_idx >= 0
+        && mc.architecture == config::Architecture::glm5_next;
+    if (deps_.hc_streams > 1 && !mtp_single_stream) {
         void* hscr = (gpu < moe_scratch_.size()) ? moe_scratch_[gpu].hc_x
                                                  : nullptr;
         const void* fn = (gpu < deps_.output_hc_fn_ptrs.size())
@@ -169,16 +186,31 @@ bool CommandDispatcher::dispatch_output_head(const OutputHeadOpts& opts) {
             ? deps_.output_hc_base_ptrs[gpu] : nullptr;
         const void* scale = (gpu < deps_.output_hc_scale_ptrs.size())
             ? deps_.output_hc_scale_ptrs[gpu] : nullptr;
-        if (!fn || !base || !scale || !hscr) {
+        // GF3.9 (glm5_next): the checkpoint ships NO model-level output_hc
+        // tensors — the final collapse is the UNWEIGHTED stream mean
+        // (vLLM pr-53906 mhc.py hc_contract: "[s, n*hidden] -> [s, hidden]
+        // by averaging"). launch_hc_stream_mean is that exact contraction
+        // (fp32 accumulation, fixed stream order). V4 keeps its learned
+        // collapse and its loud missing-weights failure.
+        const bool unweighted_collapse =
+            mc.architecture == config::Architecture::glm5_next;
+        if (!hscr || (!unweighted_collapse && (!fn || !base || !scale))) {
             spdlog::error("dispatch_output_head: mHC active but output_hc "
                           "weights/scratch missing on gpu {}", gpu);
             return false;
         }
-        compute::launch_mhc_head(
-            hscr, head_input, fn, scale, base,
-            static_cast<float>(mc.rms_norm_eps),
-            static_cast<float>(mc.hc_eps),
-            opts.num_tokens, deps_.hc_streams, mc.hidden_size, opts.stream);
+        if (unweighted_collapse) {
+            compute::launch_hc_stream_mean(
+                hscr, head_input, opts.num_tokens, deps_.hc_streams,
+                mc.hidden_size, opts.stream);
+        } else {
+            compute::launch_mhc_head(
+                hscr, head_input, fn, scale, base,
+                static_cast<float>(mc.rms_norm_eps),
+                static_cast<float>(mc.hc_eps),
+                opts.num_tokens, deps_.hc_streams, mc.hidden_size,
+                opts.stream);
+        }
         head_input = hscr;
     }
 
@@ -186,17 +218,49 @@ bool CommandDispatcher::dispatch_output_head(const OutputHeadOpts& opts) {
     const HeadWeights hw = resolve_head_weights(deps_, gpu, opts.mtp_head_idx);
 
     // Step 1: Final RMSNorm (fixes TD-50x — speculation paths were missing this).
+    // P-29 step 13: an MTP head norms into the TAIL scratch rows so the trunk
+    // verify pass's post-norm rows [0..R) — the MTP_PROJECT prev_src=1
+    // sources — survive interleaved MTP draft heads.
     if (opts.apply_final_norm
         && hw.norm
         && gpu < output_norm_scratch_.size()
         && output_norm_scratch_[gpu]) {
+        size_t norm_row_off = 0;
+        if (opts.mtp_head_idx >= 0) {
+            const int mb = std::max(1, deps_.max_batch_size);
+            if (opts.num_tokens > mb) {
+                spdlog::error("dispatch_output_head: mtp head num_tokens {} "
+                              "exceeds max_batch {}", opts.num_tokens, mb);
+                return false;
+            }
+            norm_row_off = static_cast<size_t>(mb - opts.num_tokens)
+                * mc.hidden_size * 2;
+        }
+        void* norm_dst = static_cast<char*>(
+            static_cast<void*>(output_norm_scratch_[gpu])) + norm_row_off;
         compute::launch_rmsnorm(
-            output_norm_scratch_[gpu], head_input,
+            norm_dst, head_input,
             hw.norm,
             static_cast<float>(mc.rms_norm_eps),
             opts.num_tokens, mc.hidden_size,
             compute::NormDtype::kBFloat16, opts.stream);
-        head_input = output_norm_scratch_[gpu];
+        head_input = norm_dst;
+    }
+
+    // P-29 step 13 (norm_only): the collapse + final norm above is the whole
+    // job — output_norm_scratch now holds num_tokens post-norm rows for
+    // MTP_PROJECT prev_src=1. Refuse loudly if the norm could not run
+    // (a silent no-op would feed the projection stale rows).
+    if (opts.norm_only) {
+        if (!(opts.apply_final_norm && hw.norm
+              && gpu < output_norm_scratch_.size()
+              && output_norm_scratch_[gpu])) {
+            spdlog::error("dispatch_output_head: norm_only requested but "
+                          "final-norm scratch/weights missing on gpu {}",
+                          gpu);
+            return false;
+        }
+        return true;
     }
 
     // Step 2: Output GEMM.
@@ -326,6 +390,11 @@ bool CommandDispatcher::dispatch_output_head_tp(const OutputHeadOpts& opts) {
                 head_input = deps_.hidden_state_pairs[pi].attn_buf;
         }
         if (!head_input) continue;
+        // P-29 step 13: sliced norm_only input row offset (trunk hc stride).
+        if (opts.input_row > 0)
+            head_input = static_cast<const char*>(head_input)
+                + static_cast<size_t>(opts.input_row) * mc.hidden_size
+                  * std::max(1, deps_.hc_streams) * 2;
 
         deps_.device_backends[gpu_pos]->set_device();
         void* stream_r = (static_cast<uint32_t>(gpu_pos) == primary_gpu)
@@ -339,7 +408,11 @@ bool CommandDispatcher::dispatch_output_head_tp(const OutputHeadOpts& opts) {
             deps_, static_cast<size_t>(gpu_pos), opts.mtp_head_idx);
 
         // V4-5b mHC: collapse the hc-stream residual first (per rank).
-        if (deps_.hc_streams > 1) {
+        // P-29 step 11 (#16 MTP): glm5_next MTP head input is single-stream — skip
+        // the collapse (see the single-GPU head above).
+        if (deps_.hc_streams > 1
+            && !(opts.mtp_head_idx >= 0
+                 && mc.architecture == config::Architecture::glm5_next)) {
             const size_t gp = static_cast<size_t>(gpu_pos);
             void* hscr = (gp < moe_scratch_.size()) ? moe_scratch_[gp].hc_x
                                                     : nullptr;
@@ -349,33 +422,65 @@ bool CommandDispatcher::dispatch_output_head_tp(const OutputHeadOpts& opts) {
                 ? deps_.output_hc_base_ptrs[gp] : nullptr;
             const void* scale = (gp < deps_.output_hc_scale_ptrs.size())
                 ? deps_.output_hc_scale_ptrs[gp] : nullptr;
-            if (!fn || !base || !scale || !hscr) {
+            // GF3.9 (glm5_next): unweighted stream-mean collapse — see the
+            // single-GPU head above.
+            const bool unweighted_collapse =
+                mc.architecture == config::Architecture::glm5_next;
+            if (!hscr || (!unweighted_collapse && (!fn || !base || !scale))) {
                 spdlog::error("dispatch_output_head_tp: mHC active but "
                               "output_hc weights/scratch missing on gpu {}",
                               gpu_pos);
                 return false;
             }
-            compute::launch_mhc_head(
-                hscr, head_input, fn, scale, base,
-                static_cast<float>(mc.rms_norm_eps),
-                static_cast<float>(mc.hc_eps),
-                num_tokens, deps_.hc_streams, mc.hidden_size, stream_r);
+            if (unweighted_collapse) {
+                compute::launch_hc_stream_mean(
+                    hscr, head_input, num_tokens, deps_.hc_streams,
+                    mc.hidden_size, stream_r);
+            } else {
+                compute::launch_mhc_head(
+                    hscr, head_input, fn, scale, base,
+                    static_cast<float>(mc.rms_norm_eps),
+                    static_cast<float>(mc.hc_eps),
+                    num_tokens, deps_.hc_streams, mc.hidden_size, stream_r);
+            }
             head_input = hscr;
         }
 
         // Final RMSNorm
+        // P-29 step 13: MTP heads norm into the TAIL scratch rows (single-GPU
+        // twin's rationale — verify-pass prev_src=1 rows must survive).
         if (opts.apply_final_norm
             && hw.norm
             && static_cast<size_t>(gpu_pos) < output_norm_scratch_.size()
             && output_norm_scratch_[gpu_pos]) {
+            size_t norm_row_off = 0;
+            if (opts.mtp_head_idx >= 0) {
+                const int mb = std::max(1, deps_.max_batch_size);
+                if (num_tokens > mb) {
+                    spdlog::error("dispatch_output_head_tp: mtp head "
+                                  "num_tokens {} exceeds max_batch {}",
+                                  num_tokens, mb);
+                    return false;
+                }
+                norm_row_off = static_cast<size_t>(mb - num_tokens)
+                    * mc.hidden_size * 2;
+            }
+            void* norm_dst = static_cast<char*>(
+                static_cast<void*>(output_norm_scratch_[gpu_pos]))
+                + norm_row_off;
             compute::launch_rmsnorm(
-                output_norm_scratch_[gpu_pos], head_input,
+                norm_dst, head_input,
                 hw.norm,
                 static_cast<float>(mc.rms_norm_eps),
                 num_tokens, mc.hidden_size,
                 compute::NormDtype::kBFloat16, stream_r);
-            head_input = output_norm_scratch_[gpu_pos];
+            head_input = norm_dst;
         }
+
+        // P-29 step 13 (norm_only): scratch rows landed on this rank — skip the
+        // partial GEMM (and the allgather below skips all ranks).
+        if (opts.norm_only)
+            continue;
 
         // Partial output GEMM: [num_tokens, local_vocab]
         auto* partial = static_cast<float*>(
@@ -394,6 +499,13 @@ bool CommandDispatcher::dispatch_output_head_tp(const OutputHeadOpts& opts) {
             compute::EmbeddingDtype::kBFloat16, stream_r);
 
         send_bufs[r] = partial;
+    }
+
+    // P-29 step 13 (norm_only): every rank's output_norm_scratch rows landed —
+    // no logits exist, so no allgather/transpose/confidence/readback.
+    if (opts.norm_only) {
+        deps_.device_backends[primary_gpu]->set_device();
+        return true;
     }
 
     // Step 2: Allgather partial logits → full logits.
@@ -1169,6 +1281,10 @@ void CommandDispatcher::handle_forward_one_layer(const ipc::Command& cmd) {
     pc.cuda_event       = event;
     // TD-89m: propagate routed expert miss count, as the RUN_MOE branch does.
     pc.routed_miss_count = last_moe_miss_count_;
+    // TD-INDEXER-NO-DENSE-FALLBACK witness byte: this command's attention
+    // half ran inside forward_one_layer above.
+    pc.indexer_dense = step_indexer_dense_;
+    step_indexer_dense_ = 0;
     pending_compute_.push_back(pc);
 }
 
@@ -1192,8 +1308,8 @@ void CommandDispatcher::handle_forward_one_layer(const ipc::Command& cmd) {
 
 bool CommandDispatcher::dispatch_mtp_projection(
         uint32_t cmd_seq, uint32_t gpu, uint32_t token_id,
-        int mtp_layer_idx, int hidden_row,
-        void*& stream_out, int& pair_idx_out) {
+        int mtp_layer_idx, int hidden_row, int prev_src,
+        void*& stream_out, int& pair_idx_out, int dest_row) {
     if (!deps_.cuda_kernels_enabled || !deps_.live_config
         || !deps_.sideband_base || !deps_.stream_manager) {
         write_error(cmd_seq, gpu, ipc::CmpErrorCategory::kComputeValidation,
@@ -1282,6 +1398,34 @@ bool CommandDispatcher::dispatch_mtp_projection(
     // hidden of a batched verify pass (rows [0..K) of attn_buf) — every
     // write below touches ONLY row 0, so higher rows survive a sequential
     // chain of MTP steps.
+    // P-29 step 11 (prev_src == 1): hnorm the POST-final-norm collapsed hidden
+    // that dispatch_output_head just wrote into output_norm_scratch_ (the
+    // exact `previous_hidden_states` the vLLM glm5next MTP reference
+    // receives — the target model's return value). Valid only when the
+    // caller sequences OUTPUT_HEAD immediately before this command (the
+    // lock-step probe does; the completion wait guarantees the scratch is
+    // final device-wide). Single-rank only: the scratch is per-GPU and
+    // un-replicated, so tp>1 is refused loudly rather than mis-fed.
+    if (prev_src == 1) {
+        // P-29 step 13 phase B: valid at ANY tp — the TP-split head computes the
+        // collapse + final RMSNorm into output_norm_scratch_ on EVERY rank
+        // over ALL num_tokens rows (dispatch_output_head_tp), from the
+        // replicated post-allreduce trunk hidden with replicated norm
+        // weights: each rank's scratch rows are bit-identical replicas.
+        // hidden_row selects the verify-pass row (H-stride f32→bf16 rows).
+        for (int r = 0; r < tp; ++r) {
+            const auto scratch_pos = static_cast<size_t>(
+                deps_.hidden_state_pairs[r].gpu_position);
+            if (scratch_pos >= output_norm_scratch_.size()
+                || !output_norm_scratch_[scratch_pos]) {
+                write_error(cmd_seq, gpu,
+                            ipc::CmpErrorCategory::kComputeValidation,
+                            "mtp_project: prev_src=1 but output_norm_scratch "
+                            "missing on a rank (no OUTPUT_HEAD ran?)");
+                return false;
+            }
+        }
+    }
     const size_t row_off = static_cast<size_t>(hidden_row) * h_bytes;
     for (int r = 0; r < tp; ++r) {
         const auto& pair = deps_.hidden_state_pairs[r];
@@ -1293,8 +1437,12 @@ bool CommandDispatcher::dispatch_mtp_projection(
             deps_.device_backends[pos]->stream_wait_event(
                 s, pair.moe_attn_event);
         auto* concat_hi = static_cast<char*>(ssr.mtp_concat) + h_bytes;
-        const void* prev_hidden =
-            static_cast<const char*>(pair.attn_buf) + row_off;
+        const void* prev_hidden = (prev_src == 1)
+            ? static_cast<const void*>(
+                  static_cast<const char*>(output_norm_scratch_[pos])
+                  + row_off)
+            : static_cast<const void*>(
+                  static_cast<const char*>(pair.attn_buf) + row_off);
         compute::launch_rmsnorm(
             concat_hi, prev_hidden, deps_.mtp_hnorm_ptrs[mi][pos],
             eps, 1, H, compute::NormDtype::kBFloat16, s);
@@ -1305,21 +1453,41 @@ bool CommandDispatcher::dispatch_mtp_projection(
     // Non-primary hnorms above are on the same kAttention streams the embed
     // writes land on (in-order); the primary hnorm is on kExpertFfn, the
     // same stream setup uses for its attn_buf overwrite (in-order).
+    // P-29 step 13 (dest_row > 0, batched MTP prefill chain): the embedding
+    // STAGING moves to a high TRUNK-stride row so the serial PROJECT
+    // loop's staging never clobbers the H-stride projected rows already
+    // landed at [0, dest_row]. dest_row must sit strictly below the
+    // staging region.
+    const int hc = std::max(1, deps_.hc_streams);
+    const int stage_rows_avail = superchunk_rows_ > 0
+        ? superchunk_rows_ : deps_.max_batch_size;
+    const int stage_row = (dest_row > 0)
+        ? std::max(1, stage_rows_avail - 1) : 0;
+    if (dest_row > 0 && dest_row >= stage_row * hc) {
+        write_error(cmd_seq, gpu, ipc::CmpErrorCategory::kComputeValidation,
+                    "mtp_project: dest_row collides with the embedding "
+                    "staging row (raise max_batch_size or sub-batch)");
+        return false;
+    }
     auto& ss = spec_scratch_[gpu];
     if (!setup_spec_pipeline(cmd_seq, gpu, token_id, "mtp_project",
-                             ss, stream_out, pair_idx_out))
+                             ss, stream_out, pair_idx_out, stage_row))
         return false;
 
     // Step 3: enorm(embedding) → concat[0..H) on each rank.  Primary reads
     // ss.hidden_a (kExpertFfn, in-order after the embed); secondaries read
     // their attn_buf copy (kAttention, in-order after the broadcast).
+    const size_t stage_off = static_cast<size_t>(stage_row)
+        * mc.hidden_size * hc * 2;
     for (int r = 0; r < tp; ++r) {
         const auto& pair = deps_.hidden_state_pairs[r];
         const int pos = pair.gpu_position;
         auto& ssr = spec_scratch_[pos];
         void* s = rank_stream(r);
-        const void* embed_src =
-            (r == primary_pair) ? ss.hidden_a : pair.attn_buf;
+        const void* embed_src = (r == primary_pair)
+            ? ss.hidden_a
+            : static_cast<const void*>(
+                  static_cast<const char*>(pair.attn_buf) + stage_off);
         deps_.device_backends[pos]->set_device();
         compute::launch_rmsnorm(
             ssr.mtp_concat, embed_src, deps_.mtp_enorm_ptrs[mi][pos],
@@ -1400,14 +1568,18 @@ bool CommandDispatcher::dispatch_mtp_projection(
 
     // Step 6: projected hidden → attn_buf on every rank (the MTP layer's
     // attention input) + re-record the pair's moe_attn_event so the layer's
-    // step-0 wait covers this write.
+    // step-0 wait covers this write. GF3.13: dest_row selects the H-stride
+    // destination row (MTP layers are single-stream) — a batched prefill
+    // chain lands rows [0..K) for one K-row ATTN(45).
+    const size_t dest_off = static_cast<size_t>(dest_row) * h_bytes;
     for (int r = 0; r < tp; ++r) {
         const auto& pair = deps_.hidden_state_pairs[r];
         const int pos = pair.gpu_position;
         void* s = rank_stream(r);
         deps_.device_backends[pos]->set_device();
         deps_.device_backends[pos]->memcpy_d2d_async(
-            pair.attn_buf, spec_scratch_[pos].hidden_a, h_bytes, s);
+            static_cast<char*>(pair.attn_buf) + dest_off,
+            spec_scratch_[pos].hidden_a, h_bytes, s);
         if (pair.moe_attn_event)
             deps_.device_backends[pos]->record_event(pair.moe_attn_event, s);
     }
@@ -1430,7 +1602,9 @@ void CommandDispatcher::handle_mtp_project(const ipc::Command& cmd) {
     if (!dispatch_mtp_projection(cmd.cmd_seq, gpu, p.input_token_id,
                                  static_cast<int>(p.mtp_layer_idx),
                                  static_cast<int>(p.hidden_row),
-                                 stream, pair_idx))
+                                 static_cast<int>(p.prev_src),
+                                 stream, pair_idx,
+                                 static_cast<int>(p.dest_row)))
         return;  // CMP_ERROR already written
 
     void* event = create_and_record_event(static_cast<int>(gpu),
@@ -1458,7 +1632,7 @@ void CommandDispatcher::run_mtp_pipeline(const ipc::Command& cmd) {
     int pair_idx = -1;
     if (!dispatch_mtp_projection(cmd.cmd_seq, gpu, p.input_token_id,
                                  static_cast<int>(p.mtp_layer_idx),
-                                 /*hidden_row=*/0,
+                                 /*hidden_row=*/0, /*prev_src=*/0,
                                  stream, pair_idx))
         return;
 

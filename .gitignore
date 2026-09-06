@@ -30,3 +30,14 @@ test-data/GLM-5.2-speculator.dspark
 # Routing x-ray capture (1.6 GB local artifact; see test-data/routing-xray/README.md)
 test-data/routing-xray/*.bin
 test-data/routing-xray/route_dump_*
+scratchpad/gf3_speed_saga/step2/trace_kcopy1.csv
+scratchpad/gf3_speed_saga/step3/trace_mpoke1.csv
+scratchpad/gf3_speed_saga/step15/trace15.csv
+scratchpad/gf3_speed_saga/step15/export15.log
+scratchpad/gf3_speed_saga/step16/trace_on.csv
+scratchpad/gf3_speed_saga/step16/trace_off.csv
+scratchpad/gf3_speed_saga/step16/trace_final.csv
+scratchpad/gf3_speed_saga/step16/win.sqlite
+scratchpad/gf3_speed_saga/step17/trace17_on.csv
+scratchpad/gf3_speed_saga/step17/*.npz
+scratchpad/gf3_speed_saga/p30s1/*.csv

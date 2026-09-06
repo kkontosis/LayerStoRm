@@ -4,6 +4,8 @@
 // spawns a daemon thread (DaemonLoop), and exposes start_engine/stop_engine.
 // pybind11 bindings live in python/bindings/engine_pybind.cpp.
 
+#include <string_view>
+
 #include "daemon/engine.h"
 
 #include <algorithm>
@@ -13,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <format>
 #include <mutex>
 #include <set>
 #include <new>
@@ -27,6 +30,7 @@
 #include "core/attention_device.h"
 #include "core/bf16_convert.h"
 #include "core/cuda_hardware_query.h"
+#include "core/determinism.h"
 #include "core/device_backend.h"
 #include "core/expert_device.h"
 #include "core/gpu_loader/loader_calibration.h"
@@ -51,6 +55,7 @@
 #include "compute/stream_manager.h"
 #include "core/memory/expert_cache.h"
 #include "core/memory/numa_manager.h"
+#include "daemon/dispatch_detail.h"
 #include "core/perf_trace.h"
 #include "core/memory/arena_cache.h"
 #include "core/memory/arena_ipc_client.h"
@@ -69,6 +74,7 @@
 #include "speculation/dspark_runtime.h"       // DSP-3
 #include "speculation/speculation_factory.h"
 #include "daemon/spsc_ring.h"
+#include "daemon/expert_zone_rebalancer.h"   // 44z
 #include <array>
 
 #include "model/layer_registry.h"
@@ -273,6 +279,22 @@ void Engine::init_modules() {
     // Step 1: Parse config
     cfg_ = std::make_unique<config::Config>(config::load_config(config_path_));
 
+    // Step 1a (DETERMINISM SUPERFLAGS): apply the requested mode BEFORE any
+    // getenv-latching static runs (attention devices latch at construction
+    // below; moe_driver gates latch at first decode dispatch). Two flags,
+    // strict hierarchy: compute.deterministic / LS_DETERMINISTIC = run-to-run
+    // determinism; compute.reference_trajectory_identity /
+    // LS_REFERENCE_TRAJECTORY_IDENTITY = reference-trajectory identity, which
+    // IMPLIES the former. Forces knob states via setenv (env wins over config
+    // at every read site), logs each forced knob loudly tagged with the flag
+    // that forced it, and THROWS on a user env pin that conflicts with the
+    // requested mode (incl. requesting flag 2 while suppressing flag 1)
+    // instead of silently overriding it. No-op unless requested. See
+    // src/core/determinism.h.
+    core::determinism::apply_or_throw(
+        cfg_->compute.deterministic,
+        cfg_->compute.reference_trajectory_identity);
+
     // Step 1b (TD-VOCAB-AUTODETECT): resolve model.vocab_size against the
     // weights' embedding/output-head row count BEFORE ModelConfig /
     // LayerRegistry / VramAllocator size anything off it. 0/absent = adopt
@@ -317,9 +339,55 @@ void Engine::init_modules() {
         quant_ = &model::get_format(cfg_->quantization.weights);
     }
 
+    // Step 4b (GF3.15, TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): the pinned
+    // REGION is carved before any weight load, so the glm5_next GGUF arm used to
+    // size every packed attention matrix at a BF16 upper bound. The per-tensor
+    // k-quant types are not actually unknown at plan time — they sit in the
+    // tensor-info headers this same init already scans for the expert types.
+    // Pre-scan the non-expert tensors too and hand the widths to LayerRegistry,
+    // so the region is sized at what the upload really writes (5.2 GiB of pinned
+    // VRAM on GLM-5.3-Flash, which the TP GPU spends on experts instead).
+    // Only the glm5_next arm consumes it today; every other architecture keeps
+    // its existing bound (see glm5_next_attention_layer_bytes).
+    // LS_PINNED_EXACT_WIDTHS=0 restores the pre-GF3.15 BF16 upper bound — a
+    // kill switch for a change that moves the VRAM carve, and the control arm
+    // for any A/B against it.
+    const char* exact_env = std::getenv("LS_PINNED_EXACT_WIDTHS");
+    const bool exact_widths = !(exact_env && std::string_view(exact_env) == "0");
+    if (exact_widths &&
+        cfg_->model.weights_format == config::WeightsFormat::gguf &&
+        model::gguf::is_gguf_weight_quant(cfg_->quantization.weights) &&
+        model_cfg_->is_glm5_next()) {
+        owned_gguf_widths_.emplace(model::gguf_non_expert_widths_from_path(
+            cfg_->model.weights_path, cfg_->model.use_mmap));
+        spdlog::info("GF3.15: pre-scanned {} non-expert GGUF tensor width(s) — "
+                     "pinned attention slots sized at the checkpoint's real "
+                     "k-quant widths, not a BF16 upper bound",
+                     owned_gguf_widths_->packed.size());
+    }
+
     // Step 5: Layer registry
     layer_registry_ = std::make_unique<model::LayerRegistry>(
-        *model_cfg_, *cfg_, *quant_);
+        *model_cfg_, *cfg_, *quant_,
+        owned_gguf_widths_ ? &*owned_gguf_widths_ : nullptr);
+
+    // GF3.15: state the recovery explicitly, so the pinned region is auditable
+    // from the boot log alone and the autoconfig solver has an engine-reported
+    // figure to cross-check its own model against (the whole point of the
+    // ticket family: solver models a quantity, engine computes it differently,
+    // nobody notices). Pure arithmetic — no second file scan.
+    if (owned_gguf_widths_ && !owned_gguf_widths_->empty()) {
+        const int64_t bound = model::compute_pinned_layout(
+            *model_cfg_, *cfg_, *quant_,
+            std::max(1, cfg_->parallelism.tensor_parallelism), 0,
+            /*widths=*/nullptr).total_bytes;
+        const int64_t exact = layer_registry_->pinned_layout().total_bytes;
+        constexpr double kMiB = 1024.0 * 1024.0;
+        spdlog::info("GF3.15: pinned region {:.1f} MiB exact vs {:.1f} MiB at the "
+                     "BF16 upper bound — {:.1f} MiB returned to the expert/KV "
+                     "carve (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND)",
+                     exact / kMiB, bound / kMiB, (bound - exact) / kMiB);
+    }
 
     // Step 5b: Create per-GPU DeviceBackend instances (#86a)
     device_backends_.clear();
@@ -346,6 +414,29 @@ void Engine::init_modules() {
     // Step 7: Page allocator (D2D copy via DeviceBackend; UVA auto-routes)
     page_allocator_ = std::make_unique<memory::PageAllocator>(
         *vram_allocator_, dev_ptrs[0]);
+    // S2 (TD-INDEXER-POOL-ELASTIC / TD-SLAB-S2-GLM-MIN-FOOTPRINT): the
+    // kMain span is bump-allocated POSITION-MAJOR per sequence in whole
+    // slabs — say the minimum per-sequence footprint and the tail-
+    // fragmentation cost AT BOOT (the design's MEASURE gate) so the
+    // kv-page concurrency implied by the pool size is read honestly.
+    // V4 counts CSA layers only (other layers are side-tier).
+    if (page_allocator_->pages_per_slab() > 0) {
+        int kv_layers = cfg_->model.num_hidden_layers
+                      + cfg_->model.num_nextn_predict_layers;
+        if (cfg_->model.architecture == config::Architecture::deepseek_v4) {
+            kv_layers = 0;
+            for (int cr : cfg_->model.compress_ratios)
+                if (cr == memory::kV4CsaRatio) ++kv_layers;
+        }
+        const int pps = page_allocator_->pages_per_slab();
+        const int min_slabs = (kv_layers + pps - 1) / pps;
+        spdlog::info(
+            "PageAllocator: S2 position-major bump allocation — minimum "
+            "sequence footprint {} slab(s) ({} kMain layers / {} pages per "
+            "slab), tail fragmentation ~1 partial frontier slab ({} B) per "
+            "sequence per GPU",
+            min_slabs, kv_layers, pps, page_allocator_->slab_bytes());
+    }
 
     // Step 8: Expert cache
     const model::ExpertShape expert_shape{
@@ -496,64 +587,53 @@ void Engine::init_modules() {
         // measured for a different model (compute_dims_match) OR if a device UUID does
         // not match the live GPU at that position (wrong machine / reordered devices) —
         // then recalibrate. Empty UUIDs (old v2 file) skip the UUID check (INV-LOADER-CAL-6).
-        bool loaded_ok = false;
-        if (mode == gpu_loader::CalibrationMode::kLoaded &&
-            std::filesystem::exists(calibration_path)) {
-            try {
-                gpu_loader::LoaderConstants disk = gpu_loader::load(calibration_path);
-                bool uuid_ok = true;
-                for (const auto& dev : disk.devices) {
-                    if (dev.uuid.empty()) continue;  // old v2 file → skip identity check
-                    if (dev.position < 0 ||
-                        dev.position >= static_cast<int>(dev_ptrs.size()) ||
-                        dev_ptrs[static_cast<size_t>(dev.position)] == nullptr)
-                        continue;  // no live device at this slot → can't compare
-                    std::string live_uuid;
-                    try {
-                        live_uuid = core::query_gpu_info(
-                            dev_ptrs[static_cast<size_t>(dev.position)]->gpu().id).uuid;
-                    } catch (const std::exception& e) {
-                        spdlog::warn("gpu_loader: query_gpu_info(pos={}) failed ({}); "
-                                     "skipping UUID check for it", dev.position, e.what());
-                        continue;
-                    }
-                    if (!live_uuid.empty() && live_uuid != dev.uuid) {
-                        spdlog::warn("gpu_loader: {} device pos={} UUID {} != live {} "
-                                     "(wrong machine / reordered devices); recalibrating",
-                                     calibration_path, dev.position, dev.uuid, live_uuid);
-                        uuid_ok = false;
-                        break;
-                    }
+        auto accept_disk = [&](const gpu_loader::LoaderConstants& disk) {
+            for (const auto& dev : disk.devices) {
+                if (dev.uuid.empty()) continue;  // old v2 file → skip identity check
+                if (dev.position < 0 ||
+                    dev.position >= static_cast<int>(dev_ptrs.size()) ||
+                    dev_ptrs[static_cast<size_t>(dev.position)] == nullptr)
+                    continue;  // no live device at this slot → can't compare
+                std::string live_uuid;
+                try {
+                    live_uuid = core::query_gpu_info(
+                        dev_ptrs[static_cast<size_t>(dev.position)]->gpu().id).uuid;
+                } catch (const std::exception& e) {
+                    spdlog::warn("gpu_loader: query_gpu_info(pos={}) failed ({}); "
+                                 "skipping UUID check for it", dev.position, e.what());
+                    continue;
                 }
-                if (uuid_ok && gpu_loader::compute_dims_match(disk, model_N, model_K)) {
-                    loader_constants_ = std::move(disk);
-                    loaded_ok = true;
-                } else if (uuid_ok) {
-                    spdlog::warn("gpu_loader: {} compute dims (N={},K={}) != model (N={},K={}); "
-                                 "recalibrating",
-                                 calibration_path, disk.compute_N, disk.compute_K,
-                                 model_N, model_K);
+                if (!live_uuid.empty() && live_uuid != dev.uuid) {
+                    spdlog::warn("gpu_loader: {} device pos={} UUID {} != live {} "
+                                 "(wrong machine / reordered devices); recalibrating",
+                                 calibration_path, dev.position, dev.uuid, live_uuid);
+                    return false;
                 }
-            } catch (const std::exception& e) {
-                spdlog::warn("gpu_loader: failed to load {} ({}); recalibrating",
-                             calibration_path, e.what());
             }
-        }
-        if (!loaded_ok) {
-            const gpu_loader::CalibrationMode run_mode =
-                (mode == gpu_loader::CalibrationMode::kLoaded) ? gpu_loader::CalibrationMode::kFull
-                                                              : mode;
-            gpu_loader::CalibrationConfig rcfg = gpu_loader::config_for_mode(run_mode);
-            rcfg.compute_N = model_N;
-            rcfg.compute_K = model_K;
-            rcfg.recon_payload_bytes = recon_payload;
-            loader_constants_ = gpu_loader::calibrate(dev_ptrs, *numa_manager_, rcfg, expert_ptrs);
-            try {
-                gpu_loader::save(loader_constants_, calibration_path);
-            } catch (const std::exception& e) {
-                spdlog::warn("gpu_loader: could not write {} ({})", calibration_path, e.what());
+            if (!gpu_loader::compute_dims_match(disk, model_N, model_K)) {
+                spdlog::warn("gpu_loader: {} compute dims (N={},K={}) != model (N={},K={}); "
+                             "recalibrating",
+                             calibration_path, disk.compute_N, disk.compute_K, model_N, model_K);
+                return false;
             }
-        }
+            return true;
+        };
+
+        // The precedence itself (load → validate → escalate kLoaded to full →
+        // calibrate → write) is gpu_loader::load_or_calibrate_with; this hook only
+        // supplies the model-specific calibration config and the identity check, so
+        // the shipped self-heal path is the one the unit tier covers
+        // (GpuLoaderConstants.LoadOrCalibrate*). Do NOT reinline it here.
+        loader_constants_ = gpu_loader::load_or_calibrate_with(
+            mode, calibration_path,
+            [&](gpu_loader::CalibrationMode run_mode) {
+                gpu_loader::CalibrationConfig rcfg = gpu_loader::config_for_mode(run_mode);
+                rcfg.compute_N = model_N;
+                rcfg.compute_K = model_K;
+                rcfg.recon_payload_bytes = recon_payload;
+                return gpu_loader::calibrate(dev_ptrs, *numa_manager_, rcfg, expert_ptrs);
+            },
+            accept_disk);
     }
 
     // Step 15-16: AttentionDevices + DcpExecutor (all TP configs, TD-40h)
@@ -566,6 +646,20 @@ void Engine::init_modules() {
     // be the FULL model head count (not the TP-local shard).
     const bool kv_sharded_mode = (tp >= 2)
         && cfg_->hardware.dcp_kv_mode == config::DcpKvMode::sharded;
+
+    // GF3.10 (mirror of TD-V4-DCP-KV): glm5_next TP runs REPLICATED KV
+    // only. Sequence-sharded KV is meaningless for the 34 KDA layers'
+    // whole-sequence recurrent state (no token shard to own), and the QAG
+    // structure it imposes on the 11 sparse layers has never been designed
+    // against the hybrid dispatch. Fail the BOOT, loudly — the arch's
+    // validate_shape carries a belt-and-braces refusal for the same shape.
+    if (kv_sharded_mode && model_cfg_->is_glm5_next()) {
+        throw std::runtime_error(
+            "glm5_next: sequence-sharded KV mode is fail-closed (the KDA "
+            "recurrent state is whole-sequence; replicated KV is the "
+            "glm5_next TP mode, GF3.10) — set hardware.dcp_kv_mode = "
+            "\"replicated\"");
+    }
 
     // TP GPUs are the first tp entries in the GPU list
     std::vector<config::GpuRef> tp_gpus;
@@ -653,8 +747,18 @@ void Engine::init_modules() {
             // to the 512 floor on the very box the elastic K exists for —
             // the legacy halving fail-safe reserved only 1.5 GiB and
             // reached 2048 tokens on less free VRAM.
-            const size_t headroom =
+            size_t headroom =
                 std::max(margin, static_cast<size_t>(1536ull << 20));
+            // P-30 step 1 measurement device: LS_MOE_BIG_FIT_HEADROOM_MB
+            // overrides the working headroom the elastic derivation
+            // reserves, so a sweep boot on a supervised box can realize a
+            // higher superchunk rung than the production margin allows.
+            // Diagnostic; never promoted (production keeps the margin).
+            if (const char* e = std::getenv("LS_MOE_BIG_FIT_HEADROOM_MB");
+                e && *e) {
+                const long mb = std::strtol(e, nullptr, 10);
+                if (mb >= 0) headroom = static_cast<size_t>(mb) << 20;
+            }
             const size_t budget = min_free > headroom ? min_free - headroom : 0;
             rows = static_cast<int>(std::min<size_t>(
                 static_cast<size_t>(request),
@@ -755,8 +859,18 @@ void Engine::init_modules() {
         // seeds carry no rank) — precompute once, layer-parallel (~1 s), so
         // each rank's init only allocs+uploads (was ~23 s/rank of serial
         // Householder QR, the dominant rank-init cost).
+        // TD-TQ-MTP-PI-RANGE: size for the KV layer count — the MTP block
+        // (num_nextn_predict_layers) IS sparse MLA on glm5_next and GLM-5.2
+        // and codes its KV through the same per-layer Π. Sizing only for
+        // num_hidden_layers left device_Pi(num_hidden_layers) an
+        // out-of-bounds read (debug-only assert) the day MTP speculation is
+        // armed on a TQ backend. Per-layer seeds (42 + 7*layer, INV-TQ-4)
+        // make the extra layers additive: existing layers' Π are
+        // byte-identical.
+        const int tq_layers = cfg_->model.num_hidden_layers
+                            + cfg_->model.num_nextn_predict_layers;
         const auto tq_shared_rotations = compute::precompute_tq_rotations(
-            cfg_->model.kv_lora_rank, cfg_->model.num_hidden_layers);
+            cfg_->model.kv_lora_rank, tq_layers);
         for (int i = 0; i < tp; ++i) {
             auto* dev = attention_devices_[i].get();
             // INV-TQ-PERRANK: allocate the codebook + Pi on THIS rank's GPU
@@ -766,7 +880,7 @@ void Engine::init_modules() {
             compute::TqInitOptions tq_opts;
             tq_opts.d_c = cfg_->model.kv_lora_rank;
             tq_opts.bits = 4;
-            tq_opts.num_layers = cfg_->model.num_hidden_layers;
+            tq_opts.num_layers = tq_layers;
             tq_opts.codebook_dir = LAYERSTORM_TQ_CODEBOOK_DIR;
             tq_opts.attention_device = dev;
             tq_resources_.push_back(compute::init_tq_resources(
@@ -782,7 +896,7 @@ void Engine::init_modules() {
         spdlog::info("TQ resources initialized: d_c={}, {} layers, "
                      "{} rank(s) (per-rank codebook+Pi, INV-TQ-PERRANK), "
                      "deterministic_reduce={}",
-                     cfg_->model.kv_lora_rank, cfg_->model.num_hidden_layers,
+                     cfg_->model.kv_lora_rank, tq_layers,
                      tp, det_reduce);
     }
 
@@ -879,7 +993,13 @@ void Engine::init_modules() {
             ? static_cast<int>(v4.indexer_bytes_per_page /
                                v4.indexer_entry_bytes)
             : 0;
-        vo.idx_page_bytes = v4.indexer_bytes_per_page;
+        // S1 (TD-INDEXER-POOL-ELASTIC): the physical stride of kIndexerK
+        // pages is the SLAB size (>= indexer_bytes_per_page; intra-page
+        // layout still derives from idx_entries_per_page, so only the
+        // base + page_idx * stride addressing consumes this).
+        vo.idx_page_bytes = vram_allocator_->layout().slab_bytes > 0
+                                ? vram_allocator_->layout().slab_bytes
+                                : v4.indexer_bytes_per_page;
         vo.index_n_heads = cfg_->model.index_n_heads;
         vo.index_head_dim = cfg_->model.index_head_dim;
         vo.max_index_blocks = (max_kv + memory::kV4CsaRatio - 1) / memory::kV4CsaRatio;
@@ -1197,7 +1317,11 @@ void Engine::init_modules() {
                     ? static_cast<int>(v4l.indexer_bytes_per_page
                                        / v4l.indexer_entry_bytes)
                     : 0;
-                v.idx_page_bytes = v4l.indexer_bytes_per_page;
+                // S1: physical page stride = slab size (see V4DeviceOptions
+                // wiring above).
+                v.idx_page_bytes = vram_allocator_->layout().slab_bytes > 0
+                                       ? vram_allocator_->layout().slab_bytes
+                                       : v4l.indexer_bytes_per_page;
                 v.topk = cfg_->model.index_topk;
                 v.max_seq = cfg_->serving.max_sequence_length;
                 // Ticket J: dspark speculation needs rewind-lossless ring
@@ -1220,6 +1344,13 @@ void Engine::init_modules() {
         .has_dsa              = model_cfg_->has_dsa()
                                   && cfg_->model.index_topk > 0,
         .index_topk           = cfg_->model.index_topk,
+        .index_kpool          = cfg_->model.index_kpool,  // GF3.5 row math
+        // GF3.5: glm5_next indexer k_norm eps is a HARD 1e-6 (vLLM
+        // attention.py:267), NOT the model rms_norm_eps (1e-5). 0 = legacy
+        // (use rms_norm_eps).
+        .indexer_norm_eps     =
+            cfg_->model.architecture == config::Architecture::glm5_next
+                ? 1e-6 : 0.0,
         .index_n_heads        = cfg_->model.index_n_heads,
         .index_head_dim       = cfg_->model.index_head_dim,
         // IndexShare (GLM-25b): per-layer full/shared mask. Empty (no sharing)
@@ -1233,6 +1364,55 @@ void Engine::init_modules() {
             for (bool full : mask) m.push_back(full ? 1 : 0);
             return m;
         }(),
+        // GF3.5: the computing-layer set (storage owners), incl. MTP layers
+        // — ModelConfig::computes_indexer is the one predicate.
+        .indexer_computes_layers = [&]{
+            const int n = cfg_->model.num_hidden_layers
+                        + cfg_->model.num_nextn_predict_layers;
+            std::vector<uint8_t> m(static_cast<size_t>(std::max(n, 0)), 0);
+            for (int l = 0; l < n; ++l)
+                m[static_cast<size_t>(l)] =
+                    model_cfg_->computes_indexer(l) ? 1 : 0;
+            return m;
+        }(),
+        // GF3.9 KDA (glm5_next): the slot-layout numbers the executor
+        // needs to address per-layer state/rings inside a whole-request
+        // slot (VramLayout::kda via PageAllocator::kda_layout()), plus the
+        // per-rank region bases for the decode kernels' base +
+        // slots[b] * stride indirection. All zero / empty on every other
+        // architecture (kda_enabled false ⇒ no KDA scratch allocated).
+        .kda_enabled          = model_cfg_->is_glm5_next()
+            && model_cfg_->num_linear_attention_layers() > 0
+            && page_allocator_
+            && page_allocator_->kda_state_slot_bytes() > 0,
+        .kda_heads_per_rank   =
+            cfg_->model.linear_attn_config.has_value() && tp > 0
+                ? cfg_->model.linear_attn_config->num_heads / tp : 0,
+        .kda_slot_bytes       = page_allocator_
+            ? page_allocator_->kda_layout().slot_bytes : 0,
+        .kda_recurrent_bytes_per_layer = page_allocator_
+            ? page_allocator_->kda_layout().recurrent_bytes_per_layer : 0,
+        .kda_ring_bytes_per_layer = page_allocator_
+            ? page_allocator_->kda_layout().ring_bytes_per_layer : 0,
+        .kda_per_layer_bytes  = page_allocator_
+            ? page_allocator_->kda_layout().per_layer_bytes : 0,
+        .kda_gate_lower_bound = cfg_->model.linear_attn_config.has_value()
+            ? static_cast<float>(
+                  cfg_->model.linear_attn_config->gate_lower_bound)
+            : -5.0f,
+        .kda_mapped           = page_allocator_
+            ? page_allocator_->kda_state_mapped() : false,
+        .kda_state_stride_bytes = page_allocator_
+            ? page_allocator_->kda_state_stride_bytes() : 0,
+        .kda_state_bases      = [&]{
+            std::vector<void*> v;
+            if (model_cfg_->is_glm5_next() && page_allocator_) {
+                for (int i = 0; i < tp; ++i)
+                    v.push_back(page_allocator_->kda_state_base(
+                        tp_gpus[static_cast<size_t>(i)].position));
+            }
+            return v;
+        }(),
         // GG-4: GGUF attention GEMM dispatch. Active when the checkpoint is GGUF
         // (weights_format) or the configured weight quant is a gguf* variant.
         // gguf_strategy gates int (mmvq/mmq) vs dequant; gates Q8_1 workspace.
@@ -1240,6 +1420,20 @@ void Engine::init_modules() {
             cfg_->model.weights_format == config::WeightsFormat::gguf
             || model::gguf::is_gguf_weight_quant(cfg_->quantization.weights),
         .gguf_strategy        = cfg_->quantization.gguf_strategy,
+        // TD-GLM5-TP-COMBINE-PRECISION (resolved 2026-08-31): fp32 TP
+        // partial combine — OPT-IN (LS_TP_COMBINE_FP32=1), default OFF.
+        // The fp32 machinery (fp32-out o_proj + shared/dense-FFN partials,
+        // fp32 allreduce, one post-sum bf16 round) is landed and measured:
+        // it shrinks the per-layer TP drift seed 1e2-1e5x (L0 probes), but
+        // long-decode token identity vs TP=1 does NOT follow — the binding
+        // constraint is the K-split fp32 reassociation of the row-parallel
+        // GEMMs themselves, chaotically amplified by the 45-layer stack
+        // (both precisions flip the same 0.2521-margin call at +16; see
+        // TD-GLM5-TP-KSPLIT-REASSOC and INV-KDA-TP). Default OFF keeps
+        // TP>=2 byte-identical to the GF3.10-recorded behavior and every
+        // TP=2 gate outcome; the env is the identity-work lever. Inert at
+        // tp==1 either way.
+        .tp_combine_fp32      = false,
         .communicator         = dcp_communicator_.get(),
         .stream_manager       = stream_manager_.get(),
         .graph_registry       = graph_registry_.get(),
@@ -1312,6 +1506,23 @@ void Engine::init_modules() {
     // Step 17: Statistics modules
     const uint32_t num_moe   = static_cast<uint32_t>(model_cfg_->num_moe_layers());
     const uint32_t num_exp   = static_cast<uint32_t>(cfg_->model.n_routed_experts);
+    // TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: every ipc::kMaxExperts-sized
+    // table (FAR routed union, StateSnapshot expert arrays, ELM tracking)
+    // silently drops expert ids >= the cap — refuse loudly at boot instead.
+    if (num_exp > static_cast<uint32_t>(ipc::kMaxExperts)) {
+        throw std::runtime_error(std::format(
+            "model.n_routed_experts={} exceeds ipc::kMaxExperts={} — expert "
+            "ids beyond the cap would be silently dropped from the routed "
+            "union and residency tracking (TD-GLM5N-ROUTED-EXPERT-ID-"
+            "TRUNCATION); raise ipc::kMaxExperts and shm_protocol.MAX_EXPERTS "
+            "in lockstep", num_exp, ipc::kMaxExperts));
+    }
+    if (num_moe > static_cast<uint32_t>(ipc::kMaxMoeLayers)) {
+        throw std::runtime_error(std::format(
+            "num_moe_layers={} exceeds ipc::kMaxMoeLayers={} — MoE layers "
+            "beyond the cap would be planning-blind (TD-IPC-MOE-LAYER-CAP)",
+            num_moe, ipc::kMaxMoeLayers));
+    }
     const uint32_t first_moe = static_cast<uint32_t>(cfg_->model.first_k_dense_replace);
 
     expert_stats_ = std::make_unique<statistics::ExpertStats>(
@@ -1739,8 +1950,8 @@ void Engine::init_modules() {
                                             required_bytes_with_ema(
                                                 geom,
                                                 static_cast<uint32_t>(
-                                                    cfg_->model
-                                                        .num_hidden_layers),
+                                                    moe_layer_bound(
+                                                        cfg_->model)),
                                                 static_cast<uint32_t>(
                                                     cfg_->model
                                                         .n_routed_experts))));
@@ -1796,8 +2007,16 @@ void Engine::init_modules() {
                             if (warm_attach) {
                                 const size_t adopted =
                                     arena_cache_->scan_adoptable(
+                                        // P-29 step 11: include probe MTP layers so
+                                        // their warm slots survive re-attach.
                                         static_cast<uint32_t>(
-                                            cfg_->model.num_hidden_layers),
+                                            cfg_->model.num_hidden_layers
+                                            + (model_cfg_->is_moe_layer(
+                                                   cfg_->model
+                                                       .num_hidden_layers)
+                                                   ? cfg_->model
+                                                        .num_nextn_predict_layers
+                                                   : 0)),
                                         static_cast<uint32_t>(
                                             cfg_->model.n_routed_experts),
                                         [&](int node, size_t slot,
@@ -1882,6 +2101,18 @@ void Engine::init_modules() {
                         // thread, outside any fallback catch) so an
                         // unreadable table fails init loudly. nullptr = the
                         // legacy tiered fill, byte-for-byte.
+                        // P-29 step 11 (LS_MTP_PROBE): probe-armed MTP layers'
+                        // experts are arena tenants — every key enumeration
+                        // below must cover them or layer 45 slots are never
+                        // built and each fetch dies at the deadline. Flag
+                        // off: bound == num_hidden_layers, unchanged.
+                        const uint32_t expert_layer_bound =
+                            static_cast<uint32_t>(
+                                cfg_->model.num_hidden_layers
+                                + (model_cfg_->is_moe_layer(
+                                       cfg_->model.num_hidden_layers)
+                                       ? cfg_->model.num_nextn_predict_layers
+                                       : 0));
                         std::unordered_map<memory::ExpertKey, int> place_map;
                         {
                             const auto place_policy =
@@ -1891,8 +2122,8 @@ void Engine::init_modules() {
                                 const auto ftab = memory::ArenaFreqTable::load(
                                     place_policy.freq_path);
                                 std::vector<memory::ExpertKey> pkeys;
-                                for (uint32_t L = 0; L < static_cast<uint32_t>(
-                                         cfg_->model.num_hidden_layers); ++L)
+                                for (uint32_t L = 0; L < expert_layer_bound;
+                                     ++L)
                                     for (uint32_t e = 0; e < static_cast<uint32_t>(
                                              cfg_->model.n_routed_experts); ++e) {
                                         memory::ExpertKey k{
@@ -1942,8 +2173,7 @@ void Engine::init_modules() {
                             // reservation rules as preload().
                             const auto bst = model::live_prepack_build(
                                 *pinned_arena_, *numa_manager_, *live_source_,
-                                static_cast<uint32_t>(
-                                    cfg_->model.num_hidden_layers),
+                                expert_layer_bound,
                                 static_cast<uint32_t>(
                                     cfg_->model.n_routed_experts),
                                 place_map.empty() ? nullptr : &place_map,
@@ -1956,8 +2186,7 @@ void Engine::init_modules() {
                         } else {
                             n = pinned_arena_->preload(
                                 *prepacked_source_,
-                                static_cast<uint32_t>(
-                                    cfg_->model.num_hidden_layers),
+                                expert_layer_bound,
                                 static_cast<uint32_t>(
                                     cfg_->model.n_routed_experts),
                                 loader,
@@ -2365,6 +2594,23 @@ void assign_attn_weight_ptr(parallelism::AttentionLayerWeights& w,
             case TC::indexer_compressor_wgate: w.indexer_compressor_wgate = ptr; break;
             case TC::indexer_compressor_ape:   w.indexer_compressor_ape = ptr; break;
             case TC::indexer_compressor_norm:  w.indexer_compressor_norm = ptr; break;
+            // ── GF3.9 KDA components (glm5_next linear layers; GF3.3
+            //    loaded/sharded them, this is the join that stops the
+            //    silent default-drop) ──
+            case TC::kda_q_proj:            w.kda_q_proj = ptr; break;
+            case TC::kda_k_proj:            w.kda_k_proj = ptr; break;
+            case TC::kda_v_proj:            w.kda_v_proj = ptr; break;
+            case TC::kda_b_proj:            w.kda_b_proj = ptr; break;
+            case TC::kda_f_a_proj:          w.kda_f_a_proj = ptr; break;
+            case TC::kda_f_b_proj:          w.kda_f_b_proj = ptr; break;
+            case TC::kda_g_a_proj:          w.kda_g_a_proj = ptr; break;
+            case TC::kda_g_b_proj:          w.kda_g_b_proj = ptr; break;
+            case TC::kda_q_conv1d:          w.kda_q_conv1d = ptr; break;
+            case TC::kda_k_conv1d:          w.kda_k_conv1d = ptr; break;
+            case TC::kda_v_conv1d:          w.kda_v_conv1d = ptr; break;
+            case TC::kda_a_log:             w.kda_a_log = ptr; break;
+            case TC::kda_dt_bias:           w.kda_dt_bias = ptr; break;
+            case TC::kda_o_norm:            w.kda_o_norm = ptr; break;
             default: break;
         }
     } else if (role == TR::weight_scale) {
@@ -2608,10 +2854,18 @@ void Engine::upload_pinned_weights() {
         dense_gguf_types = model::gguf_owner_types_from_model(
             *loaded_model_, model::TensorOwner::dense_ffn);
     }
+    // GF3.15: the UPLOAD plan must be sized with the SAME widths the pinned
+    // REGION was carved with (`owned_gguf_widths_`, LayerRegistry step 5), or
+    // the cursor advances by BF16-bound slots inside an exactly-sized region
+    // and `upload_pinned_weights` refuses with a region overflow. Caught live
+    // by the GLM-5.3-Flash golden the first time the two disagreed — the
+    // failure is loud and pre-upload, which is the property that makes exact
+    // sizing safe to ship.
     auto upload_plan = model::build_upload_plan(
         *model_cfg_, *cfg_, *quant_, tp, 0,
         shared_gguf_types ? &*shared_gguf_types : nullptr,
-        dense_gguf_types ? &*dense_gguf_types : nullptr);
+        dense_gguf_types ? &*dense_gguf_types : nullptr,
+        owned_gguf_widths_ ? &*owned_gguf_widths_ : nullptr);
     model::validate_plan(upload_plan, *loaded_model_, *model_cfg_, *cfg_, *quant_, tp);
 
     // Resize output vectors.
@@ -2807,12 +3061,27 @@ void Engine::upload_pinned_weights() {
                     sb.id.component == model::TensorComponent::kv_a_norm ||
                     sb.id.component == model::TensorComponent::indexer_k_norm_weight ||
                     sb.id.component == model::TensorComponent::indexer_k_norm_bias ||
+                    // GF3.9 KDA: the conv taps and o_norm are consumed BF16
+                    // by the kda kernels — the GGUF ships them F32 (convert;
+                    // dtype gate below), the native FP8 ckpt ships them BF16
+                    // (1:1). a_log/dt_bias are NOT here: the kernels read
+                    // them F32 (booklet §1.2 data contract).
+                    sb.id.component == model::TensorComponent::kda_q_conv1d ||
+                    sb.id.component == model::TensorComponent::kda_k_conv1d ||
+                    sb.id.component == model::TensorComponent::kda_v_conv1d ||
+                    sb.id.component == model::TensorComponent::kda_o_norm ||
                     // GLM-25a: indexer_weights_proj ships F32 [hidden, n_head]; the
                     // producer consumes it via a small BF16 GEMM, so convert it to
                     // BF16 on upload alongside the norms.
                     sb.id.component == model::TensorComponent::indexer_weights_proj;
                 void* ptr;
-                if (is_norm && sb.weight.data.size() >= 4) {
+                // TD-GLM5-ENGINE-NORM-UPLOAD-DTYPE (GF3.9): convert ONLY
+                // F32-in-checkpoint norms — glm5_next ships these BF16
+                // (FP8 skip list) and a blind /4 + f32_to_bf16 would upload
+                // half the bytes of garbage. Mirrors the dtype-conditional
+                // sizing in pinned_upload_plan.cpp validate_plan (GF3.3).
+                if (is_norm && sb.weight.dtype == model::SafetensorsDtype::F32
+                    && sb.weight.data.size() >= 4) {
                     const size_t n = sb.weight.data.size() / 4;
                     auto bf16 = f32_to_bf16(sb.weight.data.data(), n);
                     ptr = upload(reinterpret_cast<const std::byte*>(bf16.data()),
@@ -2847,6 +3116,25 @@ void Engine::upload_pinned_weights() {
                             attn_w.q_idx_b_is_gguf = true; attn_w.q_idx_b_gguf_type = gt; break;
                         case TC::indexer_wk:    // GLM-25a
                             attn_w.k_idx_is_gguf = true; attn_w.k_idx_gguf_type = gt; break;
+                        // ── GF3.9 KDA projections (glm5_next GGUF: Q8_0)
+                        //    route through the GGUF GEMM virtuals like the
+                        //    MLA projections ──
+                        case TC::kda_q_proj:
+                            attn_w.kda_q_is_gguf = true; attn_w.kda_q_gguf_type = gt; break;
+                        case TC::kda_k_proj:
+                            attn_w.kda_k_is_gguf = true; attn_w.kda_k_gguf_type = gt; break;
+                        case TC::kda_v_proj:
+                            attn_w.kda_v_is_gguf = true; attn_w.kda_v_gguf_type = gt; break;
+                        case TC::kda_b_proj:
+                            attn_w.kda_b_is_gguf = true; attn_w.kda_b_gguf_type = gt; break;
+                        case TC::kda_f_a_proj:
+                            attn_w.kda_f_a_is_gguf = true; attn_w.kda_f_a_gguf_type = gt; break;
+                        case TC::kda_f_b_proj:
+                            attn_w.kda_f_b_is_gguf = true; attn_w.kda_f_b_gguf_type = gt; break;
+                        case TC::kda_g_a_proj:
+                            attn_w.kda_g_a_is_gguf = true; attn_w.kda_g_a_gguf_type = gt; break;
+                        case TC::kda_g_b_proj:
+                            attn_w.kda_g_b_is_gguf = true; attn_w.kda_g_b_gguf_type = gt; break;
                         default: break;
                     }
                 }
@@ -2893,11 +3181,23 @@ void Engine::upload_pinned_weights() {
             if (!norm_slot) return;
 
             for (const auto& bundle : layer_weights.norms) {
-                // TD-73c: Convert F32 checkpoint norms → BF16 for RMSNorm kernel.
-                const size_t num_elems = bundle.weight.data.size() / 4;
-                auto bf16 = f32_to_bf16(bundle.weight.data.data(), num_elems);
-                auto* ptr = upload(reinterpret_cast<const std::byte*>(bf16.data()),
-                                   static_cast<int64_t>(num_elems * 2));
+                // TD-73c: Convert F32 checkpoint norms → BF16 for RMSNorm
+                // kernel. TD-GLM5-ENGINE-NORM-UPLOAD-DTYPE (GF3.9): gate on
+                // the checkpoint dtype — glm5_next ships BF16 norms, copied
+                // 1:1.
+                void* ptr;
+                if (bundle.weight.dtype == model::SafetensorsDtype::F32
+                    && bundle.weight.data.size() >= 4) {
+                    const size_t num_elems = bundle.weight.data.size() / 4;
+                    auto bf16 =
+                        f32_to_bf16(bundle.weight.data.data(), num_elems);
+                    ptr = upload(
+                        reinterpret_cast<const std::byte*>(bf16.data()),
+                        static_cast<int64_t>(num_elems * 2));
+                } else {
+                    ptr = upload(bundle.weight.data.data(),
+                                 static_cast<int64_t>(bundle.weight.data.size()));
+                }
                 if (bundle.id.component == model::TensorComponent::input_layernorm) {
                     attn_w.input_layernorm = ptr;
                 } else if (bundle.id.component ==
@@ -3124,10 +3424,19 @@ void Engine::upload_pinned_weights() {
             slot && loaded_model_->final_norm) {
             const auto& fn = loaded_model_->final_norm.value();
             // TD-73c: F32→BF16 conversion for final_norm.
-            const size_t num_elems = fn.weight.data.size() / 4;
-            auto bf16 = f32_to_bf16(fn.weight.data.data(), num_elems);
-            auto* ptr = upload(reinterpret_cast<const std::byte*>(bf16.data()),
-                               static_cast<int64_t>(num_elems * 2));
+            // TD-GLM5-ENGINE-NORM-UPLOAD-DTYPE (GF3.9): dtype-gated —
+            // glm5_next ships model.norm BF16, copied 1:1.
+            void* ptr;
+            if (fn.weight.dtype == model::SafetensorsDtype::F32
+                && fn.weight.data.size() >= 4) {
+                const size_t num_elems = fn.weight.data.size() / 4;
+                auto bf16 = f32_to_bf16(fn.weight.data.data(), num_elems);
+                ptr = upload(reinterpret_cast<const std::byte*>(bf16.data()),
+                             static_cast<int64_t>(num_elems * 2));
+            } else {
+                ptr = upload(fn.weight.data.data(),
+                             static_cast<int64_t>(fn.weight.data.size()));
+            }
             final_norm_ptrs_[gpu_pos] = ptr;
         }
 
@@ -3270,7 +3579,12 @@ void Engine::upload_pinned_weights() {
                 if (tp_sharded) src += per_rank * rank;
 
                 void* ptr;
-                if (is_mtp_norm && per_rank >= 4) {
+                // TD-GLM5-ENGINE-NORM-UPLOAD-DTYPE (GF3.9): convert only
+                // F32-in-checkpoint MTP norms — glm5_next ships
+                // enorm/hnorm/shared_head.norm BF16, copied 1:1.
+                if (is_mtp_norm
+                    && bundle.weight.dtype == model::SafetensorsDtype::F32
+                    && per_rank >= 4) {
                     const size_t n = static_cast<size_t>(per_rank) / 4;
                     auto bf16 = f32_to_bf16(reinterpret_cast<const float*>(src), n);
                     ptr = upload(reinterpret_cast<const std::byte*>(bf16.data()),
@@ -3677,22 +3991,47 @@ void Engine::allocate_ipc_region() {
 
     // V4-7a: DeepSeek-V4 metadata (zero for non-V4 models — engine_info_ is
     // value-initialized). Per-layer attention types come from compress_ratios.
+    // GF3.2 (TD-ATTN-TYPES-V4-NAMING): the export is the neutral
+    // attention_types; V4 codes 0/1/2 are UNCHANGED (byte-identity), and
+    // glm5_next populates codes 3 (linear/KDA) / 4 (sparse MLA) from
+    // model.layer_types — always nonzero, which marks the array populated
+    // for a non-V4 arch. Homogeneous archs (GLM-5.2/V3.2) leave it all-zero.
     if (model_cfg_->is_v4()) {
         engine_info_.v4_hc_mult = static_cast<int32_t>(cfg_->model.hc_mult);
         engine_info_.v4_num_hash_layers =
             static_cast<int32_t>(cfg_->model.num_hash_layers);
         const int nl = std::min<int>(cfg_->model.num_hidden_layers,
-                                     ipc::EngineInfo::kV4MaxLayers);
+                                     ipc::EngineInfo::kMaxAttentionTypeLayers);
         for (int l = 0; l < nl; ++l) {
             switch (model_cfg_->attention_type_for_layer(l)) {
                 case model::V4AttentionType::kSwa:
-                    engine_info_.v4_attention_types[l] = 0; break;
+                    engine_info_.attention_types[l] = 0; break;
                 case model::V4AttentionType::kCsa:
-                    engine_info_.v4_attention_types[l] = 1; break;
+                    engine_info_.attention_types[l] = 1; break;
                 case model::V4AttentionType::kHca:
-                    engine_info_.v4_attention_types[l] = 2; break;
+                    engine_info_.attention_types[l] = 2; break;
             }
         }
+    } else if (model_cfg_->is_glm5_next()) {
+        const int nl = std::min<int>(cfg_->model.num_hidden_layers,
+                                     ipc::EngineInfo::kMaxAttentionTypeLayers);
+        for (int l = 0; l < nl; ++l) {
+            engine_info_.attention_types[l] =
+                model_cfg_->is_linear_attention_layer(l) ? 3 : 4;
+        }
+    }
+
+    // TD-GLM5-KDA-SLOTS-EXPORT: state-pool geometry for the orchestrator's
+    // admission (zero for models without linear-attention state — the
+    // struct is value-initialized; reduction rule documented at
+    // memory::kda_state_export).
+    if (vram_allocator_) {
+        const auto ks = memory::kda_state_export(vram_allocator_->layout());
+        engine_info_.kda_state_mapped        = ks.mapped ? 1 : 0;
+        engine_info_.kda_state_slots         = ks.slots;
+        engine_info_.kda_state_slot_bytes    = ks.slot_bytes;
+        engine_info_.kda_state_pages_per_seq = ks.pages_per_seq;
+        engine_info_.kda_state_pool_pages    = ks.pool_pages;
     }
 }
 
@@ -3762,7 +4101,16 @@ void Engine::spawn_daemon_thread() {
     std::vector<model::GgufModelExpertTypes> routed_layer_gguf_types;
     if (gguf_quant_for_disp && loaded_model_) {
         const size_t nl = loaded_model_->layers.size();
-        routed_layer_gguf_types.resize(nl);
+        // P-29 step 11 (LS_MTP_PROBE): probe-armed MTP layers' experts stream from
+        // the expert source (live-GGUF); their per-layer k-quant triple must
+        // be in this table or layer 45 decodes at the global-max types with
+        // wrong in-slot up/down offsets (the GG-9 NaN class). Flag off:
+        // is_moe_layer(nl) is false and nl_tab == nl (unchanged).
+        const size_t nl_tab = nl
+            + (model_cfg_->is_moe_layer(static_cast<int>(nl))
+                   ? static_cast<size_t>(cfg_->model.num_nextn_predict_layers)
+                   : 0);
+        routed_layer_gguf_types.resize(nl_tab);
         for (size_t l = 0; l < nl; ++l) {
             for (const auto& experts : loaded_model_->layers[l].routed_experts) {
                 for (const auto& b : experts) {
@@ -3781,12 +4129,15 @@ void Engine::spawn_daemon_thread() {
             }
         }
         if (expert_source_()) {
-            for (size_t l = 0; l < nl; ++l) {
+            for (size_t l = 0; l < nl_tab; ++l) {
                 // Only layers with no loaded routed bundles (WP-6 skip) take
                 // their types from the manifest (prepacked) or the GGUF
                 // tensor directory (live prepack); loaded bundles stay the
-                // source of truth in legacy/mmap mode.
-                if (!loaded_model_->layers[l].routed_experts.empty()) continue;
+                // source of truth in legacy/mmap mode. Layers >= nl (probe
+                // MTP) have no LoadedModel entry — always source-typed.
+                if (l < nl
+                    && !loaded_model_->layers[l].routed_experts.empty())
+                    continue;
                 auto t = expert_source_()->gguf_types_for_layer(
                     static_cast<int>(l));
                 if (!t) continue;
@@ -3934,6 +4285,17 @@ void Engine::spawn_daemon_thread() {
     // TD-PREFILL-SUPERCHUNK: publish the EFFECTIVE MoE batch capacity (the
     // dispatcher's VRAM fail-safe may have stepped the request down).
     engine_info_.moe_batch_capacity = command_dispatcher_->moe_batch_capacity();
+    // P-30 step 1: publish the REALIZED single-shot chunk bound too — the
+    // EP-beyond-TP orchestrator stride must follow this, not the raw config
+    // request (the elastic fail-safe may have stepped the request down, and
+    // a stride above the single-shot bound drives the chunked path, which is
+    // rejected with expert-only ranks resident — TD-MOE-EP-XTP-WAVES).
+    engine_info_.moe_chunk_capacity = command_dispatcher_->moe_chunk_capacity();
+    // R4b arch capability export (INV-SEQ-FORK-TRUNC): the dispatcher
+    // queries the active AttentionArch property — single source of truth
+    // with handle_seq_fork's rejection gate.
+    engine_info_.seq_fork_truncatable =
+        command_dispatcher_->seq_fork_truncatable() ? 1 : 0;
 
     // IPC-5: State publisher
     state_publisher_ = std::make_unique<StatePublisher>(StatePublisher::Deps{
@@ -3976,9 +4338,14 @@ void Engine::spawn_daemon_thread() {
                 const size_t slot_bytes =
                     pinned_arena_->node_arena(nodes.front())->slot_size();
                 const auto mcfg = memory::ArenaMigrator::Config::from_env();
+                // P-29 step 13 phase B: the migrator table is hidden-layer-
+                // absolute; moe_layer_bound extends it to cover armed
+                // MTP/NextN layers (glm5_next flag-on: 46) so layer-45
+                // fetches feed online placement instead of being silently
+                // dropped. Flag off: == num_hidden_layers, bit-identical.
                 arena_migrator_ = std::make_unique<memory::ArenaMigrator>(
                     mcfg, *pinned_arena_, hbm,
-                    static_cast<uint32_t>(cfg_->model.num_hidden_layers),
+                    static_cast<uint32_t>(moe_layer_bound(cfg_->model)),
                     static_cast<uint32_t>(cfg_->model.n_routed_experts),
                     slot_bytes);
                 elm_->set_h2d_enqueue_observer(
@@ -3993,7 +4360,7 @@ void Engine::spawn_daemon_thread() {
                 // shutdown() after the daemon joins.
                 if (arena_cache_) {
                     const auto nl = static_cast<uint32_t>(
-                        cfg_->model.num_hidden_layers);
+                        moe_layer_bound(cfg_->model));
                     const auto ne = static_cast<uint32_t>(
                         cfg_->model.n_routed_experts);
                     if (const auto v = arena_cache_->ema_load(nl, ne)) {
@@ -4034,6 +4401,222 @@ void Engine::spawn_daemon_thread() {
             spdlog::warn(
                 "arena_placement.online engaged but the pinned arena path is "
                 "inactive — online placement NOT applied");
+        }
+    }
+
+    // ── 44z: KV <-> expert zone rebalancer (default OFF) ──────────────────
+    // Constructed BEFORE daemon_loop_impl_ so the loop's background_fn can
+    // capture it, and declared before the dispatcher in engine.h so it
+    // outlives both callback holders.
+    {
+        // Policy base: the parsed _internal-kv_expert_rebalance section
+        // (TD-KVXP-SCHEMA-KNOBS); LS_* env vars override either way inside
+        // from_config_env (the kda_state.mapped precedence).
+        ExpertZoneRebalancer::Config xz_base{};
+        if (cfg_) {
+            const auto& kx = cfg_->_internal_kv_expert_rebalance;
+            xz_base.enabled = kx.enabled;
+            xz_base.max_waste = kx.max_waste;
+            xz_base.low_water_frac = kx.low_water_frac;
+            xz_base.high_water_frac = kx.high_water_frac;
+            xz_base.max_slots_per_grant = kx.max_slots_per_grant;
+            xz_base.min_tick_interval_us =
+                static_cast<int64_t>(kx.tick_ms) * 1000;
+            xz_base.grant_cooldown_ms = kx.grant_cooldown_ms;
+        }
+        auto xz_cfg = ExpertZoneRebalancer::Config::from_config_env(xz_base);
+        if (xz_cfg.enabled) {
+            // Preconditions the mechanism cannot work without: a SLABBED
+            // kMain region (a grant is a whole-slab run) and at least one
+            // attention host actually holding kMain pages.
+            const int64_t slab_bytes =
+                vram_allocator_ ? vram_allocator_->layout().slab_bytes : 0;
+            std::vector<int> xz_tp;
+            const int xz_tp_size =
+                std::max(1, cfg_->parallelism.tensor_parallelism);
+            for (int i = 0; i < xz_tp_size
+                            && i < static_cast<int>(cfg_->hardware.gpus.size());
+                 ++i) {
+                const int g =
+                    cfg_->hardware.gpus[static_cast<size_t>(i)].ref.position;
+                if (page_allocator_
+                    && page_allocator_->total_pages(g, memory::Pool::kMain) > 0)
+                    xz_tp.push_back(g);
+            }
+            const bool slabbed = slab_bytes > 0 && page_allocator_
+                                 && page_allocator_->pages_per_slab() > 0;
+            if (!slabbed || xz_tp.empty() || !expert_cache_ || !layer_registry_
+                || !transfer_engine_ || !stream_manager_) {
+                spdlog::warn(
+                    "44z expert-zone rebalancer requested "
+                    "(_internal-kv_expert_rebalance.enabled / "
+                    "LS_KV_EXPERT_REBALANCE=1) but NOT started: slab_bytes "
+                    "{}, attention hosts with kMain pages {}, expert_cache {}, "
+                    "transfer_engine {}, stream_manager {} — a grant is a "
+                    "whole-slab run of the shared kMain region, which this "
+                    "model/boot does not have",
+                    slab_bytes, xz_tp.size(),
+                    static_cast<const void*>(expert_cache_.get()),
+                    static_cast<const void*>(transfer_engine_.get()),
+                    static_cast<const void*>(stream_manager_.get()));
+            } else {
+                ExpertZoneRebalancer::Deps xz{};
+                xz.page_allocator = page_allocator_.get();
+                xz.expert_cache = expert_cache_.get();
+                xz.tp_gpus = xz_tp;
+                xz.geometry = memory::ExpertZoneGeometry{
+                    .expert_slot_bytes =
+                        layer_registry_->per_routed_expert_bytes(),
+                    .slab_bytes = slab_bytes,
+                    .max_waste = xz_cfg.max_waste};
+                // Band-width guard input: the slabs ONE admission claims
+                // transiently before the sequence settles. Mapped KDA state
+                // is the dominant, exactly-known term (units_per_rank x
+                // unit_slabs); the per-sequence indexer-K share is NOT added
+                // here — the guard's 2x factor covers it, and the indexer
+                // reservation is a function of the request's own token
+                // budget rather than a fixed per-admission constant.
+                // P-29 step 13 phase B: with MTP speculation armed, one admission
+                // claims THREE whole KDA state footprints (live slot + two
+                // INV-KDA-REWIND anchor slots, dispatch_lifecycle
+                // seq_create) — the reserve must hold all of them or 44z's
+                // boot grants and the admission fight a refuse/reclaim
+                // oscillation (observed: alternating request failures).
+                const int64_t xz_state_copies =
+                    (cfg_->speculation.enabled
+                     && cfg_->speculation.method
+                            == config::SpeculationMethodType::mtp
+                     && cfg_->speculation.mtp.enabled)
+                        ? 3 : 1;
+                const int64_t xz_transient_slabs =
+                    page_allocator_->kda_state_mapped()
+                        ? static_cast<int64_t>(
+                              page_allocator_->kda_units_per_rank())
+                              * page_allocator_->kda_unit_slabs()
+                              * xz_state_copies
+                        : 0;
+                xz.admission_transient_slabs = xz_transient_slabs;
+                // The low-water reserve must hold every admission the engine
+                // may have in flight at once. Same source and same
+                // max(1, ...) guard the KV pool is sized by
+                // (vram_allocator.cpp), so the reserve and the pool cannot
+                // drift apart.
+                const int xz_concurrency =
+                    std::max(1, cfg_->serving.max_concurrent_requests);
+                xz.max_concurrent_admissions = xz_concurrency;
+                // TD-KVXP-PER-STEP-FLOOR: the per-step growth term — one KV
+                // auto-growth chunk plus one indexer-K group, in slabs
+                // (CommandDispatcher::growth_chunk_slabs). With it wired the
+                // marks use the principled per-step derivation: reserve =
+                // B x (upfront state + growth headroom), band = 2 x growth;
+                // the bulk-prefill claim is answered by the orchestrator's
+                // bounded large-prefill wait (LS_KVXP_LARGE_PREFILL_TOKENS /
+                // _WAIT_MS) on the eager drain, not by a standing reserve.
+                xz.per_step_growth_slabs =
+                    command_dispatcher_
+                        ? command_dispatcher_->growth_chunk_slabs()
+                        : 0;
+                xz.moe_quiesced = [this] {
+                    return command_dispatcher_
+                        && command_dispatcher_->moe_dispatch_quiesced();
+                };
+                // TransferEngine owns the h2d stream; the FFN barrier goes
+                // through the per-GPU DeviceBackend + StreamManager (no raw
+                // CUDA anywhere in this TU — INV-GPU-1).
+                xz.record_h2d_barrier = [this](int g) -> void* {
+                    return transfer_engine_->record_h2d_barrier(g);
+                };
+                xz.record_ffn_barrier = [this](int g) -> void* {
+                    if (g < 0 || static_cast<size_t>(g) >= device_backends_.size()
+                        || !device_backends_[static_cast<size_t>(g)])
+                        return nullptr;
+                    auto* be = device_backends_[static_cast<size_t>(g)].get();
+                    void* ev = be->create_event();
+                    if (ev)
+                        be->record_event(
+                            ev, stream_manager_->stream(
+                                    g, compute::StreamId::kExpertFfn));
+                    return ev;
+                };
+                xz.event_complete = [this](int g, void* ev) {
+                    if (!ev || g < 0
+                        || static_cast<size_t>(g) >= device_backends_.size()
+                        || !device_backends_[static_cast<size_t>(g)])
+                        return true;
+                    const auto r = device_backends_[static_cast<size_t>(g)]
+                                       ->query_event(ev);
+                    // kError is terminal for the event — treat it as complete
+                    // so the reclaim does not wedge; the device fault surfaces
+                    // through the ordinary compute path.
+                    return r.status != compute::EventStatus::kNotReady;
+                };
+                xz.destroy_event = [this](int g, void* ev) {
+                    if (!ev || g < 0
+                        || static_cast<size_t>(g) >= device_backends_.size()
+                        || !device_backends_[static_cast<size_t>(g)])
+                        return;
+                    device_backends_[static_cast<size_t>(g)]->destroy_event(ev);
+                };
+                // Drain evictions go THROUGH the lifecycle manager
+                // (INV-ELM-EVICT). A cache-direct evict here left the ELM's
+                // (key,gpu) tier kHot for keys the cache no longer held;
+                // ensure_resident then never re-fetched them and every MoE
+                // layer routing such a key burned its full fetch deadline —
+                // the TD-KVXP-RECLAIM-REGRANT-WEDGE silent crawl.
+                xz.evict_expert = [this](memory::ExpertKey key, int gpu) {
+                    return elm_ ? elm_->request_evict(key, gpu)
+                                : expert_cache_->evict(key, gpu);
+                };
+                expert_zone_rebalancer_ =
+                    std::make_unique<ExpertZoneRebalancer>(std::move(xz),
+                                                           xz_cfg);
+                if (expert_zone_rebalancer_->enabled()) {
+                    spdlog::info(
+                        "44z expert-zone rebalancer ENABLED "
+                        "(_internal-kv_expert_rebalance / env "
+                        "LS_KV_EXPERT_REBALANCE): low/high water {}/{} slabs, "
+                        "band {} — ABSOLUTE, derived from {} concurrent "
+                        "admissions x the {}-slab admission transient (a "
+                        "pool-fraction reserve would strand more capacity the "
+                        "emptier the pool gets); frac floors {}/{}, "
+                        "max_waste {}, max {} slots/grant, tick {} ms, grant "
+                        "cooldown {} ms",
+                        expert_zone_rebalancer_->low_water_slabs(),
+                        expert_zone_rebalancer_->high_water_slabs(),
+                        expert_zone_rebalancer_->min_band_slabs(),
+                        xz_concurrency, xz_transient_slabs,
+                        xz_cfg.low_water_frac, xz_cfg.high_water_frac,
+                        xz_cfg.max_waste, xz_cfg.max_slots_per_grant,
+                        xz_cfg.min_tick_interval_us / 1000,
+                        xz_cfg.grant_cooldown_ms);
+                    // TD-KVXP-CAPACITY-REPUBLISH (resolved): the REEF
+                    // service re-reads total_slots(kStable) whenever the
+                    // cache's elastic topology generation moves (checked at
+                    // ensure_reef_service, once per REEF command), so
+                    // grants/reclaims reach the placement model at the next
+                    // solve; the loader evict board needs no republish
+                    // (capacity is a reserve hint, membership is
+                    // listener-driven truth).
+                    if (cfg_->gpu_loader.enabled)
+                        spdlog::info(
+                            "44z + gpu_loader: loader/REEF capacity caps are "
+                            "LIVE — republished on every elastic "
+                            "grant/reclaim (TD-KVXP-CAPACITY-REPUBLISH)");
+                    command_dispatcher_->set_pool_pressure_callback(
+                        [r = expert_zone_rebalancer_.get()](
+                            int gpu, int64_t shortfall_slabs) {
+                            r->note_pool_pressure_refusal(gpu,
+                                                          shortfall_slabs);
+                        });
+                } else {
+                    expert_zone_rebalancer_.reset();
+                }
+            }
+        } else {
+            spdlog::debug(
+                "44z expert-zone rebalancer disabled (set "
+                "_internal-kv_expert_rebalance.enabled or "
+                "LS_KV_EXPERT_REBALANCE=1 to enable)");
         }
     }
 
@@ -4083,10 +4666,16 @@ void Engine::spawn_daemon_thread() {
         .advance_progressive_fn = [this]() -> bool {
             return command_dispatcher_->advance_progressive_moe();
         },
-        // M3b: arena migrator tick (near-free when idle; nullable).
-        .background_fn = arena_migrator_
+        // M3b: arena migrator tick + 44z expert-zone rebalancer tick (both
+        // near-free when idle and independently nullable — composed into the
+        // ONE background hook the loop offers).
+        .background_fn = (arena_migrator_ || expert_zone_rebalancer_)
             ? DaemonLoop::Deps::BackgroundFn(
-                  [m = arena_migrator_.get()] { m->tick(); })
+                  [m = arena_migrator_.get(),
+                   z = expert_zone_rebalancer_.get()] {
+                      if (m) m->tick();
+                      if (z) z->tick();
+                  })
             : DaemonLoop::Deps::BackgroundFn{},
     };
     daemon_loop_impl_ = std::make_unique<DaemonLoop>(std::move(deps));
@@ -4280,12 +4869,28 @@ void Engine::arena_attach_early_worker_() {
             arena_early_.nodeids.push_back({n, sd});
             nodeids.push_back({n, sd});
         }
+        // P-29 step 13 phase B: with MTP experts armed the census extends past
+        // num_hidden_layers (glm5_next: 42 -> 43 MoE layers, 12,096 ->
+        // 12,384 slots). Fold that into the identity so the two shapes
+        // never silently share a store (the mismatch takes the existing
+        // on_conflict path). census_id == 0 (historical census) keeps
+        // every existing store's hash exact.
+        uint64_t census_id = 0;
+        {
+            const int bound = moe_layer_bound(cfg_->model);
+            if (bound > cfg_->model.num_hidden_layers) {
+                census_id =
+                    (static_cast<uint64_t>(bound) << 32) |
+                    static_cast<uint64_t>(
+                        std::max(0, cfg_->model.n_routed_experts));
+            }
+        }
         arena_early_.geom_hash = memory::ArenaCache::hash_config(
             arena_early_.slot_bytes,
             static_cast<size_t>(
                 cfg_->memory.pin_host_expert_pool_extra_scratch_bytes),
             nodeids, cfg_->memory.pin_host_expert_pool_sizing, spill,
-            arena_early_.placement_id);
+            arena_early_.placement_id, census_id);
         arena_early_.source_id = memory::ArenaCache::hash_source_id(
             live ? std::filesystem::absolute(
                        cfg_->model.weights_path).string() + "#live-prepack"
@@ -4355,7 +4960,7 @@ void Engine::arena_attach_early_worker_() {
             // disables EMA persistence — adoption proceeds untouched.
             const size_t want = memory::ArenaCache::required_bytes_with_ema(
                 stored,
-                static_cast<uint32_t>(cfg_->model.num_hidden_layers),
+                static_cast<uint32_t>(moe_layer_bound(cfg_->model)),
                 static_cast<uint32_t>(cfg_->model.n_routed_experts));
             if (arena_meta_->bytes() < want) {
                 if (arena_meta_->ensure_bytes(want)) {

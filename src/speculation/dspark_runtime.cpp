@@ -318,6 +318,20 @@ std::unique_ptr<DsparkRuntime> DsparkRuntime::create(
     rt->theta_ = static_cast<float>(ck.rope_theta);
     rt->ctx_cap_ = dc.draft_context_capacity_tokens;
     rt->aux_rows_cap_ = dc.aux_capture_max_rows;
+    // TD-DSPARK-CTX-POLICY: windowed drafting -- the context arena becomes
+    // a rotating window over the newest positions instead of a hard cap.
+    // Schema field speculation.dspark.ctx_rotate (default true;
+    // TD-DSPARK-CTX-ROTATE-SCHEMA resolved), with LS_DSPARK_CTX_ROTATE
+    // overriding EITHER WAY when SET ('0' = legacy fail-closed cap, any
+    // other value = ON).  Forced OFF for the V4 dflash arm regardless
+    // (absolute-position rope table + single-copy latent arena; its
+    // serving recipe is draftless -- TD-ORCH-ONE-FLOW-GLM-REGRESSION
+    // note (3)).
+    if (!ck.is_v4_dflash) {
+        rt->rotate_ = dc.ctx_rotate;
+        if (const char* rot = std::getenv("LS_DSPARK_CTX_ROTATE"))
+            rt->rotate_ = !(*rot == '0');
+    }
     if (rt->block_size_ > 16) fail("block_size > 16 unsupported");
     if (static_cast<int>(rt->aux_ids_.size()) > 31)
         fail("more than 31 aux layers unsupported");
@@ -626,10 +640,13 @@ std::unique_ptr<DsparkRuntime> DsparkRuntime::create(
 
     spdlog::info(
         "dspark_runtime: armed on GPU position {} — {} weight bytes + {} "
-        "scratch bytes (ctx capacity {} tokens, aux staging {} rows, "
-        "gamma {} / block {})",
+        "scratch bytes (ctx capacity {} tokens, rotation {}, aux staging "
+        "{} rows, gamma {} / block {})",
         backend->gpu().position, rt->weights_.arena_bytes, layout.total,
-        rt->ctx_cap_, rt->aux_rows_cap_, rt->spec_tokens_, rt->block_size_);
+        rt->ctx_cap_,
+        rt->rotate_ ? "ON (windowed drafting, TD-DSPARK-CTX-POLICY)"
+                    : "OFF (legacy fail-closed cap)",
+        rt->aux_rows_cap_, rt->spec_tokens_, rt->block_size_);
     return rt;
 }
 
@@ -826,6 +843,23 @@ void DsparkRuntime::invalidate_context(const char* why) {
     ctx_valid_ = false;
     cap_slot_mask_ = 0;
     cap_multi_ = false;
+    // A full invalidation kills any dormant post-epoch re-arm tracking too
+    // (enter_dormant re-establishes it AFTER calling this).
+    rearm_pending_ = false;
+}
+
+void DsparkRuntime::enter_dormant(uint64_t seq, uint32_t slot0_end,
+                                  uint32_t last_end, const char* why) {
+    invalidate_context(why);
+    rearm_pending_ = true;
+    dorm_seq_ = seq;
+    dorm_slot0_end_ = slot0_end;
+    // Single-slot checkpoints: the slot-0 window IS the final slot.
+    dorm_last_end_ = aux_count() == 1 ? slot0_end : last_end;
+    spdlog::debug(
+        "dspark_runtime: dormant post-epoch re-arm armed for seq {} — "
+        "slot-0 frontier {}, final-slot frontier {}",
+        seq, dorm_slot0_end_, dorm_last_end_);
 }
 
 bool DsparkRuntime::ensure_capture_event(compute::DeviceBackend& src_backend) {
@@ -850,7 +884,12 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
                                 void* src_stream) {
     const int n_aux = aux_count();
     if (slot < 0 || slot >= n_aux || rows <= 0 || !target_attn_buf) return;
-    if (static_cast<int64_t>(start_pos) + rows > ctx_cap_) {
+    if (!rotate_ && static_cast<int64_t>(start_pos) + rows > ctx_cap_) {
+        // Legacy fail-closed cap (TD-DSPARK-CTX-CAP).  With rotation armed
+        // (TD-DSPARK-CTX-POLICY) the arena is a window over the newest
+        // positions: arena capacity is enforced at ingest/finalize time
+        // (maybe_rotate_arena) and oversized EPOCHS at the epoch checks
+        // below (enter_dormant).
         invalidate_context(
             "context KV arena overflow (TD-DSPARK-CTX-CAP)");
         return;
@@ -865,12 +904,15 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
                 ctx_seq_id_ = seq_id;
                 ctx_len_ = 0;
                 ctx_valid_ = true;
+                ctx_base_ = 0;
+                rearm_pending_ = false;
                 cap_slot_mask_ = 0;
                 cap_multi_ = false;
                 spdlog::debug("dspark_runtime: context (re)armed for seq {}",
                               seq_id);
             } else if (ctx_valid_ && seq_id != ctx_seq_id_
-                       && start_pos <= static_cast<uint32_t>(ctx_len_)) {
+                       && start_pos <= static_cast<uint32_t>(ctx_len_)
+                       && start_pos >= static_cast<uint32_t>(ctx_base_)) {
                 // Prefix-cache fork ADOPTION (serving.prefix_cache): a NEW
                 // sequence whose first fed row lands INSIDE the tracked
                 // context adopts it — rebind + overwrite from start_pos
@@ -888,6 +930,41 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
                 spdlog::debug("dspark_runtime: context ADOPTED by seq {} at "
                               "pos {} (ctx_len {})", seq_id, start_pos,
                               ctx_len_);
+            } else if (rearm_pending_ && !ctx_valid_) {
+                // TD-DSPARK-CTX-POLICY dormant frontier: an oversized epoch
+                // was skipped; follow its slot-0 coverage and re-arm an
+                // EMPTY window at the first fresh epoch past its end.
+                if (seq_id != dorm_seq_) {
+                    invalidate_context(
+                        "sequence switch while awaiting post-epoch re-arm "
+                        "(TD-DSPARK-CTX-POLICY)");
+                    return;
+                }
+                if (dorm_last_end_ == dorm_slot0_end_ &&
+                    start_pos == dorm_slot0_end_ && rows <= ctx_cap_) {
+                    // Epoch fully delivered on every slot: this window
+                    // begins a FRESH epoch — re-arm and process it below.
+                    ctx_seq_id_ = seq_id;
+                    ctx_valid_ = true;
+                    ctx_base_ = static_cast<int>(start_pos);
+                    ctx_len_ = static_cast<int>(start_pos);
+                    rearm_pending_ = false;
+                    cap_slot_mask_ = 0;
+                    cap_multi_ = false;
+                    spdlog::debug(
+                        "dspark_runtime: context RE-ARMED empty at pos {} "
+                        "after an oversized epoch (seq {})",
+                        start_pos, seq_id);
+                } else if (start_pos == dorm_slot0_end_) {
+                    dorm_slot0_end_ += static_cast<uint32_t>(rows);
+                    if (n_aux == 1) dorm_last_end_ = dorm_slot0_end_;
+                    return;
+                } else {
+                    invalidate_context(
+                        "non-contiguous slot-0 window while awaiting "
+                        "post-epoch re-arm (TD-DSPARK-CTX-POLICY)");
+                    return;
+                }
             } else if (seq_id != ctx_seq_id_) {
                 invalidate_context("sequence switch mid-context "
                                    "(TD-DSPARK-BATCH)");
@@ -902,6 +979,21 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
         // into the per-slot fc accumulator instead of re-basing the window.
         if (cap_slot_mask_ == 1u && cap_seq_ == seq_id &&
             start_pos == cap_slot_end_[0]) {
+            // TD-DSPARK-CTX-POLICY: an epoch larger than the whole arena
+            // can never be windowed (later slots' fc contributions arrive
+            // only after slot 0's full coverage) — skip the epoch and
+            // re-arm after it.
+            if (rotate_ && static_cast<int64_t>(start_pos) + rows -
+                                   cap_start_pos_ >
+                               ctx_cap_) {
+                enter_dormant(seq_id,
+                              start_pos + static_cast<uint32_t>(rows),
+                              cap_start_pos_,
+                              "superchunk capture epoch exceeds the context "
+                              "window (TD-DSPARK-CTX-POLICY; drafting "
+                              "re-arms after the epoch)");
+                return;
+            }
             if (!cap_multi_ &&
                 !begin_multi_window_epoch(src_backend, src_stream))
                 return;
@@ -917,6 +1009,25 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
         // Epoch start (a fresh slot-0 window always re-bases the capture
         // window — pre-superchunk behavior; an abandoned earlier epoch is
         // caught by the position-gap/last-slot completeness contracts).
+        if (rotate_ && rows > ctx_cap_) {
+            // TD-DSPARK-CTX-POLICY: single-window epoch larger than the
+            // whole arena — skip it, re-arm after it (dormant frontier).
+            enter_dormant(seq_id, start_pos + static_cast<uint32_t>(rows),
+                          start_pos,
+                          "capture epoch exceeds the context window "
+                          "(TD-DSPARK-CTX-POLICY; drafting re-arms after "
+                          "the epoch)");
+            return;
+        }
+        if (rotate_ && start_pos < static_cast<uint32_t>(ctx_base_)) {
+            // Rotation discarded rows below ctx_base_: an overwrite-rewind
+            // (or fork adoption) below the window base cannot be honored.
+            // Unreachable for the blessed round shapes (rewind depth
+            // <= gamma + 1 << ctx_cap_/2, the post-rotation margin).
+            invalidate_context("re-feed below the rotated context window "
+                               "base (TD-DSPARK-CTX-POLICY)");
+            return;
+        }
         if (start_pos > static_cast<uint32_t>(ctx_len_)) {
             invalidate_context("position gap in captured hiddens");
             return;
@@ -929,7 +1040,23 @@ void DsparkRuntime::capture_aux(int slot, const void* target_attn_buf,
         cap_slot_end_.assign(static_cast<size_t>(n_aux), start_pos);
         cap_slot_end_[0] = start_pos + static_cast<uint32_t>(rows);
     } else {
-        if (!ctx_valid_) return;
+        if (!ctx_valid_) {
+            if (rearm_pending_ && seq_id == dorm_seq_ && slot == n_aux - 1) {
+                // Dormant frontier: follow the skipped epoch's FINAL-slot
+                // coverage (chunk-major arrival) so epoch completion is
+                // observable for the re-arm above.
+                if (start_pos == dorm_last_end_ &&
+                    static_cast<uint64_t>(start_pos) + rows <=
+                        dorm_slot0_end_) {
+                    dorm_last_end_ = start_pos + static_cast<uint32_t>(rows);
+                } else {
+                    invalidate_context(
+                        "final-slot window mismatch while awaiting "
+                        "post-epoch re-arm (TD-DSPARK-CTX-POLICY)");
+                }
+            }
+            return;
+        }
         if (cap_multi_) {
             // Multi-window epoch (superchunk): per-slot contiguous window
             // accumulation.  A slot's FIRST window starts at the epoch base
@@ -1209,8 +1336,10 @@ void DsparkRuntime::append_context_kv(const void* normed, int rows,
             rk.backend->stream_wait_event(rk.stream, ev_xfer0_);
         }
     }
-    const int64_t pos_off =
-        static_cast<int64_t>(start_pos) * kv_dim_local_ * kBf16;
+    // Arena row = absolute position - ctx_base_ (0 with rotation off /
+    // before the first rotation — bit-identical legacy addressing then).
+    const int64_t pos_off = (static_cast<int64_t>(start_pos) - ctx_base_) *
+                            kv_dim_local_ * kBf16;
     for (size_t r = 0; r < nr; ++r) {
         auto& rk = ranks_[r];
         rk.backend->set_device();
@@ -1241,7 +1370,66 @@ void DsparkRuntime::append_context_kv(const void* normed, int rows,
     if (nr > 1) ranks_[0].backend->set_device();
 }
 
+void DsparkRuntime::maybe_rotate_arena(int rows, uint32_t start_pos) {
+    // TD-DSPARK-CTX-POLICY sliding-window rotation.  The append
+    // [start_pos, start_pos + rows) must fit arena rows
+    // [start_pos - ctx_base_, ...): when it would overflow, DISCARD the
+    // oldest rows by compacting the newest surviving rows to arena row 0
+    // and re-basing.  keep_post = max(ctx_cap_/2, rows) rows survive after
+    // the append, which (a) keeps >= ctx_cap_/2 >> gamma+1 rows of margin
+    // above the base so every blessed overwrite-rewind stays honorable,
+    // (b) amortizes rotations to one per ~ctx_cap_/2 appended tokens, and
+    // (c) makes each per-(rank, layer, K/V) D2D copy provably
+    // non-overlapping: copy_rows = keep_post - rows <= shift (the
+    // trigger condition start_pos + rows - ctx_base_ > ctx_cap_ implies
+    // shift = new_base - ctx_base_ > ctx_cap_ - keep_post >= copy_rows;
+    // see spec/plans/DSPARK_CTX_ROTATION.md for the algebra).  Enqueued on
+    // each rank's own stream: ordered after every prior attention read /
+    // append of that arena and before the appends that follow — no events
+    // needed.  Rows [start_pos, ctx_len_) are NOT copied: the caller
+    // appends (overwrites) them at their new offsets immediately after.
+    if (!rotate_) return;
+    const int64_t end = static_cast<int64_t>(start_pos) + rows;
+    if (end - ctx_base_ <= ctx_cap_) return;
+    const int keep_post = std::max(ctx_cap_ / 2, rows);
+    const int64_t new_base = end - keep_post;
+    const int64_t copy_rows = static_cast<int64_t>(start_pos) - new_base;
+    if (new_base <= ctx_base_ || copy_rows < 0 || rows > ctx_cap_) {
+        // Defensive: unreachable — the capture epoch guards bound rows to
+        // ctx_cap_ and the trigger condition forces new_base > ctx_base_.
+        invalidate_context(
+            "context rotation geometry violation (TD-DSPARK-CTX-POLICY)");
+        return;
+    }
+    const int64_t shift = new_base - ctx_base_;
+    const int64_t row_b = static_cast<int64_t>(kv_dim_local_) * kBf16;
+    const size_t nr = ranks_.size();
+    for (size_t r = 0; r < nr; ++r) {
+        auto& rk = ranks_[r];
+        rk.backend->set_device();
+        if (copy_rows == 0) continue;
+        for (int l = 0; l < L_; ++l) {
+            auto* kb = static_cast<char*>(k_base(r, l));
+            rk.backend->memcpy_d2d_async(
+                kb, kb + shift * row_b,
+                static_cast<size_t>(copy_rows * row_b), rk.stream);
+            auto* vb = static_cast<char*>(v_base(r, l));
+            rk.backend->memcpy_d2d_async(
+                vb, vb + shift * row_b,
+                static_cast<size_t>(copy_rows * row_b), rk.stream);
+        }
+    }
+    ranks_[0].backend->set_device();
+    ctx_base_ = static_cast<int>(new_base);
+    ++rotations_;
+    spdlog::debug(
+        "dspark_runtime: context window rotated — new base {} ({} rows "
+        "kept + {} incoming, cap {})",
+        ctx_base_, copy_rows, rows, ctx_cap_);
+}
+
 void DsparkRuntime::ingest_context(int rows, uint32_t start_pos) {
+    maybe_rotate_arena(rows, start_pos);
     auto& rk = ranks_[0];
     rk.backend->set_device();
     void* s = rk.stream;
@@ -1264,6 +1452,7 @@ void DsparkRuntime::ingest_context(int rows, uint32_t start_pos) {
 }
 
 void DsparkRuntime::finalize_context_chunked(int rows, uint32_t start_pos) {
+    maybe_rotate_arena(rows, start_pos);
     // The fc accumulation over every slot's pieces is already stream-ordered
     // on the draft stream (capture_slot_chunked); hidden_norm + per-layer KV
     // proceed in staging-sized row pieces so ctx_normed_/ctx_ktmp_ keep
@@ -1314,6 +1503,11 @@ bool DsparkRuntime::run_step(uint64_t seq_id, uint32_t anchor_token_id,
         return set_err("anchor_pos " + std::to_string(anchor_pos) +
                        " beyond ingested context length " +
                        std::to_string(ctx_len_));
+    if (anchor_pos < static_cast<uint32_t>(ctx_base_))
+        return set_err("anchor_pos " + std::to_string(anchor_pos) +
+                       " below the rotated context window base " +
+                       std::to_string(ctx_base_) +
+                       " (TD-DSPARK-CTX-POLICY)");
     if (static_cast<int64_t>(anchor_token_id) >= V_)
         return set_err("anchor token id out of vocab");
 
@@ -1457,6 +1651,12 @@ bool DsparkRuntime::run_step(uint64_t seq_id, uint32_t anchor_token_id,
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
     const int base_pos = static_cast<int>(anchor_pos);
+    // Context rows attended: the window [ctx_base_, anchor_pos).  Queries
+    // and stored keys are RoPE'd at ABSOLUTE positions, so attention
+    // scores depend only on relative offsets — every retained row scores
+    // bit-identically to the unrotated arena; rotation only removes the
+    // softmax mass of the discarded rows (< ctx_base_).
+    const int ctx_rows = base_pos - ctx_base_;
 
     for (int l = 0; l < L_; ++l) {
         for (size_t r = 0; r < nranks; ++r) {
@@ -1490,9 +1690,9 @@ bool DsparkRuntime::run_step(uint64_t seq_id, uint32_t anchor_token_id,
             // on this rank's head shard of the context-KV arena.
             compute::launch_dspark_block_attention(
                 b_qattn(r), b_qq(r),
-                anchor_pos > 0 ? k_base(r, l) : nullptr,
-                anchor_pos > 0 ? v_base(r, l) : nullptr, b_qk(r), b_qv(r),
-                nq, base_pos, n_heads_local_, head_dim_, scale,
+                ctx_rows > 0 ? k_base(r, l) : nullptr,
+                ctx_rows > 0 ? v_base(r, l) : nullptr, b_qk(r), b_qv(r),
+                nq, ctx_rows, n_heads_local_, head_dim_, scale,
                 ranks_[r].stream);
 
             // o_proj row-parallel partial (K-window shard at nr>1; the
@@ -1681,8 +1881,7 @@ void DsparkRuntime::v4_moe_ffn(int layer, int rows, void* s) {
     auto gguf_gemm = [&](int N, int K, const void* A, void* D_out,
                          void* b_ptrs) {
         compute::GgufGroupedGemmParams p{};
-        p.type = static_cast<compute::GgufQuantType>(
-            static_cast<int>(model::GgufKQuantType::MXFP4));
+        p.type = compute::GgufQuantType::MXFP4;
         p.strategy = compute::GgufGemmStrategy::int_strategy;
         p.num_experts = E;
         p.N = N;

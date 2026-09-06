@@ -97,11 +97,14 @@ public:
                          void* const* streams);
 
     /// Step 14: allreduce o_proj hidden states (TP reduction).
-    /// hiddens [dcp_size] reduced IN-PLACE ([B, hidden_size] BF16).
+    /// hiddens [dcp_size] reduced IN-PLACE ([B, hidden_size] BF16 — or FP32
+    /// when fp32 is set: the TD-GLM5-TP-COMBINE-PRECISION fp32 partial
+    /// combine, kCollFloat32 sum; the caller rounds to BF16 once after).
     /// No-op when dcp_size == 1.
     void reduce_hidden(void* const* hiddens,
                         int batch_size,
-                        void* const* streams);
+                        void* const* streams,
+                        bool fp32 = false);
 
     bool is_active() const;
     int dcp_size() const;

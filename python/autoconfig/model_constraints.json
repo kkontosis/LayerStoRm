@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "Combination-keyed per-model constraint registry (TD-AUTOCONFIG-COMBO-CONSTRAINTS).",
+    "SHIPPED DATA, not user config: loaded once at import by combo_constraints.py,",
+    "validated loudly, frozen. A row binds a COMBINATION of choices: it is consulted",
+    "only when every predicate in `when` matches the derivation's context, so a",
+    "derivation outside the combination never loads the constraint and nothing is",
+    "over-constrained.",
+    "",
+    "Row fields:",
+    "  id        - stable handle; tests and refusals quote it",
+    "  kind      - engine_gate | validator. A combination row is an ENGINE-CURRENT",
+    "              FACT (grep the cited site before trusting it), never `measured`",
+    "              and never `heuristic` - re-measuring cannot change it, only an",
+    "              engine commit can, and that commit DELETES the row.",
+    "  when      - the combination, as predicate-key -> condition. A condition is a",
+    "              bare scalar (equality), a list (membership), or an operator",
+    "              object {gt|ge|lt|le|eq|ne|in: value}. Predicate keys are the",
+    "              closed set combo_constraints.PREDICATE_KEYS; a GPU predicate",
+    "              (e.g. gpu_class) is a NEW KEY there, not a new mechanism.",
+    "  force     - dotted recipe path -> the only value the engine accepts under",
+    "              the combination. A contradicting --pin REFUSES, quoting both;",
+    "              never a silent override.",
+    "  statement - present tense, what the engine DOES, boot-log voice.",
+    "  ticket    - the TD whose resolution retires (deletes) this row.",
+    "  site      - the engine code site that enforces the gate.",
+    "",
+    "Deleting a row re-derives the config with the rule gone - no code edit",
+    "(the delete-the-row property tests in tests/unit/test_autoconfig_solver.py",
+    "keep this honest)."
+  ],
+  "rows": [
+    {
+      "id": "glm5next-no-sharded-kv",
+      "kind": "engine_gate",
+      "when": {"arch": "glm5_next", "tensor_parallelism": {"gt": 1}},
+      "force": {"hardware.dcp_kv_mode": "replicated"},
+      "statement": "glm5_next rejects dcp_kv_mode=sharded at tp>=2: the 34 KDA layers' recurrent state is whole-sequence, so there is no token shard for a rank to own - the engine fail-closes with the fix in the message (GF3.10, mirror of TD-V4-DCP-KV; belt-and-braces refusal in the arch's validate_shape). Replicated KV is the only mode that boots.",
+      "ticket": "TD-AUTOCONFIG-GLM5NEXT-TP-SHARDED-KV",
+      "site": "src/daemon/engine.cpp:637-643"
+    }
+  ]
+}

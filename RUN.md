@@ -1,5 +1,11 @@
 ## Serve
 
+**No config for your box yet?** `python python/cli/autoconfigure.py --model
+<weights>` fits this hardware to the model, writes a recipe and prints the
+serve command — calibration and the 100-token loader training included. See
+**spec/AUTO_RUN.md**. The rest of this section is the hand-tuned champion
+path, which always wins over a derived config.
+
 Config-first: the champion json carries the engine knobs (placement table,
 calibration_path, speculation, prefix cache, arena attach/persist). Env vars
 that remain, and why:

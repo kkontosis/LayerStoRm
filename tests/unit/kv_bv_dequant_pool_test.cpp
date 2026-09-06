@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "compute/kernels/smxx/quant/kv_bv_extract_dequant.h"  // P-29 step 21: params observed by CountingAttentionDevice
 #include "core/gpu_ref.h"
 #include "core/null_attention_device.h"
 #include "parallelism/dcp_executor.h"       // AttentionLayerWeights
@@ -330,4 +331,156 @@ TEST_F(KvBvDequantPoolTest, BF16ScheduleNoop) {
     EXPECT_NE(r10.weight_ptr, r11.weight_ptr);
     EXPECT_NE(r11.weight_ptr, r12.weight_ptr);
     EXPECT_NE(r10.weight_ptr, r12.weight_ptr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P-29 step 21 — TD-KVBV-DEQUANT-POOL-INERT-GLM5N
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Records kv_bv_extract_dequant launches so a multi-rank test can prove which
+// DEVICE each dequant actually ran on (the latent one-rank kReady bug hid
+// exactly here: the sync fallback dequanted the acquiring rank only, then
+// marked the whole slot ready).
+class CountingAttentionDevice : public lc::NullAttentionDevice {
+public:
+    using lc::NullAttentionDevice::NullAttentionDevice;
+    void kv_bv_extract_dequant(const lc::KvBvExtractDequantParams& p,
+                               void*) override {
+        ++dequant_calls;
+        last_output = p.output;
+    }
+    int dequant_calls = 0;
+    void* last_output = nullptr;
+};
+
+class KvBvDequantPoolMultiRankTest : public KvBvDequantPoolTest {
+protected:
+    lp::KvBvDequantPool::Options make_opts2() {
+        cfg::GpuRef g0{0, 0, cfg::GpuType::rtx5090};
+        cfg::GpuRef g1{1, 1, cfg::GpuType::rtx5090};
+        dev0_ = std::make_unique<CountingAttentionDevice>(g0);
+        dev1_ = std::make_unique<CountingAttentionDevice>(g1);
+        auto opts = make_opts();
+        opts.dcp_size = 2;
+        opts.attention_devices = {dev0_.get(), dev1_.get()};
+        return opts;
+    }
+    std::unique_ptr<CountingAttentionDevice> dev0_;
+    std::unique_ptr<CountingAttentionDevice> dev1_;
+};
+
+// THE latent-bug repro (fails on the pre-step-21 code): an unscheduled
+// acquire() takes the synchronous fallback, which dequants ONLY the acquiring
+// rank. The old code marked the slot kReady, so rank 1's acquire() returned
+// its buffer with whatever the PREVIOUS occupant left in it — no dequant was
+// ever launched on device 1 for this layer. Every rank's acquire must be
+// backed by a dequant launched on that rank's own device.
+TEST_F(KvBvDequantPoolMultiRankTest, SyncFallbackDequantsEveryRank) {
+    lp::KvBvDequantPool pool(make_opts2());
+
+    auto w = make_fp8_weights();
+
+    auto r0 = pool.acquire(9, 0, w, nullptr);
+    EXPECT_FALSE(r0.is_direct);
+    EXPECT_EQ(dev0_->dequant_calls, 1);
+    EXPECT_EQ(dev0_->last_output, r0.weight_ptr)
+        << "rank 0's dequant must target rank 0's slot buffer";
+    EXPECT_EQ(dev1_->dequant_calls, 0);
+
+    auto r1 = pool.acquire(9, 1, w, nullptr);
+    EXPECT_FALSE(r1.is_direct);
+    EXPECT_EQ(dev1_->dequant_calls, 1)
+        << "one-rank kReady bug: rank 1 was handed its buffer without any "
+           "dequant ever launched on device 1";
+    EXPECT_EQ(dev1_->last_output, r1.weight_ptr)
+        << "rank 1's dequant must target rank 1's slot buffer";
+    EXPECT_NE(r0.weight_ptr, r1.weight_ptr);
+
+    // Stable on re-acquire: no further launches, same buffers.
+    auto r0b = pool.acquire(9, 0, w, nullptr);
+    auto r1b = pool.acquire(9, 1, w, nullptr);
+    EXPECT_EQ(r0b.weight_ptr, r0.weight_ptr);
+    EXPECT_EQ(r1b.weight_ptr, r1.weight_ptr);
+    EXPECT_EQ(dev0_->dequant_calls, 1);
+    EXPECT_EQ(dev1_->dequant_calls, 1);
+}
+
+// schedule_dequant launches every rank up front — acquire must not re-launch.
+TEST_F(KvBvDequantPoolMultiRankTest, ScheduledPathLaunchesEveryRankOnce) {
+    lp::KvBvDequantPool pool(make_opts2());
+
+    auto w = make_fp8_weights();
+    const lp::AttentionLayerWeights* w_ptr[2] = {&w, &w};
+
+    pool.schedule_dequant(5, w_ptr);
+    EXPECT_EQ(dev0_->dequant_calls, 1);
+    EXPECT_EQ(dev1_->dequant_calls, 1);
+
+    auto r0 = pool.acquire(5, 0, w, nullptr);
+    auto r1 = pool.acquire(5, 1, w, nullptr);
+    EXPECT_FALSE(r0.is_direct);
+    EXPECT_FALSE(r1.is_direct);
+    EXPECT_NE(r0.weight_ptr, r1.weight_ptr);
+    EXPECT_EQ(dev0_->dequant_calls, 1);
+    EXPECT_EQ(dev1_->dequant_calls, 1);
+}
+
+// A half-acquired sync-fallback slot must NOT be evictable: only slots every
+// rank has covered may be recycled (otherwise rank 1 could later acquire a
+// slot whose buffer was re-purposed for another layer).
+TEST_F(KvBvDequantPoolMultiRankTest, PartiallyAcquiredSlotNotEvicted) {
+    lp::KvBvDequantPool pool(make_opts2());
+
+    auto w = make_fp8_weights();
+    const lp::AttentionLayerWeights* w_ptr[2] = {&w, &w};
+
+    // Layer 9: rank 0 only (sync fallback — slot half-covered).
+    auto r9_0 = pool.acquire(9, 0, w, nullptr);
+
+    // Fill the remaining rotating slots via full schedule+acquire cycles.
+    for (int layer : {10, 11}) {
+        pool.schedule_dequant(layer, w_ptr);
+        pool.acquire(layer, 0, w, nullptr);
+        pool.acquire(layer, 1, w, nullptr);
+    }
+
+    // A new layer needs a slot: it must evict one of the fully-covered
+    // layers (10/11), never layer 9's half-covered slot.
+    auto r12_0 = pool.acquire(12, 0, w, nullptr);
+    EXPECT_NE(r12_0.weight_ptr, r9_0.weight_ptr)
+        << "half-acquired slot was evicted out from under rank 1";
+
+    // Rank 1 of layer 9 still lands on layer 9's slot, freshly dequanted.
+    int dev1_before = dev1_->dequant_calls;
+    auto r9_1 = pool.acquire(9, 1, w, nullptr);
+    EXPECT_EQ(dev1_->dequant_calls, dev1_before + 1);
+    EXPECT_EQ(dev1_->last_output, r9_1.weight_ptr);
+}
+
+// Zero-slot (inert) pool: BF16-direct acquire needs no slot and no VRAM;
+// a dequant-needing weight fails LOUDLY instead of serving garbage; prime and
+// schedule_dequant are safe no-ops for BF16 weights.
+TEST_F(KvBvDequantPoolTest, ZeroSlotPoolDirectPathWorksDequantThrows) {
+    auto opts = make_opts();
+    opts.num_slots = 0;
+    lp::KvBvDequantPool pool(std::move(opts));
+
+    auto w_bf16 = make_bf16_weights();
+    const lp::AttentionLayerWeights* bf16_ptr = &w_bf16;
+
+    // prime / schedule on BF16: no-ops, no crash (glm5_next primes layers
+    // 0,1 = KDA layers with no kv_b at all).
+    pool.prime(0, &bf16_ptr);
+    pool.prime(1, &bf16_ptr);
+    pool.schedule_dequant(5, &bf16_ptr);
+
+    auto r = pool.acquire(5, 0, w_bf16, nullptr);
+    EXPECT_TRUE(r.is_direct);
+    EXPECT_EQ(r.stride_a, static_cast<int64_t>(P + V) * D_c);
+
+    // Mis-sized pool (a dequant-needing weight with 0 slots) fails loudly.
+    auto w_fp8 = make_fp8_weights();
+    const lp::AttentionLayerWeights* fp8_ptr = &w_fp8;
+    EXPECT_THROW(pool.acquire(6, 0, w_fp8, nullptr), std::runtime_error);
+    EXPECT_THROW(pool.prime(0, &fp8_ptr), std::runtime_error);
 }

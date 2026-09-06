@@ -47,7 +47,12 @@ class KvBvDequantPool {
 public:
     struct Options {
         int dcp_size = 1;
-        int num_slots = 5;                ///< 2 permanent (layers 0,1) + 3 rotating
+        int num_slots = 5;                ///< 2 permanent (layers 0,1) + 3 rotating.
+                                          ///  0 = inert pool (no VRAM): every
+                                          ///  layer is BF16-direct; a
+                                          ///  needs_dequant() weight reaching
+                                          ///  acquire() then throws loudly
+                                          ///  (P-29 step 21).
         int num_heads_local = 64;
         int qk_nope_head_dim = 128;
         int v_head_dim = 128;
@@ -58,6 +63,15 @@ public:
 
     explicit KvBvDequantPool(Options opts);
     ~KvBvDequantPool();
+
+    /// True when this layer's kv_b_proj V-side must be dequanted through a
+    /// pool slot: FP8 (scales present) *or* packed GGUF k-quant (GG-7b,
+    /// TD-GG7-KVB-V-PATH-GGUF). BF16 kv_b (incl. GLM-1 assembled split
+    /// attn_k_b/attn_v_b on glm5_next) takes the direct-pointer path and
+    /// never consumes a slot. Exposed so DcpExecutor can size the pool to
+    /// ZERO slots on models where no layer ever dequants
+    /// (TD-KVBV-DEQUANT-POOL-INERT-GLM5N, P-29 step 21).
+    static bool needs_dequant(const AttentionLayerWeights& w);
 
     // Non-copyable, non-movable (owns device buffers + events).
     KvBvDequantPool(const KvBvDequantPool&) = delete;
@@ -104,6 +118,18 @@ private:
         SlotState state = SlotState::kIdle;
         std::vector<void*> buffers;    // [dcp_size] BF16 device ptrs
         std::vector<void*> events;     // [dcp_size] CUDA events for async completion
+        // P-29 step 21 (TD-KVBV-DEQUANT-POOL-INERT-GLM5N latent bug): the
+        // slot state alone cannot express PER-RANK readiness. The old code
+        // marked a slot kReady after the synchronous fallback dequanted ONE
+        // rank — the other rank's acquire() then returned its (stale)
+        // buffer without any dequant ever running on that rank. Same
+        // species in the kDequanting branch: the FIRST acquiring rank's
+        // wait flipped the slot to kReady, so later ranks skipped the
+        // stream_wait_event on their OWN dequant event. Both are now
+        // tracked per rank:
+        uint32_t launched_ranks = 0;   ///< bit r: dequant launched for rank r
+        uint32_t synced_ranks = 0;     ///< bit r: rank r's consumer stream is
+                                       ///  ordered after that dequant
     };
 
     /// Find a slot holding layer_idx, or -1.

@@ -33,6 +33,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1080,8 +1081,14 @@ TEST(DsparkForward, CaptureRewindAndGapContracts) {
     dc.markov_rank = 4;
     dc.draft_context_capacity_tokens = 256;
     dc.aux_capture_max_rows = 16;
+    // TD-DSPARK-CTX-POLICY: this test pins the LEGACY fail-closed cap
+    // contracts — rotation (default ON) is disabled via its kill switch.
+    // Rotation-mode contracts: CtxRotationWindowContracts / byte tests.
+    setenv("LS_DSPARK_CTX_ROTATE", "0", 1);
     Harness h(cfg);
+    unsetenv("LS_DSPARK_CTX_ROTATE");
     auto* rt = h.rt.get();
+    ASSERT_FALSE(rt->ctx_rotation_enabled());
 
     const int H = 8;
     void* src = h.backend->device_alloc(16 * H * 2);
@@ -1165,8 +1172,330 @@ TEST(DsparkForward, CaptureRewindAndGapContracts) {
     EXPECT_TRUE(rt->ctx_valid());
     EXPECT_EQ(rt->ctx_len(), 1);
 
+    // Rotation OFF is byte-identical legacy: the base never moves and no
+    // compaction ever ran.
+    EXPECT_EQ(rt->ctx_base(), 0);
+    EXPECT_EQ(rt->ctx_rotations(), 0);
+    EXPECT_FALSE(rt->ctx_rearm_pending());
+
     h.backend->synchronize_device();
     h.backend->device_free(src);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TD-DSPARK-CTX-POLICY: windowed drafting — context-arena rotation
+// ═════════════════════════════════════════════════════════════════════════════
+
+namespace {
+lc::Config rotation_config(const fs::path& dir) {
+    auto cfg = runtime_config(dir);
+    auto& dc = cfg.speculation.dspark;
+    dc.block_size = 8;
+    dc.speculative_tokens = 7;
+    dc.aux_hidden_state_layer_ids = {0, 1};
+    dc.mask_token_id = 5;
+    dc.max_anchors = 16;
+    dc.draft_vocab_size = 32;
+    dc.markov_rank = 4;
+    dc.draft_context_capacity_tokens = 32;  // tiny window: rotations cheap
+    dc.aux_capture_max_rows = 16;
+    return cfg;
+}
+}  // namespace
+
+// Rotation-mode state-machine contracts: the arena is a window over the
+// newest positions — appends past the cap rotate (base advances, drafting
+// stays VALID), rewinds inside the window overwrite, anchors/rewinds below
+// the base fail closed, and an OVERSIZED epoch (> cap rows) is skipped via
+// the dormant frontier and re-arms an EMPTY window at its end.
+TEST(DsparkForward, CtxRotationWindowContracts) {
+    if (!has_cuda_gpu()) GTEST_SKIP() << "No CUDA GPU";
+
+    const auto dir = make_tiny_checkpoint("ctxrot", tiny_tensors(7));
+    auto cfg = rotation_config(dir);
+    unsetenv("LS_DSPARK_CTX_ROTATE");  // default = ON
+    Harness h(cfg);
+    auto* rt = h.rt.get();
+    ASSERT_TRUE(rt->ctx_rotation_enabled());
+
+    const int H = 8;
+    void* src = h.backend->device_alloc(64 * H * 2);
+    ASSERT_NE(src, nullptr);
+    auto step = [&](uint64_t seq, uint32_t pos, int rows) {
+        rt->capture_aux(0, src, rows, seq, pos, *h.backend, h.stream);
+        rt->capture_aux(1, src, rows, seq, pos, *h.backend, h.stream);
+    };
+    std::string err;
+
+    // Fill to the cap: no rotation yet.
+    step(1, 0, 16);
+    step(1, 16, 16);
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_len(), 32);
+    EXPECT_EQ(rt->ctx_base(), 0);
+    EXPECT_EQ(rt->ctx_rotations(), 0);
+
+    // Append past the cap: rotation, drafting STAYS VALID.
+    // keep_post = max(cap/2, rows) = 16 -> base = 40 - 16 = 24.
+    step(1, 32, 8);
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_len(), 40);
+    EXPECT_EQ(rt->ctx_base(), 24);
+    EXPECT_EQ(rt->ctx_rotations(), 1);
+    EXPECT_TRUE(rt->run_step(1, /*anchor=*/3, /*anchor_pos=*/40, 4, &err))
+        << err;
+
+    // Anchor below the window base fails closed (loud, never silent).
+    EXPECT_FALSE(rt->run_step(1, 3, /*anchor_pos=*/20, 4, &err));
+    EXPECT_NE(err.find("below the rotated context window base"),
+              std::string::npos)
+        << err;
+
+    // Overwrite-rewind INSIDE the window: blessed, len shrinks to the end.
+    step(1, 38, 1);
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_len(), 39);
+    EXPECT_EQ(rt->ctx_base(), 24);
+
+    // Re-feed BELOW the window base: the discarded rows cannot be
+    // overwritten — fail closed.
+    step(1, 20, 1);
+    EXPECT_FALSE(rt->ctx_valid());
+
+    // Position-0 restart resets the base.
+    step(1, 0, 4);
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_base(), 0);
+    EXPECT_EQ(rt->ctx_len(), 4);
+
+    // ── Oversized SINGLE-WINDOW epoch (rows > cap): dormant frontier ──
+    step(1, 4, 40);  // 40 rows > cap 32: skip epoch, follow it
+    EXPECT_FALSE(rt->ctx_valid());
+    EXPECT_TRUE(rt->ctx_rearm_pending());
+    EXPECT_FALSE(rt->run_step(1, 3, 4, 4, &err));
+    // Fresh epoch at the skipped epoch's end (44): re-arm EMPTY window.
+    step(1, 44, 4);
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_FALSE(rt->ctx_rearm_pending());
+    EXPECT_EQ(rt->ctx_base(), 44);
+    EXPECT_EQ(rt->ctx_len(), 48);
+    // Anchor at the re-arm base: EMPTY context window (block-only
+    // attention — the anchor_pos == 0 shape at a nonzero base).
+    EXPECT_TRUE(rt->run_step(1, 3, /*anchor_pos=*/44, 4, &err)) << err;
+    EXPECT_TRUE(rt->run_step(1, 3, /*anchor_pos=*/48, 4, &err)) << err;
+    EXPECT_FALSE(rt->run_step(1, 3, /*anchor_pos=*/40, 4, &err));
+
+    // ── Oversized MULTI-WINDOW (superchunk) epoch ──
+    auto cap = [&](int slot, uint64_t seq, uint32_t pos, int rows) {
+        rt->capture_aux(slot, src, rows, seq, pos, *h.backend, h.stream);
+    };
+    cap(0, 1, 48, 16);  // epoch base 48, slot 0 [48,64)
+    cap(0, 1, 64, 16);  // extension: epoch 32 rows == cap, still fine
+    cap(0, 1, 80, 8);   // extension to 40 rows > cap: dormant
+    EXPECT_FALSE(rt->ctx_valid());
+    EXPECT_TRUE(rt->ctx_rearm_pending());
+    cap(1, 1, 48, 16);  // final slot follows the skipped epoch...
+    cap(1, 1, 64, 16);
+    cap(1, 1, 80, 8);   // ...to completion (88)
+    EXPECT_TRUE(rt->ctx_rearm_pending());
+    step(1, 88, 2);     // fresh epoch at the end: re-arm
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_base(), 88);
+    EXPECT_EQ(rt->ctx_len(), 90);
+
+    // ── Non-contiguous capture while dormant: dead until position 0 ──
+    step(1, 90, 40);    // oversized: dormant (slot-0 end 130)
+    EXPECT_TRUE(rt->ctx_rearm_pending());
+    step(1, 140, 2);    // gap vs the dormant frontier: fully dead
+    EXPECT_FALSE(rt->ctx_valid());
+    EXPECT_FALSE(rt->ctx_rearm_pending());
+    step(1, 130, 2);    // even the old frontier no longer re-arms
+    EXPECT_FALSE(rt->ctx_valid());
+    step(1, 0, 2);      // position-0 restart
+    EXPECT_TRUE(rt->ctx_valid());
+    EXPECT_EQ(rt->ctx_base(), 0);
+
+    h.backend->synchronize_device();
+    h.backend->device_free(src);
+}
+
+// The rotation compaction is a pure byte MOVE: the surviving window rows
+// are bit-identical to the same rows before the rotation (every layer, K
+// and V), and the post-rotation forward is deterministic.
+TEST(DsparkForward, CtxRotationCompactionPreservesBytes) {
+    if (!has_cuda_gpu()) GTEST_SKIP() << "No CUDA GPU";
+
+    const auto dir = make_tiny_checkpoint("ctxrotbytes", tiny_tensors(9));
+    auto cfg = rotation_config(dir);
+    unsetenv("LS_DSPARK_CTX_ROTATE");
+    Harness h(cfg);
+    auto* rt = h.rt.get();
+    ASSERT_TRUE(rt->ctx_rotation_enabled());
+
+    const TinyDims d;
+    const int H = static_cast<int>(d.H);
+    const int kv_dim = d.heads * static_cast<int>(d.D);  // 8
+    const int cap = 32;
+    const int64_t row_b = static_cast<int64_t>(kv_dim) * 2;      // BF16
+    const int64_t v_off = static_cast<int64_t>(cap) * row_b;     // V after K
+    const int64_t layer_b = 2 * v_off;                           // K + V
+
+    // Position-distinct capture content so every arena row is unique.
+    void* src = h.backend->device_alloc(16 * H * 2);
+    ASSERT_NE(src, nullptr);
+    auto feed = [&](uint32_t pos, int rows) {
+        std::vector<uint16_t> bf(static_cast<size_t>(rows) * H);
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < H; ++c)
+                bf[static_cast<size_t>(r) * H + c] =
+                    f2bf(0.02f * static_cast<float>(pos + r) +
+                         0.003f * static_cast<float>(c) - 0.4f);
+        h.backend->set_device();
+        h.backend->memcpy_h2d(src, bf.data(), bf.size() * 2);
+        rt->capture_aux(0, src, rows, 1, pos, *h.backend, h.stream);
+        rt->capture_aux(1, src, rows, 1, pos, *h.backend, h.stream);
+    };
+
+    feed(0, 16);
+    feed(16, 16);
+    ASSERT_TRUE(rt->ctx_valid());
+    ASSERT_EQ(rt->ctx_len(), 32);
+    ASSERT_EQ(rt->ctx_rotations(), 0);
+
+    // Snapshot the rows that will survive the next rotation: the append
+    // [32, 40) rotates to base 24 (keep_post = 16), so absolute rows
+    // [24, 32) — arena rows [24, 32) now — move to arena rows [0, 8).
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    const int copy_rows = 8, shift = 24;
+    std::vector<std::vector<char>> pre(4);  // {L0,L1} x {K,V}
+    for (int l = 0; l < 2; ++l) {
+        const auto* kb = static_cast<const char*>(rt->debug_ctx_k(l));
+        pre[static_cast<size_t>(2 * l)].resize(
+            static_cast<size_t>(copy_rows * row_b));
+        ASSERT_EQ(cudaMemcpy(pre[static_cast<size_t>(2 * l)].data(),
+                             kb + shift * row_b,
+                             static_cast<size_t>(copy_rows * row_b),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        pre[static_cast<size_t>(2 * l + 1)].resize(
+            static_cast<size_t>(copy_rows * row_b));
+        ASSERT_EQ(cudaMemcpy(pre[static_cast<size_t>(2 * l + 1)].data(),
+                             kb + v_off + shift * row_b,
+                             static_cast<size_t>(copy_rows * row_b),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+    }
+
+    feed(32, 8);  // triggers the rotation
+    ASSERT_TRUE(rt->ctx_valid());
+    ASSERT_EQ(rt->ctx_base(), 24);
+    ASSERT_EQ(rt->ctx_rotations(), 1);
+
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    for (int l = 0; l < 2; ++l) {
+        const auto* kb = static_cast<const char*>(rt->debug_ctx_k(l));
+        std::vector<char> post(static_cast<size_t>(copy_rows * row_b));
+        ASSERT_EQ(cudaMemcpy(post.data(), kb,
+                             static_cast<size_t>(copy_rows * row_b),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(std::memcmp(post.data(),
+                              pre[static_cast<size_t>(2 * l)].data(),
+                              post.size()),
+                  0)
+            << "K rows moved with bit changes, layer " << l;
+        ASSERT_EQ(cudaMemcpy(post.data(), kb + v_off,
+                             static_cast<size_t>(copy_rows * row_b),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(std::memcmp(post.data(),
+                              pre[static_cast<size_t>(2 * l + 1)].data(),
+                              post.size()),
+                  0)
+            << "V rows moved with bit changes, layer " << l;
+    }
+
+    // Post-rotation forward is deterministic (two identical run_steps
+    // produce bit-identical base logits).
+    std::string err;
+    const int nq = 4, rows = nq + 1;
+    std::vector<float> l1(static_cast<size_t>(rows) * d.V),
+        l2(static_cast<size_t>(rows) * d.V);
+    ASSERT_TRUE(rt->run_step(1, 3, 40, nq, &err)) << err;
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    ASSERT_EQ(cudaMemcpy(l1.data(), rt->base_logits(), l1.size() * 4,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_TRUE(rt->run_step(1, 3, 40, nq, &err)) << err;
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    ASSERT_EQ(cudaMemcpy(l2.data(), rt->base_logits(), l2.size() * 4,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(std::memcmp(l1.data(), l2.data(), l1.size() * 4), 0);
+
+    h.backend->set_device();
+    h.backend->synchronize_device();
+    h.backend->device_free(src);
+}
+
+// Sharded (nr == 2) rotation: the compaction runs per-rank over each head
+// shard's arena on that rank's stream — drafting survives past the cap and
+// the sharded forward stays deterministic.
+TEST(DsparkForward, CtxRotationShardedSmoke) {
+    if (!has_cuda_gpu()) GTEST_SKIP() << "No CUDA GPU";
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2)
+        GTEST_SKIP() << "needs 2 CUDA devices";
+
+    const auto dir = make_tiny_checkpoint("ctxrotshard", tiny_tensors(11));
+    auto cfg = rotation_config(dir);
+    cfg.speculation.dspark.draft_gpus = {0, 1};
+    unsetenv("LS_DSPARK_CTX_ROTATE");
+    ShardHarness h(cfg);
+    auto* rt = h.rt.get();
+    ASSERT_TRUE(rt->ctx_rotation_enabled());
+
+    const int H = 8;
+    h.backends[0]->set_device();
+    void* src = h.backends[0]->device_alloc(16 * H * 2);
+    ASSERT_NE(src, nullptr);
+    auto step = [&](uint32_t pos, int rows) {
+        rt->capture_aux(0, src, rows, 1, pos, *h.backends[0], h.streams[0]);
+        rt->capture_aux(1, src, rows, 1, pos, *h.backends[0], h.streams[0]);
+    };
+    step(0, 16);
+    step(16, 16);
+    step(32, 8);  // rotation on both rank arenas
+    ASSERT_TRUE(rt->ctx_valid());
+    ASSERT_EQ(rt->ctx_base(), 24);
+    ASSERT_EQ(rt->ctx_rotations(), 1);
+
+    std::string err;
+    const int nq = 4, rows = nq + 1;
+    const TinyDims d;
+    std::vector<float> l1(static_cast<size_t>(rows) * d.V),
+        l2(static_cast<size_t>(rows) * d.V);
+    ASSERT_TRUE(rt->run_step(1, 3, 40, nq, &err)) << err;
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    ASSERT_EQ(cudaMemcpy(l1.data(), rt->base_logits(), l1.size() * 4,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_TRUE(rt->run_step(1, 3, 40, nq, &err)) << err;
+    rt->draft_backend()->set_device();
+    rt->draft_backend()->synchronize_device();
+    ASSERT_EQ(cudaMemcpy(l2.data(), rt->base_logits(), l2.size() * 4,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(std::memcmp(l1.data(), l2.data(), l1.size() * 4), 0);
+
+    h.backends[0]->set_device();
+    h.backends[0]->synchronize_device();
+    h.backends[0]->device_free(src);
 }
 
 // TD-V4-SPEC-PREFILL-CTX: pending_final_window exposes the exact epoch

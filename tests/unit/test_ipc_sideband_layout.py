@@ -192,8 +192,9 @@ class TestSidebandTotalSize:
             f"Python={SIDEBAND_TOTAL_SIZE}"
         )
 
-    def test_total_size_is_96272(self, cpp_layout):
-        # 8 command regions (→ 26624, end of spec-checkpoint) + F-4 routing-export
-        # slot (65552) + F-7 seam-checkpoint (4096) = 96272.
-        assert cpp_layout["_total_size"] == 96272
-        assert SIDEBAND_TOTAL_SIZE == 96272
+    def test_total_size_is_100368(self, cpp_layout):
+        # 8 command regions (→ 30720, end of spec-checkpoint; expert
+        # prefetch/eviction 512 entries each since GF3.15) + F-4
+        # routing-export slot (65552) + F-7 seam-checkpoint (4096) = 100368.
+        assert cpp_layout["_total_size"] == 100368
+        assert SIDEBAND_TOTAL_SIZE == 100368

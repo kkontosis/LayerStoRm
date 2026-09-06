@@ -464,3 +464,25 @@ def test_trainer_apply_cli_smoke(tmp_path):
     assert trained["source"] == "trained"
     assert len(trained["matrix"]) == gt.B
     assert len(trained["devices"]) == gt.M
+
+
+def test_overhead_sanity_thresholds():
+    """TD-AUTOCONFIG-TRAINER-NEGATIVE-OVERHEAD: a fitted global constant is
+    decision-invariant (added outside max(dev,bank) to every candidate), so a
+    ~us-scale negative intercept is sub-noise and QUIET; a constant comparable
+    to the residual RMSE means the intercept absorbs a systematic term and
+    must WARN (distrust absolute predictions, refit)."""
+    from trainer import overhead_sanity
+
+    # the real fits: glm5_next -2.02 us @ RMSE 591; GLM-5.2 -1.47 @ 5308
+    assert overhead_sanity(-2.022871356399361, 591.1045508798492) is None
+    assert overhead_sanity(-1.4719995142124307, 5308.4411409308495) is None
+    # systematic absorption: constant ~ the RMSE itself
+    w = overhead_sanity(-500.0, 591.1)
+    assert w is not None
+    assert "TD-AUTOCONFIG-TRAINER-NEGATIVE-OVERHEAD" in w
+    assert "placement ORDER is unaffected" in w
+    # sign-agnostic: a huge POSITIVE constant is the same alarm
+    assert overhead_sanity(+500.0, 591.1) is not None
+    # degenerate RMSE guard
+    assert overhead_sanity(1.0, 0.0) is not None

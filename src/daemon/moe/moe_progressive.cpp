@@ -7,6 +7,7 @@
 #include "daemon/dispatch_detail.h"
 #include "daemon/ep_residency_dedup.h"  // INV-MOE-EP-DISJOINT force-ON dedup
 #include "daemon/expert_lifecycle_manager.h"
+#include "daemon/moe/moe_internal.h"  // 44z: TD-91d zero-fill guard counters
 #include "core/perf_trace.h"
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <cstdio>  // I8b shadow-dump JSONL sink (fopen/fprintf)
 #include <cstdlib>  // TD-DRIFT-ROOTCAUSE getenv gate
 #include <cstring>
+#include <map>     // TD-MOE-PROGRESSIVE-DEGRADED-SILENT degrade diagnostics
 #include <limits>
 #include <span>
 #include <string>  // I8 shadow log assembly
@@ -70,6 +72,29 @@ static bool far_ensure_residents_enabled() {
     }();
     return on;
 }
+
+// P-29 step 19 (LS_FAR_GATE_DISPATCH, default ON; =0 restores the bail):
+// when the gated-final commit finds a pending demand copy still STAGED in
+// the transfer engine, force-dispatch the staged demand-priority queue for
+// that GPU past max_inflight_per_gpu instead of falling back to the
+// host-poll finalize. Measured basis (step-19 trace reduction of the
+// champion 8k arm): 9.0% of fetching decode layers fell back, 100% of them
+// with >=1 own copy staged behind an inflight window that was 100%
+// physically-complete-but-undetected copies from >=1-3 layers back (median
+// age 4.3 ms) — the cap was written to bound live DMA concurrency and now
+// gates stale bookkeeping. The late flush the daemon would do anyway lands
+// 34 us (median) AFTER kMoeFetchIssued, past the commit; dispatching it
+// inside the commit converts the layer to the device-gated path. Fallback
+// wall cost measured 0.22-0.58 ms/token. Dispatch order is identical to
+// flush_staged (same priority-queue order), only earlier — copies, bytes,
+// kernels and their order are unchanged (bit-identical bar).
+static bool far_gate_dispatch_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("LS_FAR_GATE_DISPATCH");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 }  // namespace
 
 // ── #90: Progressive fetch-and-run MoE ─────────────────────────────────────
@@ -110,6 +135,15 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
         return;
     }
 
+    // P-29 step 16: an EXTERNAL (orchestrator-split) FETCH command was not
+    // preceded by this handler's own FAR pre-issue — clear any stale
+    // pre-issue flags so its dispatch never consumes another command's
+    // primed buffers. The FAR-delegated call (cmd_type ==
+    // E_CMD_FAR_FORWARD_LAYER) keeps them: they were set for THIS layer a
+    // few lines up in handle_far_forward_layer.
+    if (cmd.cmd_type != ipc::E_CMD_FAR_FORWARD_LAYER)
+        clear_far_prologue();
+
     if (!deps_.expert_cache) {
         write_error(cmd.cmd_seq, cmd.gpu_idx,
                     ipc::CmpErrorCategory::kFetchAndRunMoe,
@@ -144,6 +178,10 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     if (cmd.cmd_type == ipc::E_CMD_FAR_FORWARD_LAYER) {
         state.cmp_cmd_type_override = cmd.cmd_type;
         state.cmp_data_bytes        = p.expert_count;
+        // TD-INDEXER-NO-DENSE-FALLBACK witness byte (the FAR command's
+        // attention half ran in handle_far_forward_layer just above).
+        state.cmp_indexer_dense     = step_indexer_dense_;
+        step_indexer_dense_         = 0;
     }
     state.total_experts = static_cast<int>(p.expert_count);
     // TD-PREFILL-MOE-BIG: BIG command — double-buffered waves + chunked
@@ -151,6 +189,13 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     state.big = big;
     state.chunk_tokens = big
         ? static_cast<int>(cmd.fetch_and_run_moe_big.chunk_tokens) : 0;
+
+    // P-29 step 16 (LS_FAR_PROLOGUE_PREISSUE): the FAR pre-issue already
+    // broadcast rank0's normalized hidden + top-K to the EP-XTP ranks for
+    // this layer — the overlap pass and the finalize must not re-broadcast
+    // (same skip contract as the overlap pass' own broadcast).
+    state.xtp_broadcast_done = far_prologue_bcast_done_
+        && far_prologue_layer_ == p.layer_idx;
 
     // Read sideband expert list.
     const auto* entries = reinterpret_cast<const ipc::ExpertPrefetchEntry*>(
@@ -205,6 +250,16 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     // I8 GPU-loader shadow solve + (LS_LOADER_ACT) reroute. Env-gated, inert in
     // production; implemented in dispatch_loader.cpp.
     route_moe_by_loader(entries, cmd, state);
+    // P-29 step 17: kMoeEnter SUB-MARKERS (token=1..4) decompose the
+    // readback→FetchIssued host window: 1 = state build + loader route done,
+    // 2 = decider/transient/zero-cap/locks done, 3 = missing-expert H2Ds
+    // issued (issue_moe_wave returned), 4 = resident-overlap pass enqueued.
+    // token==0 remains the handler-entry record; consumers keying on
+    // kMoeEnter must filter token==0 (same convention as the stage-18
+    // graph-replay sub-markers).
+    perf_trace::record(perf_trace::kMoeEnter,
+                       static_cast<uint16_t>(cmd.gpu_idx), cmd.cmd_seq,
+                       p.layer_idx, 1);
 
     // ── F-6: selective-fetch decider ───────────────────────────────────
     // Decide which *missing* (non-resident) experts to issue H2D for. Resident
@@ -324,6 +379,9 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
             ++zero_cap_skipped;
         }
         if (zero_cap_skipped > 0) {
+            // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: potentially-routed experts
+            // were dropped for a capacity/topology reason — degraded.
+            state.degraded = true;
             spdlog::error(
                 "fetch_and_run_moe: {} fetch entr{} target GPU(s) with a "
                 "0-slot stable zone (first: L{}E{} gpu={}) — skipped "
@@ -345,6 +403,9 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
             }
         }
     }
+    perf_trace::record(perf_trace::kMoeEnter,
+                       static_cast<uint16_t>(cmd.gpu_idx), cmd.cmd_seq,
+                       p.layer_idx, 2);  // P-29 step 17 sub-marker: decider+locks done
 
     // TD-EVICT-BOARD-DESYNC: the EvictScoreBoard now learns residency from the
     // ExpertCache's own add/evict choke-points (it is the cache's
@@ -445,6 +506,9 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
     if (cpu_layer_has_forced(state.layer_idx))
         cpu_fetch_win_start_ns_ = xray_now_ns();
     issue_moe_wave(state);
+    perf_trace::record(perf_trace::kMoeEnter,
+                       static_cast<uint16_t>(cmd.gpu_idx), cmd.cmd_seq,
+                       p.layer_idx, 3);  // P-29 step 17 sub-marker: H2Ds issued
 
     // ── C-6 early-kick: kick the host CPU-expert FFN CONCURRENT with the fetch ──
     // The missing-expert H2Ds are now in flight on the copy streams (issue_moe_
@@ -548,6 +612,9 @@ void CommandDispatcher::handle_fetch_and_run_moe_impl(const ipc::Command& cmd,
         && deps_.cuda_kernels_enabled && moe_resident_overlap_enabled()) {
         run_moe_overlap_pass(state);
     }
+    perf_trace::record(perf_trace::kMoeEnter,
+                       static_cast<uint16_t>(state.gpu_idx), state.cmd_seq,
+                       state.layer_idx, 4);  // P-29 step 17 sub-marker: overlap done
 
     // ── LS_FAR_GATED_FINAL: gated-final hybrid ──────────────────────────
     // The resident-overlap kPartial kernels are now enqueued on the kExpertFfn
@@ -879,8 +946,21 @@ bool CommandDispatcher::far_stream_gate_commit(ProgressiveMoeState& st,
             return false;
         }
         if (!deps_.transfer_engine->is_dispatched_h2d(er.key, er.target_gpu)) {
-            ++gated_final_fb_not_dispatched_;
-            return false;
+            // P-29 step 19: the copy is staged behind the inflight cap —
+            // force-dispatch the demand-priority staged queue for this GPU
+            // and re-check (see far_gate_dispatch_enabled above).
+            bool now_dispatched = false;
+            if (far_gate_dispatch_enabled()) {
+                deps_.transfer_engine->dispatch_staged_at_least(
+                    er.target_gpu, kDemandFetchPriority);
+                now_dispatched = deps_.transfer_engine->is_dispatched_h2d(
+                    er.key, er.target_gpu);
+                if (now_dispatched) ++gated_final_force_dispatched_;
+            }
+            if (!now_dispatched) {
+                ++gated_final_fb_not_dispatched_;
+                return false;
+            }
         }
         const auto* ce = deps_.expert_cache->lookup(er.key, er.target_gpu);
         if (!ce || !ce->vram_address) {
@@ -1534,9 +1614,36 @@ bool CommandDispatcher::advance_progressive_moe() {
                 // finalize with what arrived (graceful degradation, same as
                 // the timeout path) instead of burning the deadline.
                 if (issue_moe_wave(st) == 0) {
+                    // Diagnostic detail (TD-MOE-PROGRESSIVE-DEGRADED-SILENT):
+                    // per-target-GPU remaining/free/total stable slots so the
+                    // trigger shape is readable from the log.
+                    std::string detail;
+                    if (deps_.expert_cache && deps_.cuda_kernels_enabled) {
+                        std::map<int, int> remaining;
+                        for (const auto& er : st.experts)
+                            if (!er.is_arrived && er.fetch_requested
+                                && !er.issued)
+                                ++remaining[er.target_gpu];
+                        for (const auto& [g, n] : remaining)
+                            detail += fmt::format(
+                                " gpu{}: {} unissued, {}/{} stable free,"
+                                " {} streaming free;", g, n,
+                                deps_.expert_cache->free_slots(
+                                    g, memory::CacheZone::kStable),
+                                deps_.expert_cache->total_slots(
+                                    g, memory::CacheZone::kStable),
+                                deps_.expert_cache->free_slots(
+                                    g, memory::CacheZone::kStreaming));
+                    }
                     spdlog::warn("progressive MoE: no capacity to issue any of "
                                  "the remaining routed experts (layer {}) — "
-                                 "finalizing degraded", st.layer_idx);
+                                 "finalizing degraded ({} arrived / {} skipped "
+                                 "/ {} total;{})", st.layer_idx,
+                                 st.arrived_count, st.skipped_count,
+                                 st.total_experts, detail);
+                    // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: make the degrade
+                    // observable to the caller, not only to the log.
+                    st.degraded = true;
                     st.phase = ProgressiveMoePhase::kFinalize;
                 }
                 if (st.phase != ProgressiveMoePhase::kFinalize) return false;
@@ -1570,6 +1677,35 @@ bool CommandDispatcher::advance_progressive_moe() {
                 ).count());
             if (now_ns >= st.deadline_ns) {
                 st.timed_out = true;
+                // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: the deadline only
+                // governs while a requested fetch is genuinely in flight
+                // (quiescence finalizes first otherwise), so a timeout
+                // finalize computes without router-selected experts.
+                st.degraded = true;
+                // LOUD, once per timed-out command (so at most one line per
+                // deadline period — no spam risk). The KVXP regrant wedge
+                // burned this deadline on EVERY layer for tens of minutes
+                // with zero log output; the crawl was indistinguishable from
+                // a hard hang until a debugger was attached. Name the first
+                // few un-arrived experts so the next reader can query their
+                // ELM/cache state directly.
+                int missing = 0;
+                std::string first_missing;
+                for (const auto& er : st.experts) {
+                    if (er.is_arrived || !er.fetch_requested) continue;
+                    if (missing < 4)
+                        first_missing += fmt::format(" L{}E{}(issued={})",
+                                                     er.key.layer_idx,
+                                                     er.key.expert_idx,
+                                                     er.issued ? 1 : 0);
+                    ++missing;
+                }
+                spdlog::warn(
+                    "progressive MoE layer {}: fetch deadline expired with "
+                    "{} routed expert(s) un-arrived ({} arrived / {} skipped "
+                    "/ {} total; first:{}) — finalizing DEGRADED (cmd_seq {})",
+                    st.layer_idx, missing, st.arrived_count, st.skipped_count,
+                    st.total_experts, first_missing, st.cmd_seq);
                 st.phase = ProgressiveMoePhase::kFinalize;
             }
         }
@@ -1620,6 +1756,26 @@ bool CommandDispatcher::advance_progressive_moe() {
                 // from a prior layer never leak into their dispatch.
                 for (int g : ep_xtp_gpus_)
                     zero_bitset(g);
+                // TD-GLM53-EP4-DEGENERATE-GENERATION tripwire: an expert
+                // that ARRIVED on a GPU nobody will dispatch is a SILENT
+                // correctness loss — its w_k*expert_out_k never enters the
+                // combine, yet nothing timed out and nothing was skipped, so
+                // the deadline/quiescence degraded paths above cannot see it.
+                // That is exactly how a one-TP-rank EP>1 topology dropped
+                // ~(EP-1)/EP of every token's routed contribution while
+                // moe_degraded_layers stayed 0.  Count the unownable bits here
+                // and DEGRADE the layer: every gate, ledger and discard rule
+                // already trusts moe_degraded, so this is the signal that
+                // reaches them.
+                auto dispatchable = [&](int g) {
+                    if (g == static_cast<int>(st.gpu_idx)) return true;
+                    if (deps_.dcp_executor)
+                        for (const auto& tg : deps_.dcp_executor->gpus())
+                            if (tg.position == g) return true;
+                    return std::find(ep_xtp_gpus_.begin(), ep_xtp_gpus_.end(), g)
+                           != ep_xtp_gpus_.end();
+                };
+                int unowned = 0;
                 for (const auto& er : st.experts) {
                     // Rolling waves: experts already accumulated by a wave-
                     // partial pass are EXCLUDED (their rows live in
@@ -1630,7 +1786,19 @@ bool CommandDispatcher::advance_progressive_moe() {
                         auto& b = moe_scratch_[er.target_gpu].expert_resident_bitset;
                         int eidx = er.key.expert_idx;
                         b[eidx / 8] |= static_cast<uint8_t>(1u << (eidx % 8));
+                        if (!dispatchable(er.target_gpu)) ++unowned;
                     }
+                }
+                if (unowned > 0) {
+                    st.degraded = true;
+                    spdlog::error(
+                        "MoE finalize layer {}: {} arrived expert(s) sit on a "
+                        "GPU that no dispatch covers — their contribution is "
+                        "DROPPED from the routed combine "
+                        "(TD-GLM53-EP4-DEGENERATE-GENERATION tripwire). "
+                        "Marking the layer degraded so the health counters see "
+                        "it; expert placement and the EP-xTP fold disagree.",
+                        st.layer_idx, unowned);
                 }
 
                 InternalMoeParams mp{};
@@ -1676,8 +1844,21 @@ bool CommandDispatcher::advance_progressive_moe() {
                             compute_evt_gpu, compute::StreamId::kExpertFfn));
                 }
 
-                if (deps_.dcp_communicator
-                    && deps_.dcp_communicator->is_active()) {
+                // TD-GLM53-EP4-DEGENERATE-GENERATION: the bitset loop above
+                // populates expert-only GPUs' bitsets from er.target_gpu — the
+                // finalize MUST take the multi-rank path whenever any such host
+                // exists, or exactly those experts are never computed/folded
+                // (and nothing reports degraded: they DID arrive).
+                // 44z health tripwire (ticket §5): snapshot the TD-91d
+                // zero-fill guard counter across ALL GPUs before the dispatch.
+                // dispatch_moe_all_ranks builds a pointer table on EVERY rank
+                // it computes on, so a per-GPU diff would miss fires on the
+                // other ranks — sum the whole bank (the honest form).
+                const int64_t zone_guard_before = zone_guard_zero_fills_total();
+
+                if ((deps_.dcp_communicator
+                     && deps_.dcp_communicator->is_active())
+                    || !ep_xtp_gpus_.empty()) {
                     dispatch_moe_all_ranks(mp);
                 } else {
                     dispatch_moe_internal(mp);
@@ -1690,11 +1871,38 @@ bool CommandDispatcher::advance_progressive_moe() {
                         be->record_event(compute_t_end, deps_.stream_manager->stream(
                             compute_evt_gpu, compute::StreamId::kExpertFfn));
                 }
+
+                // 44z health tripwire: a guard fire inside the dispatch above
+                // means a bitset-resident expert had NO cache entry when its
+                // B-pointer was staged — its contribution was ZEROED for every
+                // routed token of this layer. Under 44z zone rebalancing that
+                // is exactly "the dispatch consulted a reclaimed slot" (the
+                // reclaim hazard the design must never ship silently), and in
+                // general it is the TD-GLM53-EP4 silent-loss class. Degrade the
+                // layer: st.degraded reaches pc.moe_degraded below, hence
+                // [orch-stats] moe_degraded_layers — which every gate, ledger
+                // and discard rule already trusts.
+                const int64_t zone_guard_fires =
+                    zone_guard_zero_fills_total() - zone_guard_before;
+                if (zone_guard_fires > 0) {
+                    st.degraded = true;
+                    spdlog::warn(
+                        "44z tripwire: {} zeroed expert contribution(s) on "
+                        "layer {} — dispatch consulted entries missing from the "
+                        "cache (reclaimed/evicted mid-flight); layer marked "
+                        "DEGRADED",
+                        zone_guard_fires, st.layer_idx);
+                }
             }
         }
         perf_trace::record(perf_trace::kMoeFinalizeExit,
                            static_cast<uint16_t>(st.gpu_idx), st.cmd_seq,
                            st.layer_idx, 0);
+
+        // P-29 step 16: the pre-issued FAR prologue (if any) is fully
+        // consumed by the finalize dispatch above — clear so no later
+        // dispatch of the same layer at a different shape can match it.
+        clear_far_prologue();
 
         // TD-V4-SPEC-PREFILL-CTX: chunk-final aux capture — when this was
         // the LAST layer and the dspark epoch awaits only the final slot,
@@ -1745,6 +1953,8 @@ bool CommandDispatcher::advance_progressive_moe() {
             pc.layer_idx         = st.layer_idx;
             pc.cuda_event        = event;
             pc.routed_miss_count = miss_count;
+            pc.moe_degraded      = st.degraded ? 1 : 0;
+            pc.indexer_dense     = st.cmp_indexer_dense;
             pc.compute_t_start   = compute_t_start;  // perf_trace: → kComputeGpu on reap
             pc.compute_t_end     = compute_t_end;
             // Union-aware cache partitioning: release the transient streaming
@@ -1779,7 +1989,8 @@ bool CommandDispatcher::advance_progressive_moe() {
                 st.gpu_idx, st.layer_idx, /*status=*/0,
                 /*host_buf_offset=*/0, /*data_bytes=*/st.cmp_data_bytes,
                 /*top1_prob=*/0.0f, /*entropy=*/0.0f,
-                miss_count);
+                miss_count, /*moe_degraded=*/st.degraded ? 1 : 0,
+                /*indexer_dense=*/st.cmp_indexer_dense);
             // No deferred event: sweep the transient streaming residents now.
             if (st.transient_gpu_mask != 0)
                 sweep_transient_streaming(st.transient_gpu_mask);

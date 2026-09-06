@@ -125,20 +125,35 @@ void StatePublisher::publish_gpu_snapshots(ipc::StateSnapshot& snap, StateTransa
 // ── Expert statistics ───────────────────────────────────────────────────────
 
 void StatePublisher::publish_expert_stats(ipc::StateSnapshot& snap, StateTransaction& tx) {
-    StateTransactionGuard guard(tx);
     size_t active = static_cast<size_t>(num_moe_layers_) * ipc::kMaxExperts;
     size_t active_bytes = active * sizeof(float);
 
-    if (!deps_.expert_stats || active == 0) {
+    // P-29 step 21 (TD-STATE-PUBLISH-DEAD-EXPERT-STATS): while the feed is
+    // dead — no ExpertStats at all, or one that has never seen an update()
+    // (the only update() site is behind opt-in LS_FEED_EXPERTSTATS) — every
+    // accessor early-returns 0.0, so the group's content is a constant
+    // 4x215 KB of zeros. Publish those zeros ONCE, then skip the group (and
+    // its seqlock transaction) entirely: ~7.4 publishes/token of dead
+    // 42x320x4 accessor walks on the dispatch thread. Shm-byte-identical to
+    // the old per-cycle rewrite. total_tokens_processed() is monotonic, so
+    // "went live" is a one-way edge caught on the next publish.
+    const bool feed_live = deps_.expert_stats
+        && deps_.expert_stats->total_tokens_processed() > 0;
+    if (!feed_live) {
+        if (expert_stats_zeroed_) return;  // group unchanged — no tx, no writes
+        StateTransactionGuard guard(tx);
         if (active_bytes > 0) {
             std::memset(snap.expert_frequency, 0, active_bytes);
             std::memset(snap.expert_recency, 0, active_bytes);
             std::memset(snap.expert_routing_weight, 0, active_bytes);
             std::memset(snap.expert_temporal_autocorr, 0, active_bytes);
         }
+        expert_stats_zeroed_ = true;
         return;
     }
+    expert_stats_zeroed_ = false;
 
+    StateTransactionGuard guard(tx);
     auto& es = *deps_.expert_stats;
     for (uint32_t l = 0; l < num_moe_layers_; ++l) {
         uint32_t abs_layer = l + first_moe_layer_;

@@ -14,6 +14,7 @@
 
 #include "compute/stream_manager.h"
 #include "config/config_parser.h"          // GatingScoreFn (V4-4a)
+#include "model/model_config.h"            // P-29 step 11 mtp_probe_experts_enabled
 #include "core/device_backend.h"
 #include "core/expert_device.h"
 #include "core/memory/eviction_policy.h"   // ExpertKey, CacheZone, SubComponent
@@ -31,6 +32,37 @@ namespace layerstorm::daemon {
 
 inline memory::ExpertKey make_key(uint32_t layer, uint16_t expert) {
     return {layer, expert};
+}
+
+// ── Per-layer mHC stream count (P-29 step 11 / #16 MTP) ────────────────────────
+// glm5_next MTP/NextN layers (>= num_hidden_layers) carry NO hc_* tensors
+// (MODELINFO §3e/§5: "MTP layers use the non-mHC path") — they run
+// single-stream while the rest of the model runs hc_mult streams. Every
+// layer-scoped mHC glue site (hc_pre/hc_post collapse, gate-input collapse,
+// residual row widths, head collapse) must consult THIS instead of the
+// engine-wide hc_streams, or layer 45 reads stream-mean garbage. For
+// layer < num_hidden_layers (every production dispatch today) this returns
+// `hc_streams` unchanged — byte-identical behavior.
+// P-29 step 11: MoE-layer upper bound for dispatch predicates. With LS_MTP_PROBE
+// armed on glm5_next, MTP/NextN layers (>= num_hidden_layers) are real MoE
+// layers (router uploaded at NH+mi, experts arena tenants) — dispatch
+// predicates that gate "real MoE layer" on `< num_hidden_layers` must use
+// this bound instead, or a FETCH_AND_RUN at layer 45 silently computes
+// nothing (audit finding #1). Flag off: exactly num_hidden_layers.
+inline int moe_layer_bound(const config::ModelConfig& mc) {
+    if (model::ModelConfig::mtp_probe_experts_enabled()
+        && mc.architecture == config::Architecture::glm5_next)
+        return mc.num_hidden_layers + mc.num_nextn_predict_layers;
+    return mc.num_hidden_layers;
+}
+
+inline int hc_streams_for_layer(int hc_streams,
+                                const config::ModelConfig& mc, int layer) {
+    if (hc_streams > 1
+        && mc.architecture == config::Architecture::glm5_next
+        && layer >= mc.num_hidden_layers)
+        return 1;
+    return hc_streams;
 }
 
 // ── Gating scoring-function mapping (V4-4a) ───────────────────────────────
@@ -190,6 +222,11 @@ struct GroupedGemmArgs {
     // device-fused GGUF int kernel. Routed: expanded_tokens; dense/shared:
     // num_tokens. Set at each GGUF call site alongside use_gguf.
     int gguf_total_tokens = 0;
+
+    // TD-GLM5-TP-COMBINE-PRECISION: D_base is FP32, store the fp32 acc raw
+    // (dense/shared 1-expert TP partial; GGUF route only — see
+    // GgufGroupedGemmParams::d_fp32). B_base doubles as B0_host.
+    bool d_fp32 = false;
 };
 
 inline void launch_grouped_gemm(const GroupedGemmArgs& g) {
@@ -205,9 +242,15 @@ inline void launch_grouped_gemm(const GroupedGemmArgs& g) {
         p.expert_offsets = g.expert_offsets;
         p.B_ptrs         = g.B_ptrs;
         p.total_tokens   = g.gguf_total_tokens;
+        p.d_fp32         = g.d_fp32;
+        p.B0_host        = g.B_base;   // dense/shared: host weight pointer
         g.dev->gguf_grouped_gemm(p, g.gemm_workspace,
                                  g.gemm_workspace_bytes, g.stream);
     } else if (g.use_fp8) {
+        if (g.d_fp32)
+            throw std::runtime_error(
+                "launch_grouped_gemm: d_fp32 (TP fp32 combine) supports the "
+                "GGUF route only — FP8 grouped has no fp32-out epilogue");
         compute::Fp8GroupedGemmParams p{};
         p.num_experts   = g.num_experts;
         p.N             = g.N;
@@ -225,6 +268,10 @@ inline void launch_grouped_gemm(const GroupedGemmArgs& g) {
         g.dev->fp8_grouped_gemm(p, g.gemm_workspace,
                                 g.gemm_workspace_bytes, g.stream);
     } else {
+        if (g.d_fp32)
+            throw std::runtime_error(
+                "launch_grouped_gemm: d_fp32 (TP fp32 combine) supports the "
+                "GGUF route only — NVFP4 grouped has no fp32-out epilogue");
         compute::Nvfp4GroupedGemmParams p{};
         p.num_experts   = g.num_experts;
         p.N             = g.N;
@@ -313,6 +360,57 @@ struct MoeGemmEmitter {
     // a concrete attention-decode-graph driver exists, so it is NOT built now.
 };
 
+// ── MPOKE (P-29 step 3): dense/shared FFN meta poke elimination ──────────────
+// The GGUF dense/shared FFN route reads ONLY expert_offsets + B_ptrs (+
+// total_tokens); problem_sizes / sf_offsets / alphas / input_scales are
+// FP8/NVFP4-only (see the GroupedGemmArgs GG-5b comment). Yet the dispatch
+// sites uploaded all of them per layer per token — ~10 tiny (4-32 B) H2D
+// pokes/layer/rank, ~450/token/rank on a 45-layer model, each a synchronous
+// pageable staging copy on the single daemon dispatch thread. MPOKE:
+//   (a) skips the GGUF-dead uploads outright,
+//   (b) caches the {0,B} expert_offsets upload behind a B fingerprint,
+//   (c) binds the dense/shared 1-element B_ptrs through a per-(layer,slot)
+//       device arena guarded by a host pointer mirror — steady-state decode
+//       re-binds identical weight pointers every token, so the 8-byte H2D
+//       collapses to zero after the first token (self-healing: any pointer
+//       change re-uploads).
+// LS_MOE_META_CACHE=0 restores the exact legacy per-token upload stream.
+inline bool moe_meta_cache_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("LS_MOE_META_CACHE");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Per-GPU bind-cache view (fields live in MoeScratch). Slot layout per layer:
+// 0 = gate_up fused / gate (split), 1 = up (split), 2 = down.
+struct GgufBindCache {
+    void* dev_base = nullptr;        // device [num_layers*3] void*
+    const void** host_mirror = nullptr;  // host [num_layers*3]; nullptr = unbound
+    int layer_idx = -1;
+
+    bool active() const { return dev_base && host_mirror && layer_idx >= 0; }
+};
+
+// Returns the device 1-element B_ptrs array for (layer, slot), uploading the
+// 8-byte pointer only when it differs from the mirrored last upload. The
+// memcpy source is the persistent mirror slot itself, so the call is safe
+// whether the pageable copy stages synchronously or not.
+inline const void** bind_gguf_b_slot(compute::DeviceBackend* gpu_dev,
+                                     const GgufBindCache& c, int slot,
+                                     const void* val, void* stream) {
+    const size_t idx = static_cast<size_t>(c.layer_idx) * 3
+                       + static_cast<size_t>(slot);
+    void** dev_slot = static_cast<void**>(c.dev_base) + idx;
+    if (c.host_mirror[idx] != val) {
+        c.host_mirror[idx] = val;
+        gpu_dev->memcpy_h2d_async(dev_slot, &c.host_mirror[idx],
+                                  sizeof(void*), stream);
+    }
+    return const_cast<const void**>(dev_slot);
+}
+
 // ── GGUF dense/shared gate_up stage (GG-5c) ─────────────────────────────────
 // Dense-FFN and shared-expert FFN concatenate their own `ffn_gate`‖`ffn_up`
 // weights (gate-block then up-block, contiguous) and normally run them as one
@@ -339,6 +437,11 @@ struct GgufDenseGateUpArgs {
     compute::GgufGemmStrategy strategy;
     const void* gate_up_weight;     // device weight base pointer (gate ‖ up); its VALUE is known host-side and staged H2D into single_b_ptr, then dereferenced as B_ptrs[0] on-device
     void* single_b_ptr;             // device [1] void* — the GEMM's B_ptrs array
+    GgufBindCache bind_cache{};     // MPOKE: when active(), slots 0/1 of the
+                                    // per-layer arena replace single_b_ptr
+                                    // (fused/gate → slot 0, split up → slot 1)
+                                    // and the 8-byte bind is skipped when the
+                                    // pointer is unchanged since last upload
     const int32_t* expert_offsets;  // device [2] {0, num_tokens}
     compute::ExpertDevice* dev;
     compute::DeviceBackend* gpu_dev;
@@ -353,10 +456,19 @@ inline int launch_gguf_dense_gate_up(const GgufDenseGateUpArgs& a) {
     // the same synchronicity the surrounding single_b_ptr binds rely on) and
     // launch one single-expert GGUF GEMM of output width N into `d`.
     const void* b_staging = nullptr;
+    int bind_slot = 0;  // MPOKE: fused/gate → slot 0, split up → slot 1
     auto emit = [&](const void* b_base, int N, compute::GgufQuantType t, void* d) {
-        b_staging = b_base;
-        a.gpu_dev->memcpy_h2d_async(a.single_b_ptr, &b_staging,
-                                    sizeof(void*), a.stream);
+        const void** b_ptrs;
+        if (a.bind_cache.active()) {
+            // MPOKE: per-(layer,slot) cached bind — no H2D when unchanged.
+            b_ptrs = bind_gguf_b_slot(a.gpu_dev, a.bind_cache, bind_slot++,
+                                      b_base, a.stream);
+        } else {
+            b_staging = b_base;
+            a.gpu_dev->memcpy_h2d_async(a.single_b_ptr, &b_staging,
+                                        sizeof(void*), a.stream);
+            b_ptrs = static_cast<const void**>(a.single_b_ptr);
+        }
         GroupedGemmArgs g{/*use_fp8=*/false, /*num_experts=*/1, N, a.hidden,
             a.a_base, /*B_base=*/nullptr, d,
             /*scale_A_base=*/nullptr, /*scale_B_base=*/nullptr, /*alphas=*/nullptr,
@@ -366,7 +478,7 @@ inline int launch_gguf_dense_gate_up(const GgufDenseGateUpArgs& a) {
         g.gguf_type = t;
         g.gguf_strategy = a.strategy;
         g.gguf_total_tokens = a.num_tokens;  // dense/shared: 1 expert, M rows
-        g.B_ptrs = static_cast<const void**>(a.single_b_ptr);
+        g.B_ptrs = b_ptrs;
         launch_grouped_gemm(g);
     };
 

@@ -96,7 +96,7 @@ class ProbePredictor:
         self._ne = metadata.num_experts
         self._n_moe = metadata.num_moe_layers
         self._n_layers = metadata.num_layers
-        self._first_moe = metadata.num_layers - metadata.num_moe_layers
+        self._first_moe = metadata.first_moe_layer
         self._rng = np.random.default_rng(42)
 
         self._probe_layers = tuple(
@@ -263,7 +263,7 @@ class Probe:
         self._predictor = predictor
         self._num_experts = metadata.num_experts
         self._num_layers = metadata.num_layers
-        self._first_moe = metadata.num_layers - metadata.num_moe_layers
+        self._first_moe = metadata.first_moe_layer
 
         self._probe_layers = tuple(
             round(frac * (metadata.num_layers - 1))

@@ -14,6 +14,14 @@ class ArchDeepseekV4 final : public AttentionArch {
 public:
     explicit ArchDeepseekV4(CommandDispatcher& d) : AttentionArch(d) {}
 
+    /// V4 keeps lossy position-indexed side-tier state: the SWA ring
+    /// overwrites slot pos % window and the CSA/HCA compressor state
+    /// rings cycle pos % capacity, mutating in place -- the entries a
+    /// prefix-truncated child needs ([N - window, N)) were destroyed by
+    /// the parent's later appends unless N equals the parent frontier.
+    /// Truncating forks are rejected on this arch (R4a scope reduction).
+    bool lossy_position_indexed_state() const override { return true; }
+
     /// V4 shape gate: B==1 decode-shaped steps, single-sequence chunked
     /// prefill / superchunk sub-launches (chunk_len == num_seqs), dspark
     /// verify chunks; drafts / multi-sequence shapes fail closed. Sets the

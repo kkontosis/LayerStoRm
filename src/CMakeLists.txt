@@ -6,12 +6,16 @@ set(SNAPMLA_DIR "${CMAKE_SOURCE_DIR}/deps/LayerStoRmKernels/csrc")
 
 set(SNAPMLA_SOURCES
   # sm120 decode (dense + sparse FP8)
+  ${SNAPMLA_DIR}/sm120/decode/dense_fp8/instantiations/glm5n_persistent_h64.cu
   ${SNAPMLA_DIR}/sm120/decode/dense_fp8/instantiations/model1_persistent_h64.cu
   ${SNAPMLA_DIR}/sm120/decode/dense_fp8/instantiations/v32_persistent_h64.cu
+  ${SNAPMLA_DIR}/sm120/decode/sparse_fp8/instantiations/glm5n_persistent_h64.cu
   ${SNAPMLA_DIR}/sm120/decode/sparse_fp8/instantiations/model1_persistent_h64.cu
   ${SNAPMLA_DIR}/sm120/decode/sparse_fp8/instantiations/v32_persistent_h64.cu
 
   # sm120 prefill (dense + sparse absorbed BF16)
+  # phase1_k512 = the GLM5N NoPE geometry (D_QK = D_V = 512); phase1_k576 = V3.2.
+  ${SNAPMLA_DIR}/sm120/prefill/dense/fwd/head64/instantiations/phase1_k512.cu
   ${SNAPMLA_DIR}/sm120/prefill/dense/fwd/head64/instantiations/phase1_k576.cu
   ${SNAPMLA_DIR}/sm120/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
   ${SNAPMLA_DIR}/sm120/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu
@@ -430,6 +434,7 @@ set(CUDA_DESIGNATED_TUS
   ${CMAKE_CURRENT_SOURCE_DIR}/compute/csa_hca_sm120_attention_device.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/daemon/attention/combine.cpp  # DCP attention combine (moved from compute/dcp_attention_wrapper.cpp)
   ${CMAKE_CURRENT_SOURCE_DIR}/compute/graphs/dcp_allreduce_graph.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/compute/graphs/decode_span_graph.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compute/graphs/nccl_group_graph.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/compute/graphs/routed_ffn_graph.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/parallelism/nccl_collective_backend.cpp

@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "x-configFile": "prefix_spill.json",
+  "description": "TD-PREFIX-TIDY-COLD-SPILL: age idle prefix holders' cold KV out to disk (the SECOND tiering hop: VRAM -> pinned cold pool -> spill directory). Orchestrator-side POLICY (which holder, when: age + hit history, background/idle only); the engine executes the byte moves through the KV-tiering manager. The spill directory is a CACHE, never a store: stale files are reclaimed at startup and nothing in it is load-bearing across boots.",
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Spill idle hibernated prefix holders to disk. DEFAULT TRUE (user directive 2026-08-27). Inert on architectures without a KV-tiering manager (V4) and when the path is unwritable (the feature disables LOUDLY at boot rather than failing requests)."
+    },
+    "path": {
+      "type": "string",
+      "default": "~/.layerstorm/prefix-cache",
+      "description": "Spill directory ('~' is expanded explicitly; created on demand). If it cannot be created or written the feature DISABLES for the boot with a loud warning \u2014 requests are never failed over spill I/O. All ls-spill-*.kvspill files in it are deleted at orchestrator startup (stale-file reclamation: a spill file is only meaningful to the engine boot that wrote it)."
+    },
+    "max_mib": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16777216,
+      "default": 32768,
+      "description": "MANDATORY byte cap over the live spill files in MiB, enforced BEFORE each write (engine-side, exact): a spill that would exceed it is refused, the orchestrator evicts the LRU SPILLED holder (deleting its file \u2014 the eviction policy over the spill directory itself) and retries once. A single 25k-token GLM holder is ~600 MiB/rank of cold KV, so an uncapped default-ON disk feature could fill a home partition. Default 32768 MiB (32 GiB)."
+    },
+    "idle_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "default": 300,
+      "description": "A hibernated holder becomes a spill candidate only after this many seconds without a hit (age + hit history, never size alone). The sweep runs only while the request queue is idle (background \u2014 never on the request path) and spills at most one holder per pass, LRU-first."
+    }
+  },
+  "additionalProperties": false
+}

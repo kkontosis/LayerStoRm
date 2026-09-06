@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "model/quantization/quant_interface.h"
@@ -209,6 +210,57 @@ GgufModelExpertTypes gguf_expert_types_from_model(const LoadedModel& model);
 /// budget need it). Throws if no stacked routed-expert tensors are found.
 GgufModelExpertTypes gguf_expert_types_from_path(const std::string& weights_path,
                                                  bool use_mmap = true);
+
+/// GF3.15 (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): the checkpoint's REAL
+/// per-tensor storage width for the NON-EXPERT tensors, keyed by
+/// (layer_idx, TensorComponent), from a header-only pre-scan.
+///
+/// The pinned-region layout must be computed BEFORE any weight load (the VRAM
+/// allocator carves against it), so the glm5_next GGUF arm historically sized
+/// every packed attention matrix at a BF16 upper bound — "per-tensor k-quant
+/// types unknown at plan time".  They are not unknown: they sit in the GGUF
+/// tensor-info headers, exactly where `gguf_expert_types_from_path` already
+/// reads the routed experts' types.  On GLM-5.3-Flash the BF16 bound over the
+/// 34 KDA layers' q/k/v/o projections alone costs 4.6 GiB of pinned VRAM that
+/// the TP GPU could hold experts in.
+///
+/// ONLY k-quant tensors are recorded.  A plain-float tensor is absent from the
+/// map and the caller keeps its existing (BF16 / F32) sizing — which stays a
+/// valid upper bound, because the loader's only widening transforms
+/// (`requant_bundle_to_q8_0`, F32→BF16 norms) shrink such tensors.  Tensors the
+/// loader DEQUANTS or WIDENS at load (embedding / lm_head → BF16, hc_*_fn →
+/// F32, the IndexPool compressor gate → BF16, the split kv_b halves → one
+/// combined BF16 kv_b_proj) must keep their transformed-width sizing and are
+/// therefore never looked up by the sizing formulas.
+struct GgufNonExpertWidths {
+    /// key = layer_idx * kLayerStride + static_cast<int64_t>(component)
+    static constexpr int64_t kLayerStride = 4096;
+    std::unordered_map<int64_t, GgufKQuantType> packed;
+
+    bool empty() const { return packed.empty(); }
+
+    static int64_t key(int layer_idx, TensorComponent c) {
+        return static_cast<int64_t>(layer_idx) * kLayerStride
+             + static_cast<int64_t>(c);
+    }
+
+    std::optional<GgufKQuantType> find(int layer_idx, TensorComponent c) const {
+        auto it = packed.find(key(layer_idx, c));
+        if (it == packed.end()) return std::nullopt;
+        return it->second;
+    }
+};
+
+/// Cheap pre-scan (headers only, no data load) of every NON-expert k-quant
+/// tensor at `weights_path`.  Sibling of `gguf_expert_types_from_path`; same
+/// file walk, same cost.  Returns an empty map when the path holds no GGUF
+/// files or none of its non-expert tensors are k-quantized — callers then keep
+/// their upper-bound sizing, so an empty result is never an error.
+///
+/// Duplicate (layer, component) entries across shards keep the WIDEST type: the
+/// slot must hold whichever tensor actually arrives.
+GgufNonExpertWidths gguf_non_expert_widths_from_path(
+    const std::string& weights_path, bool use_mmap = true);
 
 /// GG-9: scan a loaded GGUF model's FFN tensors for the given owner
 /// (`routed_expert`, `shared_expert`, or `dense_ffn`) and return the

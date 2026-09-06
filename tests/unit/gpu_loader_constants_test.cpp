@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -134,21 +135,238 @@ TEST(GpuLoaderConstants, LoadOrCalibrateLoadsExistingFile) {
   std::remove(path.c_str());
 }
 
-// Missing file in kLoaded mode → falls back to a (here empty, no-GPU) calibration
-// and WRITES the file (self-healing first run).
+// ── Self-heal control flow (load_or_calibrate_with, the injection seam) ──────
+//
+// The subject here is the PRECEDENCE + SELF-HEAL logic, not the probe timings:
+// file missing / unreadable / rejected → escalate kLoaded to kFull → measure →
+// write → the next run loads the file instead of measuring again. This is the
+// SHIPPED flow: the engine's init hook (engine.cpp Step 14c) calls
+// load_or_calibrate_with() and supplies only the model-specific config + the
+// identity check, and load_or_calibrate() is a thin wrapper over the same
+// function — there is no second copy to drift.
+//
+// Driving the real measurement here is not an option in Tier 1: since
+// HBM-as-NUMA banks landed, NumaManager detects the box's HBM nodes from sysfs
+// regardless of an empty HardwareConfig and calibrate() probes them for minutes
+// (and pins host memory — real hardware in a "no CUDA, no sysfs" tier). That
+// real-hardware arm is kept below as an opt-in duplicate; see spec/TESTING.md
+// "Opt-in test arms".
+
+namespace {
+
+// Records how the seam was driven: which modes reached the measurement step, and
+// how many times. Returns a recognizable constants value so the caller can prove
+// the RETURNED and the WRITTEN constants are the same thing.
+struct FakeCalibrator {
+  std::vector<CalibrationMode> calls;
+  LoaderConstants result = make_sample();
+
+  CalibrateFn fn() {
+    return [this](CalibrationMode m) {
+      calls.push_back(m);
+      return result;
+    };
+  }
+};
+
+std::string temp_path(const char* name) {
+  return std::string(testing::TempDir()) + "/" + name;
+}
+
+}  // namespace
+
+// Missing file in kLoaded mode → escalates to a FULL calibration, and the produced
+// constants are WRITTEN to the path (self-healing first run).
 TEST(GpuLoaderConstants, LoadOrCalibrateMissingFileProducesIt) {
-  const std::string path = std::string(testing::TempDir()) + "/loader_produced.json";
+  const std::string path = temp_path("loader_produced.json");
   std::remove(path.c_str());
   ASSERT_FALSE(std::filesystem::exists(path));
 
-  layerstorm::config::HardwareConfig hw;  // empty → calibrate() does no measurement
+  FakeCalibrator cal;
+  const LoaderConstants produced = load_or_calibrate_with(CalibrationMode::kLoaded, path, cal.fn());
+
+  ASSERT_EQ(cal.calls.size(), 1u) << "a missing file must trigger exactly one calibration";
+  EXPECT_EQ(cal.calls[0], CalibrationMode::kFull)
+      << "kLoaded must escalate to FULL, not to the quick preset";
+  EXPECT_EQ(produced, cal.result);
+  ASSERT_TRUE(std::filesystem::exists(path)) << "missing-file fallback must write the file";
+  // What was written IS what was returned — otherwise the next boot silently gets
+  // different constants than this one ran with.
+  EXPECT_EQ(load(path), produced);
+  std::remove(path.c_str());
+}
+
+// ...and the heal STICKS: a second kLoaded run over the produced file must load it,
+// never measure again. (This is the half that makes it "self-healing" rather than
+// "recalibrates every boot".)
+TEST(GpuLoaderConstants, LoadOrCalibrateSelfHealIsIdempotent) {
+  const std::string path = temp_path("loader_selfheal.json");
+  std::remove(path.c_str());
+
+  FakeCalibrator first;
+  const LoaderConstants produced = load_or_calibrate_with(CalibrationMode::kLoaded, path, first.fn());
+  ASSERT_EQ(first.calls.size(), 1u);
+
+  FakeCalibrator second;
+  const LoaderConstants reloaded = load_or_calibrate_with(CalibrationMode::kLoaded, path, second.fn());
+  EXPECT_TRUE(second.calls.empty()) << "the healed file must be loaded, not re-measured";
+  EXPECT_EQ(reloaded, produced);
+  std::remove(path.c_str());
+}
+
+// A present-but-unreadable file is the other self-heal trigger: recalibrate (full)
+// and OVERWRITE the corrupt file, rather than throwing or returning junk.
+TEST(GpuLoaderConstants, LoadOrCalibrateCorruptFileRecalibratesAndOverwrites) {
+  const std::string path = temp_path("loader_corrupt.json");
+  {
+    std::ofstream out(path, std::ios::trunc);
+    out << "{ this is not valid json";
+  }
+  ASSERT_TRUE(std::filesystem::exists(path));
+
+  FakeCalibrator cal;
+  const LoaderConstants produced = load_or_calibrate_with(CalibrationMode::kLoaded, path, cal.fn());
+
+  ASSERT_EQ(cal.calls.size(), 1u) << "an unreadable file must trigger a calibration";
+  EXPECT_EQ(cal.calls[0], CalibrationMode::kFull);
+  EXPECT_EQ(produced, cal.result);
+  EXPECT_EQ(load(path), produced) << "the corrupt file must be overwritten with the new constants";
+  std::remove(path.c_str());
+}
+
+// A file that PARSES but fails the caller's validity check is the third self-heal
+// trigger, and the one the engine actually relies on: its accept hook rejects
+// constants measured for a different model (compute_dims_match, INV-LOADER-CAL-4)
+// or on a different machine (device UUIDs, INV-LOADER-CAL-6). A rejected file must
+// behave exactly like an unreadable one — recalibrate (full) and overwrite.
+TEST(GpuLoaderConstants, RejectedFileRecalibratesAndOverwrites) {
+  const std::string path = temp_path("loader_rejected.json");
+  LoaderConstants wrong_model = make_sample();
+  wrong_model.compute_K = 6144;  // != the deployed model's hidden_size
+  save(wrong_model, path);
+
+  FakeCalibrator cal;
+  int seen = 0;
+  const LoaderConstants produced = load_or_calibrate_with(
+      CalibrationMode::kLoaded, path, cal.fn(), [&](const LoaderConstants& disk) {
+        ++seen;
+        return compute_dims_match(disk, 4096, 7168);  // the engine's guard, verbatim
+      });
+
+  EXPECT_EQ(seen, 1) << "the accept hook must see the parsed file";
+  ASSERT_EQ(cal.calls.size(), 1u) << "a rejected file must trigger a calibration";
+  EXPECT_EQ(cal.calls[0], CalibrationMode::kFull);
+  EXPECT_EQ(produced, cal.result);
+  EXPECT_EQ(load(path), produced) << "the rejected file must be overwritten";
+  std::remove(path.c_str());
+}
+
+// The mirror: a file the hook ACCEPTS is used as-is and nothing is measured.
+TEST(GpuLoaderConstants, AcceptedFileIsUsedAsIs) {
+  const LoaderConstants a = make_sample();  // compute_N=4096, compute_K=7168
+  const std::string path = temp_path("loader_accepted.json");
+  save(a, path);
+
+  FakeCalibrator cal;
+  const LoaderConstants loaded = load_or_calibrate_with(
+      CalibrationMode::kLoaded, path, cal.fn(),
+      [](const LoaderConstants& disk) { return compute_dims_match(disk, 4096, 7168); });
+  EXPECT_TRUE(cal.calls.empty());
+  EXPECT_EQ(loaded, a);
+  std::remove(path.c_str());
+}
+
+// The accept hook is a kLoaded-only gate: an explicit kQuick/kFull request measures
+// without ever consulting it (there is no candidate file to validate).
+TEST(GpuLoaderConstants, AcceptHookNotConsultedInExplicitModes) {
+  const std::string path = temp_path("loader_accept_explicit.json");
+  save(make_sample(), path);
+
+  FakeCalibrator cal;
+  int seen = 0;
+  load_or_calibrate_with(CalibrationMode::kFull, path, cal.fn(),
+                         [&](const LoaderConstants&) { ++seen; return true; });
+  EXPECT_EQ(seen, 0);
+  EXPECT_EQ(cal.calls.size(), 1u);
+  std::remove(path.c_str());
+}
+
+// An existing, readable file in kLoaded mode must NOT calibrate at all.
+TEST(GpuLoaderConstants, LoadOrCalibrateExistingFileDoesNotCalibrate) {
+  const LoaderConstants a = make_sample();
+  const std::string path = temp_path("loader_existing.json");
+  save(a, path);
+
+  FakeCalibrator cal;
+  const LoaderConstants loaded = load_or_calibrate_with(CalibrationMode::kLoaded, path, cal.fn());
+  EXPECT_TRUE(cal.calls.empty()) << "kLoaded with a good file must not measure";
+  EXPECT_EQ(loaded, a);
+  std::remove(path.c_str());
+}
+
+// kQuick/kFull are NOT load modes: they measure with their own preset even when a
+// file exists, and refresh the file. (A stale file must never shadow an explicit
+// recalibration request.)
+TEST(GpuLoaderConstants, ExplicitModesAlwaysCalibrateAndRefreshFile) {
+  const std::string path = temp_path("loader_explicit.json");
+  LoaderConstants stale = make_sample();
+  stale.expert_bytes = 1.0;  // recognizably different from what the calibrator returns
+  save(stale, path);
+
+  for (const CalibrationMode m : {CalibrationMode::kQuick, CalibrationMode::kFull}) {
+    FakeCalibrator cal;
+    const LoaderConstants produced = load_or_calibrate_with(m, path, cal.fn());
+    ASSERT_EQ(cal.calls.size(), 1u) << calibration_mode_name(m) << " must always measure";
+    EXPECT_EQ(cal.calls[0], m) << "the requested mode must reach the calibrator unchanged";
+    EXPECT_EQ(produced, cal.result);
+    EXPECT_EQ(load(path), produced) << calibration_mode_name(m) << " must refresh the file";
+  }
+  std::remove(path.c_str());
+}
+
+// An empty path means "measure, persist nothing" — no file, no throw.
+TEST(GpuLoaderConstants, EmptyPathCalibratesWithoutWriting) {
+  FakeCalibrator cal;
+  const LoaderConstants produced = load_or_calibrate_with(CalibrationMode::kQuick, "", cal.fn());
+  ASSERT_EQ(cal.calls.size(), 1u);
+  EXPECT_EQ(cal.calls[0], CalibrationMode::kQuick);
+  EXPECT_EQ(produced, cal.result);
+}
+
+// An empty path in kLoaded mode has nothing to load: it must still escalate to a
+// full calibration (the engine gets constants either way) and write nothing.
+TEST(GpuLoaderConstants, EmptyPathInLoadedModeStillCalibrates) {
+  FakeCalibrator cal;
+  const LoaderConstants produced = load_or_calibrate_with(CalibrationMode::kLoaded, "", cal.fn());
+  ASSERT_EQ(cal.calls.size(), 1u);
+  EXPECT_EQ(cal.calls[0], CalibrationMode::kFull);
+  EXPECT_EQ(produced, cal.result);
+}
+
+// OPT-IN ARM (spec/TESTING.md): the same self-heal path driven through the
+// backends/numa overload, i.e. with the real calibrate() doing real NUMA-bank
+// probing. Minutes of work and it touches host/pinned memory, so it is out of the
+// Tier-1 budget and out of the Tier-1 contract; run it deliberately with
+//   LS_TEST_RUN_FULL_CALIBRATION=1 ctest --test-dir build -R GpuLoaderCalibrationSlow
+// See spec/TESTING.md ("Opt-in test arms").
+TEST(GpuLoaderCalibrationSlow, MissingFileProducesItViaRealCalibration) {
+  if (!std::getenv("LS_TEST_RUN_FULL_CALIBRATION"))
+    GTEST_SKIP() << "opt-in: real multi-minute NUMA/HBM-bank calibration; set "
+                    "LS_TEST_RUN_FULL_CALIBRATION=1 to run "
+                    "(fast seam coverage: GpuLoaderConstants.LoadOrCalibrate*)";
+  const std::string path = temp_path("loader_produced_real.json");
+  std::remove(path.c_str());
+  ASSERT_FALSE(std::filesystem::exists(path));
+
+  layerstorm::config::HardwareConfig hw;  // empty: no GPUs → transfer cells stay zero
   layerstorm::memory::NumaManager numa(hw);
   const std::vector<layerstorm::compute::DeviceBackend*> no_backends;
 
   const LoaderConstants produced =
       load_or_calibrate(CalibrationMode::kLoaded, path, no_backends, numa);
   EXPECT_EQ(produced.source, "calibrated");
-  EXPECT_TRUE(std::filesystem::exists(path)) << "missing-file fallback must write the file";
+  ASSERT_TRUE(std::filesystem::exists(path)) << "missing-file fallback must write the file";
+  EXPECT_EQ(load(path), produced);
   std::remove(path.c_str());
 }
 

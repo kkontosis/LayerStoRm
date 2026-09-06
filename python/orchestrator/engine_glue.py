@@ -99,6 +99,7 @@ def metadata_from_engine_info(
     vocab_size: int = 0,
     think_start_token_id: int = -1,
     think_end_token_id: int = -2,
+    first_moe_layer: int = -1,
 ) -> EngineMetadata:
     """Translate a pybind EngineInfo into the orchestrator's EngineMetadata.
 
@@ -107,6 +108,14 @@ def metadata_from_engine_info(
     the hidden-state attn buffer (EMBEDDING output / OUTPUT_HEAD input)
     and the logits scratch (OUTPUT_HEAD output).  Prefix-matched because
     the registry names carry rank/position suffixes.
+
+    ``first_moe_layer`` is the model config's ``first_k_dense_replace``
+    (P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS).  EngineInfo carries no
+    such field, and the historical `num_layers - num_moe_layers`
+    fallback (-1 = use it) is WRONG once the MTP expert census is armed
+    (glm5_next + speculation.method mtp + speculation.mtp.enabled): the
+    census then counts the NextN block, so the subtraction lands one
+    layer low.  Callers that have the engine-config dict must pass it.
     """
     hidden_buf_id = 0
     logits_buf_id = 0
@@ -128,6 +137,7 @@ def metadata_from_engine_info(
         num_layers=int(info.num_layers),
         expert_bytes=int(info.expert_bytes),
         kv_bytes_per_page=int(info.kv_bytes_per_page),
+        first_moe_layer=int(first_moe_layer),
         num_expert_devices=int(info.num_expert_devices),
         gpus=gpus,
         eos_token_ids=eos_token_ids,
@@ -141,6 +151,18 @@ def metadata_from_engine_info(
         # TD-PREFILL-MOE-BIG: elastic superchunk capacity — enables the
         # loop's superchunk prefill (FETCH_AND_RUN_MOE_BIG per layer).
         moe_batch_capacity=int(getattr(info, "moe_batch_capacity", 0)),
+        # P-30 step 1: realized single-shot MoE chunk bound (EP-beyond-TP
+        # superchunk strides must clamp to it — TD-MOE-EP-XTP-WAVES).
+        moe_chunk_capacity=int(getattr(info, "moe_chunk_capacity", 0)),
+        # TD-GLM5-KDA-SLOTS-EXPORT: state-pool geometry so admission can
+        # SEE how close the box is to a state-pool refusal (zeros for
+        # models without linear-attention state and in mock contexts).
+        kda_state_mapped=bool(getattr(info, "kda_state_mapped", 0)),
+        kda_state_slots=int(getattr(info, "kda_state_slots", 0)),
+        kda_state_slot_bytes=int(getattr(info, "kda_state_slot_bytes", 0)),
+        kda_state_pages_per_seq=int(
+            getattr(info, "kda_state_pages_per_seq", 0)),
+        kda_state_pool_pages=int(getattr(info, "kda_state_pool_pages", 0)),
     )
 
 
@@ -175,6 +197,7 @@ def build_engine_loop(
     vocab_size: int = 0,
     think_start_token_id: int = -1,
     think_end_token_id: int = -2,
+    first_moe_layer: int = -1,
     speculation_depth: int = 0,
     mtp_config: MtpDraftConfig | None = None,
     num_mtp_layers: int = 0,
@@ -198,6 +221,7 @@ def build_engine_loop(
         vocab_size=vocab_size,
         think_start_token_id=think_start_token_id,
         think_end_token_id=think_end_token_id,
+        first_moe_layer=first_moe_layer,
     )
 
     ipc_base = int(info.ipc_base)
@@ -228,6 +252,9 @@ def build_engine_loop(
     expert_placement = ExpertPlacement(ExpertPlacementConfig(
         num_moe_layers=metadata.num_moe_layers,
         num_experts=metadata.num_experts,
+        # P-29 step 13: the MoE band is [first_moe_layer, +num_moe_layers) —
+        # never the ExpertPlacementConfig default (3) by accident.
+        first_moe_layer=metadata.first_moe_layer,
         cache_gpu_indices=list(range(metadata.num_gpus)),
     ))
     placement_optimizer = PlacementOptimizer(
@@ -248,11 +275,10 @@ def build_engine_loop(
     utility_scorer = UtilityScorer(UtilityScorerConfig(
         strategy="fixed", static_depth=max(0, speculation_depth),
     ))
-    first_moe_layer = metadata.num_layers - metadata.num_moe_layers
     verifier = Verifier(
         num_layers=metadata.num_layers,
         num_moe_layers=metadata.num_moe_layers,
-        first_moe_layer=first_moe_layer,
+        first_moe_layer=metadata.first_moe_layer,
         num_experts=metadata.num_experts,
     )
     prompt_lookup = PromptLookup()

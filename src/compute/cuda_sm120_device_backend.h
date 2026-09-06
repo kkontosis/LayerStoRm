@@ -7,7 +7,10 @@
 
 #include "core/device_backend.h"
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace layerstorm::compute {
 
@@ -19,7 +22,17 @@ struct RopeRotateParams;
 struct IndexerScoreTopkArgs;
 struct IndexerScoreTopkBatchedArgs;
 struct IndexerTopkMergeArgs;
+struct IndexerKpoolAppendArgs;
+struct IndexerKpoolChunkAppendArgs;
+struct IndexerKpoolExpandArgs;
+struct IndexerKpoolMergeArgs;
+struct KdaConvPrefillArgs;
+struct KdaConvDecodeArgs;
+struct KdaChunkedScanArgs;
+struct KdaGatedRmsNormArgs;
+struct KdaDecodeStepArgs;
 struct GgufGemmParams;
+struct GgufGemmMultiParams;
 
 class CudaSm120DeviceBackend final : public DeviceBackend {
 public:
@@ -54,6 +67,10 @@ public:
                                 void* stream);
     void batched_gemm_bf16(const StridedBatchedGemmBf16Params& params,
                             void* stream);
+    // TD-GLM5-TP-COMBINE-PRECISION: the single post-allreduce bf16 rounding
+    // of the TP fp32 partial-combine path.
+    void cast_f32_to_bf16(void* dst_bf16, const void* src_f32,
+                          int64_t count, void* stream);
     void absorb_q(const QAbsorbParams& params, void* stream);
     void rope_rotate(const RopeRotateParams& params, void* stream);
 
@@ -82,12 +99,34 @@ public:
     // dcp_indexer_mode=local (see AttentionDevice::indexer_topk_merge).
     void indexer_topk_merge(const IndexerTopkMergeArgs& args, void* stream);
 
+    // GF3.5 IndexPool (glm5_next kpool > 1): compress-append producer,
+    // pool→token expansion, and the local-mode pooled merge (candidate
+    // scatter + UNCHANGED lightning_topk over the pooled endpoints —
+    // composition mirrors topk_merge.cu's own scatter → topk shape).
+    void indexer_kpool_append(const IndexerKpoolAppendArgs& args, void* stream);
+    void indexer_kpool_chunk_append(const IndexerKpoolChunkAppendArgs& args,
+                                    void* stream);
+    void indexer_kpool_expand(const IndexerKpoolExpandArgs& args, void* stream);
+    void indexer_kpool_merge(const IndexerKpoolMergeArgs& args, void* stream);
+
+    // GF3.9 KDA linear attention (glm5_next): forwards to the GF3.7 launch
+    // wrappers (src/compute/kernels/sm120/attention/kda_linear.h) — chunked
+    // WY prefill scan, fused O(1) decode, fused q/k/v conv, gated RMSNorm.
+    void kda_conv_prefill(const KdaConvPrefillArgs& args, void* stream);
+    void kda_conv_decode(const KdaConvDecodeArgs& args, void* stream);
+    void kda_chunked_scan(const KdaChunkedScanArgs& args, void* stream);
+    void kda_gated_rmsnorm(const KdaGatedRmsNormArgs& args, void* stream);
+    void kda_decode_step(const KdaDecodeStepArgs& args, void* stream);
+    size_t kda_prefill_workspace_bytes(int t_len, int num_heads) const;
+
     // GGUF linear GEMMs (attention projections, GG-4). Concrete-only methods
     // (not in the DeviceBackend interface) — called via the composed device_ by
     // the concrete AttentionDevices, which expose them through the
     // AttentionDevice::gguf_* virtuals.
     void gguf_mmvq(const GgufGemmParams& params,
                    void* q8_1_workspace, void* stream);
+    void gguf_mmvq_multi(const GgufGemmMultiParams& params,
+                         void* q8_1_workspace, void* stream);
     void gguf_mmq(const GgufGemmParams& params,
                   void* q8_1_workspace, void* stream);
     void gguf_dequant_gemm(const GgufGemmParams& params, void* stream);
@@ -131,6 +170,27 @@ public:
 
 private:
     config::GpuRef gpu_;
+
+    // P-29 step 19 (LS_EVENT_POOL, default ON; =0 restores per-call
+    // create/destroy): free-list of timing-disabled events. B=1 decode
+    // creates+destroys ~495 events/token (~1.2 ms/token of submit-thread
+    // host time, measured 100% inline in submission chains — not idle-spin
+    // filler). Pooling rule that keeps reuse EXACTLY equivalent to a fresh
+    // event: destroy_event() pools a handle only when cudaEventQuery ==
+    // cudaSuccess (completed or never recorded) — such a handle behaves
+    // identically to a freshly created one for query (success), for
+    // stream_wait_event (completed record = no-op wait, like never-recorded)
+    // and for record_event (overwrite). A handle destroyed with a PENDING
+    // record goes to pending_retire_ and is only recycled once its record
+    // has completed (checked lazily at the next create_event calls); if the
+    // retire list is full it is genuinely destroyed (today's behavior).
+    // Thread-safe via mutex (uncontended in production: one daemon thread).
+    std::vector<void*> event_pool_;          // handles with query()==success
+    std::vector<void*> event_pending_retire_;  // destroyed with record pending
+    std::mutex event_pool_mu_;
+    uint64_t event_pool_hits_ = 0;
+    uint64_t event_pool_creates_ = 0;
+    uint64_t event_pool_real_destroys_ = 0;
 };
 
 /// Factory: creates a CudaSm120DeviceBackend.

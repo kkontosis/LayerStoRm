@@ -30,7 +30,7 @@ import sys
 
 from joiner import join
 from model import make_model
-from trainer import train, apply_params_to_constants, why
+from trainer import train, apply_params_to_constants, overhead_sanity, why
 
 
 def main(argv=None) -> int:
@@ -59,6 +59,11 @@ def main(argv=None) -> int:
     print(why(res, mdl.init_params()), file=sys.stderr)
 
     out = apply_params_to_constants(mdl, res.params, calib)
+    # TD-AUTOCONFIG-TRAINER-NEGATIVE-OVERHEAD: a fitted constant comparable
+    # to the residual RMSE means systematic absorption — say so loudly.
+    warn = overhead_sanity(float(out.get("fixed_overhead_us", 0.0)), res.loss)
+    if warn:
+        print(warn, file=sys.stderr)
     with open(args.out_calib, "w") as fh:
         json.dump(out, fh, indent=2, sort_keys=True)
         fh.write("\n")

@@ -155,9 +155,19 @@ TEST_F(ConfigValidatorSmoke, NoVramBudgetError) {
 
 TEST_F(ConfigValidatorSmoke, InsufficientVramRejected) {
     lc::Config tiny = cfg;
-    tiny.hardware.gpus = {{0, lc::GpuType::rtx5090, 2.0, 5, 16, 0, 0.85, 0,
-                           {lc::GpuRole::attention, lc::GpuRole::resident,
-                            lc::GpuRole::expert_streaming}}};
+    // Named-field init: GpuConfig is generated from config/schema.json and
+    // gains fields over time — a positional aggregate initializer here broke
+    // the smoke-tree BUILD when compute_weight/vram_budget_gb were inserted.
+    lc::GpuConfig small_gpu;
+    small_gpu.id = 0;
+    small_gpu.type = lc::GpuType::rtx5090;
+    small_gpu.vram_gb = 2.0;
+    small_gpu.pcie_gen = 5;
+    small_gpu.pcie_width = 16;
+    small_gpu.numa_node = 0;
+    small_gpu.roles = {lc::GpuRole::attention, lc::GpuRole::resident,
+                       lc::GpuRole::expert_streaming};
+    tiny.hardware.gpus = {small_gpu};
     tiny.hardware.tp_array.clear();
     tiny.memory.tp_mode_per_layer.gating = 1;
     tiny.memory.tp_mode_per_layer.pinned_dense_ffn = 1;

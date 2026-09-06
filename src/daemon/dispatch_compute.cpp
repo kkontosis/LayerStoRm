@@ -479,9 +479,11 @@ void CommandDispatcher::handle_compute_command(const ipc::Command& cmd) {
                 // family is uniform across experts (GG-6: stacked ffn_*_exps has one
                 // ggml_type per projection) and arrives as the model::GgufKQuantType
                 // ordinal in p.gguf_type; it shares the canonical value order with
-                // compute::GgufQuantType (Q2_K=0..Q8_0=5), so map by cast. Strategy
+                // compute::GgufQuantType (Q2_K=0..MXFP4=6; the order is pinned by
+                // the static_asserts in gguf_compute_cast.h), so map by cast after
+                // range-checking the raw IPC byte against the enum length. Strategy
                 // (int vs dequant) is a live-config knob.
-                if (p.gguf_type > static_cast<uint8_t>(compute::GgufQuantType::Q8_0)) {
+                if (p.gguf_type >= compute::kNumGgufQuantTypes) {
                     write_error(cmd.cmd_seq, cmd.gpu_idx,
                                 ipc::CmpErrorCategory::kComputeValidation,
                                 "expert_ffn: invalid gguf_type");
@@ -865,6 +867,9 @@ void CommandDispatcher::handle_compute_command(const ipc::Command& cmd) {
                                          ? static_cast<uint8_t*>(
                                                logits_readback_host_)
                                          : nullptr,
+                // P-29 step 13: collapse+final-norm only (MTP prefill feed).
+                .norm_only         = (p.norm_only != 0),
+                .input_row         = static_cast<int>(p.input_row),
             });
             break;
         }
@@ -957,6 +962,12 @@ void CommandDispatcher::handle_compute_command(const ipc::Command& cmd) {
     pc.cmd_type   = cmd.cmd_type;
     pc.layer_idx  = layer_idx;
     pc.cuda_event = event;
+    // TD-INDEXER-NO-DENSE-FALLBACK witness byte (legacy attention commands).
+    if (type == ipc::CMD_ATTENTION_DECODE
+        || type == ipc::CMD_ATTENTION_PREFILL) {
+        pc.indexer_dense = step_indexer_dense_;
+        step_indexer_dense_ = 0;
+    }
 
     if (type == ipc::CMD_SAMPLE_TOKENS) {
         pc.data_bytes = cmd.sample_tokens.num_tokens

@@ -19,7 +19,7 @@
 //     only textual change vs the historical non-template class, so the 64
 //     instantiation is expression-for-expression identical (REEF fingerprints
 //     are calibrated against it; guarded by Solver64GoldenRegression).
-//   * LoaderSolver256 = BasicLoaderSolver<kMaxExpertsLarge (256)> — large
+//   * LoaderSolver256 = BasicLoaderSolver<kMaxExpertsLarge (320)> — large
 //     batched-verify unions (dsp52 γ-chunk deduped unions > 64).
 //
 // Tiers (solve()):
@@ -46,7 +46,14 @@ namespace layerstorm::gpu_loader {
 
 // Compile-time bounds (sets the preallocated buffer sizes; see ticket I8b).
 inline constexpr int      kMaxExperts = 64;       // Nmax routed experts per solve (default instantiation)
-inline constexpr int      kMaxExpertsLarge = 256; // Nmax for LoaderSolver256 (batched-verify unions)
+// GF3.3 (GLM-5.3-Flash): 256 -> 320. glm5_next has 288 routed experts per
+// layer, so a prompt-prefill / batched-verify union can exceed the old 256
+// bound (the solver asserts N <= NMax — the first GLM-5.3 prefill would have
+// died on the assertion). 320 = 288 + headroom, keeping the buffers small
+// (arrays are int/double[NMax]; the name LoaderSolver256 stays — it names the
+// LARGE instantiation, not the literal bound). The frozen 64-expert decode
+// instantiation is untouched (decode byte-identity).
+inline constexpr int      kMaxExpertsLarge = 320; // Nmax for LoaderSolver256 (batched-verify / prefill unions)
 inline constexpr int      kMaxC       = 5;        // Cmax experts solved exactly by the DP (2^C states)
 inline constexpr int      kMaxDevices = 16;       // Mmax routable devices
 inline constexpr int      kMaxBanks   = 16;       // Bmax NUMA banks

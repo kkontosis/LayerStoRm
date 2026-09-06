@@ -70,6 +70,12 @@ struct StridedBatchedGemmBf16Params {
     int ldc;             ///< leading dim of C (= batch_count * m for [n, batch_count, m])
     int64_t strideC;     ///< element stride between batches in C
     int batch_count;     ///< number of batches (num_heads_local)
+    /// TD-GLM5-TP-COMBINE-PRECISION: when true, C is FP32 and the fp32
+    /// accumulator is stored raw (TP partial combine; see GgufGemmParams).
+    /// Only the single-batch tight-stride o_proj shape is supported
+    /// (batch_count == 1, lda == ldb == k, ldc == m, strides 0) — the CUDA
+    /// backend THROWS on anything else.
+    bool c_fp32 = false;
 };
 
 /// Parameters for the MLA W_UK query absorption (q_absorb kernel).
@@ -217,6 +223,204 @@ struct IndexerTopkMergeArgs {
     int page_tokens;             ///< indexer_k_page_size_tokens
 };
 
+// ── GF3.5 IndexPool (glm5_next index_kpool > 1) device ops — CUDA-free ────
+//
+// The pooled indexer stores ONE learned-pooled key per kpool consecutive
+// positions; pages span PT positions and hold E = PT/kpool entries plus an
+// in-progress-pool TAIL ([2, kpool, head_dim] bf16 raw-K + raw-gate) — see
+// deps kpool_compress.h for the layout and numerics contract. Scoring/top-k
+// reuse the lightning kernels UNCHANGED in the entry domain; these ops cover
+// what pooling adds: the compress-append producer, pool→token expansion with
+// the always-selected tail, and the local-mode candidate scatter twin.
+
+/// Decode append: stash raw key+gate at tail slot pos%kpool; when the pool
+/// completes (pos%kpool == kpool-1) compose + write its FP8 entry + scale.
+struct IndexerKpoolAppendArgs {
+    const void* k_row;       ///< [head_dim] BF16 post-LayerNorm raw key
+    const void* gate_row;    ///< [head_dim] BF16 raw gate vector
+    const void* ape;         ///< [kpool, head_dim] f32 slot bias
+    void* page_base;         ///< frontier indexer-K page
+    int page_entries;        ///< E = PT / kpool
+    int pos_in_page;         ///< pos - page_start (PT % kpool == 0)
+    int kpool;
+    int head_dim;
+    /// Device-indexed addressing (P-29 step 7, graph-capturable): when
+    /// page_table != nullptr, page_base/pos_in_page are ignored and the
+    /// kernel resolves page = page_table[(seqlen[0]-1)/page_tokens] and the
+    /// in-page offset at EXECUTION time — bit-identical writes, replayable
+    /// from a captured graph while positions advance.
+    const void* page_table = nullptr;  ///< device [pages] page-ptr row
+    const void* seqlen = nullptr;      ///< device int, this row's seqlens_k
+    int page_tokens = 0;               ///< PT
+};
+
+/// Chunk append: num_rows consecutive positions of ONE sequence landing in
+/// ONE page, pos0_in_page pool-aligned (pool-alignment invariant; launcher
+/// throws otherwise). Writes floor(num_rows/kpool) entries; seed_tail
+/// stashes the trailing num_rows % kpool rows.
+struct IndexerKpoolChunkAppendArgs {
+    const void* k_rows;      ///< [num_rows, head_dim] BF16
+    const void* gate_rows;   ///< [num_rows, head_dim] BF16
+    const void* ape;         ///< [kpool, head_dim] f32
+    void* page_base;
+    int page_entries;
+    int pos0_in_page;
+    int num_rows;
+    int kpool;
+    int head_dim;
+    bool seed_tail;
+};
+
+/// Pool→token expansion + always-selected tail: per row, eff_pools ascending
+/// pool ids expand ×kpool (row stays ascending) and the un-pooled tail
+/// [floor(len/kpool)*kpool, len) is appended; lengths_out[r] becomes the
+/// TOKEN count (overwriting the pool-count effective_k). Disjoint by
+/// floor-causality — no dedup. out_cols must be >= budget*kpool + kpool-1.
+struct IndexerKpoolExpandArgs {
+    const void* pool_ids;    ///< [num_rows, pool_stride] int32, asc, -1 pad
+    const void* eff_pools;   ///< [num_rows] int32
+    const void* row_seq_len; ///< [num_rows] int32 token counts
+    void* indices_out;       ///< [num_rows, out_stride] int32
+    void* lengths_out;       ///< [num_rows] int32
+    int num_rows;
+    int kpool;
+    int pool_stride;
+    int out_stride;          ///< index_topk_rows
+    int out_cols;
+};
+
+/// Local-mode merge, pooled twin of IndexerTopkMergeArgs: scatter every
+/// rank's (LOCAL entry slot, score) candidates onto a -inf-filled
+/// [num_entries] scratch (global = (l/page_entries*dcp + rank)*page_entries
+/// + l%page_entries), then re-run the radix top-k with the POOLED endpoints
+/// and the POOL budget — output pool ids (asc, -1 pad) + effective pools.
+/// The caller expands afterwards (indexer_kpool_expand).
+struct IndexerKpoolMergeArgs {
+    const void* gathered;        ///< [dcp_size * seg_words] words
+    int seg_words;               ///< = 2 * batch * cand_stride
+    int batch;
+    int token;
+    int cand_stride;             ///< candidate ROW stride (index_topk_rows)
+    int cand_count;              ///< per-rank candidate cap (pool budget)
+    void* scores_scratch;        ///< [num_entries] f32 (overwritten)
+    const void* block_endpoints; ///< [num_entries] int32 POOLED endpoints
+    void* topk_scores_scratch;   ///< [topk_pools] f32
+    void* pool_ids_out;          ///< [topk_pools] int32 GLOBAL pool ids
+    void* eff_pools_out;         ///< int32*
+    int num_entries;             ///< global settled-pool count
+    int topk_pools;              ///< index_topk / kpool
+    int query_position;          ///< token-domain causal cutoff
+    int dcp_size;
+    int page_entries;            ///< E
+};
+
+// ── GF3.9 KDA linear attention (glm5_next) ─────────────────────────────────
+// CUDA-free POD mirrors of the deps kda_scan.h param structs (wrapper
+// src/compute/kernels/sm120/attention/kda_linear.h — which is NOT CUDA-free,
+// hence these mirrors; the IndexerKpoolAppendArgs precedent). Contract:
+// booklet §1.2 — activations bf16 [T][H*128] token-major, conv outputs and
+// the recurrent state fp32, state [H][128][128] as S[h][v][c], conv rings
+// [3][C] fp32 oldest-first, chunk-64 launch boundaries are BITWISE
+// state-carry points. All pointers are device pointers; the caller owns the
+// slot offsets (prefill takes pre-offset ring/state pointers, decode takes
+// base + slot indirection).
+
+/// Fused q/k/v depthwise causal short conv, prefill (ONE sequence).
+struct KdaConvPrefillArgs {
+    const void* x_q;   ///< [t_len, C] bf16 raw pre-conv activations
+    const void* x_k;
+    const void* x_v;
+    const void* w_q;   ///< [C, 4] bf16 depthwise taps
+    const void* w_k;
+    const void* w_v;
+    void* ring_q;      ///< [3, C] f32 carried ring (in/out), pre-offset
+    void* ring_k;
+    void* ring_v;
+    void* out_q;       ///< [t_len, C] f32 post-SiLU
+    void* out_k;
+    void* out_v;
+    int t_len;
+    int channels;      ///< C = num_heads * 128
+};
+
+/// Conv decode step: one token per sequence, ring selected by slots[b].
+struct KdaConvDecodeArgs {
+    const void* x_q;   ///< [batch, C] bf16
+    const void* x_k;
+    const void* x_v;
+    const void* w_q;   ///< [C, 4] bf16
+    const void* w_k;
+    const void* w_v;
+    void* ring_q;      ///< base of [slots][3][C] f32
+    void* ring_k;
+    void* ring_v;
+    const void* slots; ///< [batch] int32 device, or nullptr (=> slot b)
+    int64_t ring_slot_stride;  ///< FLOATS between ring slots (>= 3*C)
+    void* out_q;       ///< [batch, C] f32 post-SiLU
+    void* out_k;
+    void* out_v;
+    int batch;
+    int channels;
+};
+
+/// Chunked WY/UT prefill scan (post-conv activations in, ONE sequence).
+/// `state` is pre-offset to the sequence's slot + layer (no indirection).
+struct KdaChunkedScanArgs {
+    const void* q;        ///< [t_len, H*128] f32 post-conv
+    const void* k;
+    const void* v;
+    const void* raw_g;    ///< [t_len, H*128] bf16 decay-gate pre-activations
+    const void* beta;     ///< [t_len, H] bf16 raw write strength
+    const void* a_log;    ///< [H] f32
+    const void* dt_bias;  ///< [H*128] f32
+    void* state;          ///< [H,128,128] f32 in/out, pre-offset
+    void* core_out;       ///< [t_len, H*128] f32 pre-o_norm
+    void* workspace;      ///< >= kda_prefill_workspace_bytes(t_len, H)
+    size_t workspace_bytes;
+    int t_len;
+    int num_heads;
+    float lower_bound;    ///< -5.0
+    float l2_eps;         ///< 1e-6
+    float scale;          ///< 1/sqrt(128), host-computed
+};
+
+/// Gated RMSNorm (o_norm), prefill path (fused into the decode step).
+struct KdaGatedRmsNormArgs {
+    const void* core;     ///< [t_len, H*128] f32
+    const void* g2;       ///< [t_len, H*128] bf16 output-gate pre-activations
+    const void* w;        ///< [128] bf16 o_norm.weight
+    void* out_bf16;       ///< [t_len, H*128] bf16, or nullptr
+    void* out_f32;        ///< [t_len, H*128] f32 test tap, or nullptr
+    int t_len;
+    int num_heads;
+    float eps;            ///< 1e-5
+};
+
+/// Fused O(1) decode step (state read+written exactly once, o_norm fused).
+struct KdaDecodeStepArgs {
+    const void* q;        ///< [batch, H*128] f32 POST-conv
+    const void* k;
+    const void* v;
+    const void* raw_g;    ///< [batch, H*128] bf16
+    const void* beta;     ///< [batch, H] bf16
+    const void* g2;       ///< [batch, H*128] bf16
+    const void* a_log;    ///< [H] f32
+    const void* dt_bias;  ///< [H*128] f32
+    const void* onorm_w;  ///< [128] bf16
+    void* state_base;     ///< base of [slots][H][128][128] f32
+    int64_t state_slot_stride;  ///< FLOATS between state slots
+    const void* slots;    ///< [batch] int32 device, or nullptr (=> slot b)
+    void* core_out;       ///< [batch, H*128] f32 pre-o_norm, or nullptr
+    void* out_bf16;       ///< [batch, H*128] bf16 o_norm output, or nullptr
+    void* out_f32;        ///< f32 tap, or nullptr
+    int batch;
+    int num_heads;
+    float lower_bound;
+    float l2_eps;
+    float onorm_eps;
+    float scale;          ///< 1/sqrt(128), host-computed
+};
+
 /// CUDA-free parameter struct for a GGUF-quantized linear GEMM (attention
 /// projection). Mirrors how `Fp8GemmParams` is a plain POD passed across the
 /// AttentionDevice seam so `dcp_executor` (a CUDA-free .cpp) can construct it
@@ -235,8 +439,32 @@ struct GgufGemmParams {
     int K;                       ///< input dim (cols of A; weight values per row)
     const void* A;               ///< [M, K] BF16 activations, row-major
     const void* B;               ///< [N, (K/QK)*block_bytes] packed GGUF weight
-    void*       C;               ///< [M, N] BF16 output, row-major
+    void*       C;               ///< [M, N] BF16 output, row-major (FP32 when c_fp32)
     model::GgufKQuantType type;  ///< per-projection GGUF k-quant type
+    /// TD-GLM5-TP-COMBINE-PRECISION: when true, C is a [M, N] FP32 buffer and
+    /// the GEMM stores its fp32 accumulator RAW (no bf16 rounding) — the TP
+    /// combine sums partials across ranks BEFORE the single bf16 round.
+    /// Contract: __float2bfloat16_rn(C_f32[i]) is bitwise equal to the
+    /// bf16-out result for identical inputs (same kernels, same reduction
+    /// order; only the epilogue store differs).
+    bool c_fp32 = false;
+};
+
+/// Multi-segment GGUF mmvq (P-29 step 15, KDA projection-ladder fusion): up
+/// to kMaxSegs weight matrices that share ONE activation A[M,K] and one GGUF
+/// type, computed in a single launch. Mirrors the kernel-side
+/// GgufMmvqMultiParams (deps/LayerStoRmGemmKernels gguf_mmvq.h) — keep the
+/// two kMaxSegs in lockstep.
+struct GgufGemmMultiParams {
+    static constexpr int kMaxSegs = 8;
+    int M;                        ///< rows of A / rows of each C (tokens)
+    int K;                        ///< shared input dim
+    const void* A;                ///< [M, K] BF16 activations, row-major
+    model::GgufKQuantType type;   ///< shared GGUF k-quant type
+    int nseg = 0;                 ///< 1..kMaxSegs
+    const void* B[kMaxSegs] = {}; ///< packed GGUF weights
+    void*       C[kMaxSegs] = {}; ///< [M, N[s]] BF16 outputs
+    int         N[kMaxSegs] = {}; ///< output channels per segment
 };
 
 class AttentionDevice {
@@ -271,6 +499,27 @@ public:
     /// tensor-core variant compute::launch_gguf_mmq_mma in the CUDA backend.
     virtual void gguf_mmq(const GgufGemmParams& params,
                           void* q8_1_workspace, void* stream) = 0;
+
+    /// Multi-segment mmvq (P-29 step 15): nseg weight matrices sharing ONE
+    /// BF16 activation A[M,K] and one GGUF type, computed in a single fused
+    /// launch (one activation quantize + one kernel, grid = sum of the
+    /// segments' N). BIT-IDENTITY CONTRACT: every segment's output bytes
+    /// equal the corresponding standalone gguf_mmvq call's — only the
+    /// blockIdx->(segment,channel) mapping changes (GgufMmvqMulti unit
+    /// suite). Base default: the equivalent serial ladder (per-segment
+    /// gguf_mmvq, each re-quantizing the same A to the same bytes) so
+    /// non-CUDA test doubles stay correct without overriding.
+    virtual void gguf_mmvq_multi(const GgufGemmMultiParams& params,
+                                 void* q8_1_workspace, void* stream) {
+        for (int s = 0; s < params.nseg; ++s) {
+            GgufGemmParams p{};
+            p.M = params.M; p.N = params.N[s]; p.K = params.K;
+            p.A = params.A; p.B = params.B[s]; p.C = params.C[s];
+            p.type = params.type;
+            p.c_fp32 = false;
+            gguf_mmvq(p, q8_1_workspace, stream);
+        }
+    }
 
     /// GGUF dequant-to-BF16 GEMM — strategy `dequant` (lossless activation).
     /// No activation quantization, no workspace. Forwards to
@@ -388,8 +637,50 @@ public:
     /// top-k merge — scatter allgathered per-rank shard candidates back to
     /// global positions and re-select the global top-k (see
     /// IndexerTopkMergeArgs for the contract).
+    /// GF3.5 IndexPool producer/selection ops (no-ops off SM120).
+    virtual void indexer_kpool_append(const IndexerKpoolAppendArgs& args,
+                                      void* stream) {}
+    virtual void indexer_kpool_chunk_append(
+        const IndexerKpoolChunkAppendArgs& args, void* stream) {}
+    virtual void indexer_kpool_expand(const IndexerKpoolExpandArgs& args,
+                                      void* stream) {}
+    virtual void indexer_kpool_merge(const IndexerKpoolMergeArgs& args,
+                                     void* stream) {}
+
     virtual void indexer_topk_merge(const IndexerTopkMergeArgs& args,
                                     void* stream) {}
+
+    /// GF3.9 KDA linear-attention ops (glm5_next; no-ops off SM120 — the
+    /// executor only reaches them with CUDA kernels enabled, and the launch
+    /// wrappers THROW on geometry misuse). The stream MUST be the owning
+    /// GPU's kAttention stream: the state pool's zero-on-claim and fork D2D
+    /// ride it (INV-KDA-STATE (b)/(c)).
+    virtual void kda_conv_prefill(const KdaConvPrefillArgs& args,
+                                  void* stream) {}
+    virtual void kda_conv_decode(const KdaConvDecodeArgs& args,
+                                 void* stream) {}
+    virtual void kda_chunked_scan(const KdaChunkedScanArgs& args,
+                                  void* stream) {}
+    virtual void kda_gated_rmsnorm(const KdaGatedRmsNormArgs& args,
+                                   void* stream) {}
+    virtual void kda_decode_step(const KdaDecodeStepArgs& args,
+                                 void* stream) {}
+    /// TD-GLM5-TP-COMBINE-PRECISION: elementwise round dst[i] =
+    /// bf16_rn(src[i]) of the fp32 allreduce result — the ONE bf16 rounding
+    /// of the TP fp32 partial-combine path. No-op default off SM120 (the
+    /// executor only reaches it with CUDA kernels enabled, mirroring the KDA
+    /// ops above).
+    virtual void cast_f32_to_bf16(void* dst_bf16, const void* src_f32,
+                                  int64_t count, void* stream) {
+        (void)dst_bf16; (void)src_f32; (void)count; (void)stream;
+    }
+
+    /// fp32 workspace bytes kda_chunked_scan requires (0 off SM120).
+    virtual size_t kda_prefill_workspace_bytes(int t_len,
+                                               int num_heads) const {
+        (void)t_len; (void)num_heads;
+        return 0;
+    }
 
     // ── Device memory ───────────────────────────────────────────────────────
 

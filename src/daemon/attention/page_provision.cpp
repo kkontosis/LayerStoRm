@@ -54,15 +54,18 @@ namespace layerstorm::daemon {
 //
 // TD-INDEXER-POOL-EVICT: the two failure modes are DISTINGUISHED.
 // kUnavailable (beyond the serving window / bad slot / dcp mismatch) is a
-// permanent property of this shape — the producer falls back (replicated
-// B==1: executor arena; local: dense), never an error. kExhausted means the
+// permanent property of this shape — refusal for a reserved sequence, loud
+// dense downgrade for an unreserved legacy one. kExhausted means the
 // POOL is full of OTHER live sequences' pages and is RETRYABLE: the caller
 // may raise a pool-exhaustion CMP_ERROR so the orchestrator evicts a prefix
 // holder and re-issues (a holder's pages are freed with its sequence).
+// TD-INDEXER-NO-DENSE-FALLBACK (Route 1): pool-growth half, shared by the
+// per-step ensure_indexer_pages and the admission-time reservation
+// (handle_seq_create / handle_seq_fork). Grows the sequence's kIndexerK
+// handles to cover token_pos; never touches the per-batch host page tables.
 CommandDispatcher::IndexerPageResult
-CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
-                                        uint32_t token_pos,
-                                        int batch_slot, int dcp_size) {
+CommandDispatcher::grow_indexer_pages(uint64_t seq_id, uint32_t token_pos,
+                                      int dcp_size) {
     using R = IndexerPageResult;
     if (!deps_.page_allocator || !deps_.live_config) return R::kUnavailable;
     const auto& cfg = *deps_.live_config;
@@ -72,12 +75,13 @@ CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
     const int n_layers = cfg.model.num_hidden_layers
                        + cfg.model.num_nextn_predict_layers;
     if (indexer_computes_.empty()) {
-        // Same rule as DcpExecutor's slot map: IndexShare full ∪ layer 0.
+        // Same rule as DcpExecutor's slot map — the ONE computing-layer
+        // predicate (GF3.5): legacy IndexShare full ∪ {layer 0}; glm5_next
+        // exactly the sparse layers + the MTP layer.
         model::ModelConfig mc(cfg);
         indexer_computes_.assign(static_cast<size_t>(n_layers), 0);
         for (int l = 0; l < n_layers; ++l)
-            indexer_computes_[l] =
-                (mc.is_full_index_layer(l) || l == 0) ? 1 : 0;
+            indexer_computes_[l] = mc.computes_indexer(l) ? 1 : 0;
         const int max_seq = cfg.serving.max_sequence_length;
         indexer_page_stride_ = (max_seq + PT - 1) / PT;
         indexer_batch_stride_ = n_layers * indexer_page_stride_;
@@ -95,9 +99,6 @@ CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
     const int need = static_cast<int>(token_pos) / PT + 1;
     if (need > indexer_page_stride_)
         return R::kUnavailable;  // beyond serving window
-    if (batch_slot < 0
-        || batch_slot >= static_cast<int>(ipc::kMaxBatchDescriptors))
-        return R::kUnavailable;
 
     // TD-GLM-INDEXER-LOCAL-MERGE: local mode allocates ONE page per (pg, l)
     // on the owner rank's GPU; replicated allocates dcp_size replicas.
@@ -126,15 +127,39 @@ CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
                 for (auto& h : page) deps_.page_allocator->free(h);
                 spdlog::warn("ensure_indexer_pages: kIndexerK exhausted at "
                              "seq {} page {} layer {} (seq has {} of {} "
-                             "logical pages; pool is sized for "
-                             "serving.max_concurrent_requests sequences at "
-                             "max_sequence_length) — capacity, retryable",
+                             "logical pages; S4 elastic — indexer slabs "
+                             "come from the shared slab pool, INV-KVT-14b "
+                             "sizing share) — capacity, retryable",
                              seq_id, pg, l, have, need);
                 return R::kExhausted;
             }
             for (const auto& h : page) handles.push_back(h);
         }
     }
+    return R::kOk;
+}
+
+CommandDispatcher::IndexerPageResult
+CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
+                                        uint32_t token_pos,
+                                        int batch_slot, int dcp_size) {
+    using R = IndexerPageResult;
+    if (batch_slot < 0
+        || batch_slot >= static_cast<int>(ipc::kMaxBatchDescriptors))
+        return R::kUnavailable;
+    // Growth (no-op for a sequence whose admission reservation already
+    // covers token_pos — the TD-INDEXER-NO-DENSE-FALLBACK guarantee).
+    const auto grown = grow_indexer_pages(seq_id, token_pos, dcp_size);
+    if (grown != R::kOk) return grown;
+
+    const auto& cfg = *deps_.live_config;
+    const int PT = cfg.memory.kv_cache.indexer_k_page_size_tokens;
+    const bool local = dcp_size >= 2
+        && cfg.hardware.dcp_indexer_mode == config::DcpIndexerMode::local;
+    const auto& handles = sequences_[seq_id].indexer_pages;
+    const int n_layers = cfg.model.num_hidden_layers
+                       + cfg.model.num_nextn_predict_layers;
+    const int need = static_cast<int>(token_pos) / PT + 1;
 
     // (Re)write this sequence's rows into batch row `batch_slot`.
     // Replicated: rank r's table gets rank r's replica at the GLOBAL page
@@ -164,6 +189,35 @@ CommandDispatcher::ensure_indexer_pages(uint64_t seq_id,
         }
     }
     return R::kOk;
+}
+
+// ── TD-INDEXER-NO-DENSE-FALLBACK helpers ──────────────────────────────────
+
+bool CommandDispatcher::model_has_paged_indexer() const {
+    if (!deps_.live_config || !deps_.page_allocator) return false;
+    const auto& cfg = *deps_.live_config;
+    return cfg.model.index_topk > 0
+        && cfg.model.architecture != config::Architecture::deepseek_v4
+        && cfg.memory.kv_cache.indexer_k_page_size_tokens > 0;
+}
+
+void CommandDispatcher::indexer_mark_dead(uint64_t seq_id, int layer,
+                                          uint32_t pos, uint32_t next_pos,
+                                          const char* why) {
+    ++indexer_dense_total_;
+    step_indexer_dense_ = 1;
+    // ERROR, not warn/debug: a kDead transition is PERMANENT dense attention
+    // (~10x slower) for the rest of the sequence's life — with reserve-at-
+    // admission live (TD-INDEXER-NO-DENSE-FALLBACK) every remaining path
+    // here is a BUG, so a box that goes dense must be loud, not merely slow.
+    // The same event rides Completion.compute.indexer_dense to [orch-stats].
+    spdlog::error(
+        "INDEXER DENSE DOWNGRADE (kDead, PERMANENT): seq {} layer {} pos {} "
+        "next_pos {} — {} (transition #{}; sparse top-k attention is lost "
+        "for this sequence's remaining life; with reserve-at-admission this "
+        "must never happen — TD-INDEXER-NO-DENSE-FALLBACK)",
+        seq_id, layer, pos, next_pos, why ? why : "?",
+        indexer_dense_total_);
 }
 
 // ── Shared side-tier page claim (attention refactor V2 P2 dedup) ──────────
@@ -288,6 +342,25 @@ bool CommandDispatcher::ensure_v4_tier_pages(uint64_t seq_id,
         }
     }
     return true;
+}
+
+
+// GF3.9: the step's FIRST indexer-computing layer (INV-DSA-EPOCH re-feed
+// detection point — see command_dispatcher.h). Legacy = 0 (full ∪ {layer 0});
+// glm5_next = the first sparse layer (3). Lazily derived, cached.
+int CommandDispatcher::indexer_first_compute_layer() {
+    if (indexer_first_compute_layer_ < 0) {
+        int first = 0;
+        if (deps_.live_config) {
+            model::ModelConfig mc(*deps_.live_config);
+            const int n = deps_.live_config->model.num_hidden_layers;
+            for (int l = 0; l < n; ++l) {
+                if (mc.computes_indexer(l)) { first = l; break; }
+            }
+        }
+        indexer_first_compute_layer_ = first;
+    }
+    return indexer_first_compute_layer_;
 }
 
 }  // namespace layerstorm::daemon

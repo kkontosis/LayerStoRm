@@ -29,6 +29,9 @@
     "index_head_dim": 128,
     "index_topk_freq": 0,
     "index_skip_topk_offset": 0,
+    "index_kpool": 1,
+    "index_kpool_compress": false,
+    "index_kpool_always_select_tail": false,
     "rope_interleave": false,
     "indexer_rope_interleave": false,
     "first_k_dense_replace": 3,
@@ -48,6 +51,14 @@
     "hc_mult": 1,
     "hc_sinkhorn_iters": 20,
     "hc_eps": 0.000001,
+    "layer_types": [],
+    "linear_attn_config": {
+      "num_heads": 64,
+      "head_dim": 128,
+      "short_conv_kernel_size": 4,
+      "gate_lower_bound": -5
+    },
+    "mla_use_nope": false,
     "vision": {
       "enabled": false,
       "hidden_size": 1152,
@@ -294,7 +305,8 @@
       "draft_context_capacity_tokens": 8192,
       "aux_capture_max_rows": 2048,
       "epm_dump_dir": "",
-      "verify_chunk_prefetch": false
+      "verify_chunk_prefetch": false,
+      "ctx_rotate": true
     },
     "self_speculative": {
       "enabled": true,
@@ -423,8 +435,12 @@
     "prefill_superchunk_tokens": 0,
     "prefill_moe_big": true,
     "moe_big_chunk_tokens": 512,
+    "moe_big_fit_headroom_mb": 1024,
+    "moe_big_fit_headroom_expert_only_mb": 256,
     "dsa_sparse_prefill": false,
     "dsa_indexer_rewind": true,
+    "deterministic": false,
+    "reference_trajectory_identity": false,
     "deterministic_reduce": true,
     "deterministic_ep_combine": false,
     "deterministic_ep_combine_precision": "bf16",
@@ -445,7 +461,12 @@
     "prefix_cache": {
       "enabled": true,
       "max_cached_tokens": 131072,
-      "max_entries": 8
+      "max_entries": 8,
+      "kda_checkpoints": {
+        "enabled": true,
+        "interval_tokens": 2048,
+        "budget_mib": 32768
+      }
     }
   },
   "preprocessing": {
@@ -458,7 +479,15 @@
     "live_prepack_threads": 0
   },
   "_internal-prefix_cache": {
-    "max_entry_tokens": 0
+    "max_entry_tokens": 0,
+    "subgrid_mid_edge": false,
+    "hibernate_holders": true
+  },
+  "_internal-prefix_spill": {
+    "enabled": true,
+    "path": "~/.layerstorm/prefix-cache",
+    "max_mib": 32768,
+    "idle_seconds": 300
   },
   "_internal-prescope": {
     "hidden_size": 7168,
@@ -583,7 +612,42 @@
   "_internal-orchestrator": {
     "ep_gpu_indices": [],
     "prefill_sc_min_tokens": 256,
-    "prefill_sc_small_chunk_tokens": 64
+    "prefill_sc_small_chunk_tokens": 64,
+    "degraded_retry_enabled": true,
+    "degraded_retry_max": 1,
+    "kvxp_large_prefill_tokens": 8192,
+    "kvxp_large_prefill_wait_ms": 2000
+  },
+  "autoconfig": {
+    "enabled": false,
+    "output_path": "",
+    "fingerprint": "",
+    "prefer": "balanced",
+    "accuracy": "standard"
+  },
+  "_internal-autoconfig": {
+    "vram_usable_fraction": 0.9375,
+    "vram_safety_margin_gb": 2.25,
+    "non_tp_overhead_gib": 1.25,
+    "host_pin_fraction_total": 0.9,
+    "hbm_spill_fraction_free": 0.6,
+    "prefill_scratch_gb": 0.5,
+    "min_seq_for_pairing": 16384,
+    "device_pool_round_pages": 1024,
+    "expert_gib_quantum": 0.5,
+    "min_max_seq": 4096
+  },
+  "_internal-kda_state": {
+    "mapped": true
+  },
+  "_internal-kv_expert_rebalance": {
+    "enabled": true,
+    "max_waste": 0.1,
+    "low_water_frac": 0.02,
+    "high_water_frac": 0,
+    "max_slots_per_grant": 8,
+    "tick_ms": 200,
+    "grant_cooldown_ms": 30000
   },
   "gpu_loader": {
     "enabled": false,

@@ -100,7 +100,8 @@ static bool is_pinned(const config::LayerPinSpec& spec, int layer_idx) {
 
 LayerRegistry::LayerRegistry(const ModelConfig& model_cfg,
                              const config::Config& cfg,
-                             const QuantInterface& expert_quant)
+                             const QuantInterface& expert_quant,
+                             const GgufNonExpertWidths* gguf_widths)
     : cfg_(&cfg) {
     const auto& m = model_cfg.raw();
     const auto& q = cfg.quantization;
@@ -176,9 +177,19 @@ LayerRegistry::LayerRegistry(const ModelConfig& model_cfg,
         // V4 (V4-3a): per-layer anatomy from compress_ratios — SWA/CSA/HCA
         // sizes differ (compressor, indexer, mHC included; BF16/F32-native,
         // unsharded here: LayerInfo carries full-layer sizes, tp=1).
+        // glm5_next (GF3.3): per-layer anatomy from layer_types — KDA linear
+        // vs NoPE sparse MLA. The function already accounts for the layer's
+        // indexer (sparse layers only) AND its mHC stream weights, so the
+        // legacy MLA + indexer_bytes_per_layer formulas must NOT be added on
+        // top (they would double-count the indexer and mis-size everything
+        // else). Unsharded, like the V4 branch: LayerInfo is tp=1.
         info.attention_bytes = model_cfg.is_v4()
             ? v4_attention_layer_bytes(
                   m, model_cfg.attention_type_for_layer(l), /*tp=*/1)
+            : model_cfg.is_glm5_next()
+            ? glm5_next_attention_layer_bytes(
+                  m, q.weights, model_cfg.is_linear_attention_layer(l),
+                  /*include_hc=*/true, /*tp=*/1, gguf_widths, l)
             : attention_bytes_per_layer + indexer_bytes_per_layer;
         info.attention_pinned = is_pinned(pin.attention, l);
 
@@ -220,7 +231,8 @@ LayerRegistry::LayerRegistry(const ModelConfig& model_cfg,
 
     // ── Authoritative pinned layout (replaces old per-component budget math) ──
     int tp = std::max(1, cfg.parallelism.tensor_parallelism);
-    pinned_layout_ = compute_pinned_layout(model_cfg, cfg, expert_quant, tp, 0);
+    pinned_layout_ = compute_pinned_layout(model_cfg, cfg, expert_quant, tp, 0,
+                                           gguf_widths);
 
     // ── DSpark draft weights + runtime scratch (DSP-2 / DSP-3) ──
     // When speculation.method=dspark the whole draft is pinned on ONE

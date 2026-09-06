@@ -482,6 +482,7 @@ class LayerStoRmServer:
         reasoning_parser: str = "",
         reasoning_config: dict[str, Any] | None = None,
         tokenizer_mode: str = "",
+        sampling_defaults: dict[str, Any] | None = None,
         guided_manager: Any = None,
     ) -> None:
         self._orchestrator = orchestrator
@@ -516,6 +517,13 @@ class LayerStoRmServer:
         # other→"high" — ref/vllm/vllm/tokenizers/deepseek_v4.py).
         # ""/"auto"/"hf" keep the legacy (GLM-shaped) behavior.
         self._tokenizer_mode = tokenizer_mode
+        # Model-recommended sampling defaults (glm5_next: top_p from the
+        # checkpoint's generation_config.json).  Applied ONLY to requests
+        # that explicitly opt into sampling (explicit temperature > 0) and
+        # leave the field unset — the greedy-champion routing of
+        # UNSPECIFIED temperature is deliberately untouched, and with no
+        # defaults dict (every other model) behavior is byte-identical.
+        self._sampling_defaults = dict(sampling_defaults or {})
         # --reasoning-config JSON passthrough (vLLM ReasoningConfig field
         # names): marker-string overrides for the named reasoning parser.
         rc = reasoning_config or {}
@@ -583,8 +591,7 @@ class LayerStoRmServer:
     async def _list_models(self) -> ModelList:
         return ModelList(data=[ModelObject(id=self._model_name)])
 
-    @staticmethod
-    def _sampling_of(request) -> SamplingParams:
+    def _sampling_of(self, request) -> SamplingParams:
         """Map API sampling fields to SamplingParams.
 
         UNSPECIFIED temperature routes to the greedy champion
@@ -595,7 +602,12 @@ class LayerStoRmServer:
         speculation (plain-arm fallback).  ``seed`` (OpenAI field) and
         ``top_k`` (extension) thread through when present — a fixed seed
         reproduces the token stream exactly (per-arm RNG streams; see
-        SamplingParams)."""
+        SamplingParams).
+
+        ``sampling_defaults`` (glm5_next: ``top_p`` 0.95 from
+        generation_config.json) fill fields the request leaves UNSET, but
+        only once the request explicitly opts into sampling — greedy
+        routing and every model without a defaults dict are unchanged."""
         explicit = "temperature" in request.model_fields_set
         t = float(request.temperature) if explicit else 0.0
         kw = {}
@@ -605,8 +617,12 @@ class LayerStoRmServer:
         top_k = getattr(request, "top_k", None)
         if top_k is not None:
             kw["top_k"] = int(top_k)
+        top_p = float(getattr(request, "top_p", 1.0))
+        if (self._sampling_defaults and explicit and t > 0.0
+                and "top_p" not in request.model_fields_set):
+            top_p = float(self._sampling_defaults.get("top_p", top_p))
         return SamplingParams(temperature=max(0.0, t),
-                              top_p=float(getattr(request, "top_p", 1.0)),
+                              top_p=top_p,
                               **kw)
 
     async def _handle_completions(
@@ -708,20 +724,96 @@ class LayerStoRmServer:
             if getattr(request, "reasoning_effort", None) == "none":
                 return False
             return thinking
+        if self._tokenizer_mode == "glm5_next":
+            # The GLM-5.3 template pre-seeds <|assistant|><think>
+            # UNCONDITIONALLY (no enable_thinking/nothink control exists
+            # in it) — thinking is structurally always on; requests that
+            # ask to disable it are rejected loudly in
+            # _mode_request_error, never silently ignored.
+            return True
         return request.thinking is not False
+
+    # glm5_next reasoning_effort normalization (GF3.13): the GLM-5.3
+    # chat template accepts exactly 'low' | 'high' and coerces EVERYTHING
+    # else (including unset) to 'max' — three levels, default max
+    # (test-data/GLM-5.3-Flash/chat_template.jinja:2-3).  The serving
+    # layer maps the client vocabulary onto those levels explicitly and
+    # 400s unknown values rather than letting the template coerce junk to
+    # max silently.  "none" is NOT a level: thinking cannot be disabled
+    # on this template (see _thinking_enabled).
+    _GLM5_EFFORT_MAP = {
+        "minimal": "low", "low": "low",
+        "medium": "high", "high": "high",
+        "max": "max", "xhigh": "max",
+    }
+
+    def _mode_request_error(
+        self, request: ChatCompletionRequest,
+    ) -> JSONResponse | None:
+        """Mode-specific request validation (loud, never silent).
+
+        glm5_next: the template has no thinking-off control (the
+        generation prompt is unconditionally ``<|assistant|><think>``), so
+        an explicit thinking-off request cannot be honored — honoring it
+        silently would misroute all reasoning into content.  Unknown
+        reasoning_effort values are rejected instead of being coerced."""
+        if self._tokenizer_mode != "glm5_next":
+            return None
+        if (request.thinking is False
+                or getattr(request, "enable_thinking", None) is False):
+            return self._error_response(
+                400,
+                "thinking cannot be disabled for glm5_next: the GLM-5.3 "
+                "chat template unconditionally pre-seeds <think> (it has "
+                "no thinking-off control); omit thinking/enable_thinking, "
+                'or use reasoning_effort "low" to shorten reasoning',
+                param="thinking")
+        eff = getattr(request, "reasoning_effort", None)
+        if eff is not None and (not isinstance(eff, str)
+                                or eff not in self._GLM5_EFFORT_MAP):
+            return self._error_response(
+                400,
+                f"invalid reasoning_effort {eff!r} for glm5_next: "
+                "accepted values are minimal/low → Low, medium/high → "
+                'High, max/xhigh → Max (default max); "none" is '
+                "unsupported — thinking cannot be disabled on this "
+                "template",
+                param="reasoning_effort")
+        ct = getattr(request, "clear_thinking", None)
+        if ct is not None and not isinstance(ct, bool):
+            return self._error_response(
+                400, "clear_thinking must be a boolean",
+                param="clear_thinking")
+        return None
 
     def _render_kwargs(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Chat-template kwargs per tokenizer mode.  deepseek_v4:
         normalized thinking (explicit, so template and parsers agree) +
         reasoning_effort mapping "max"/"xhigh"→"max", other→"high"
-        ("none" disables thinking and is not forwarded).  Legacy: the
-        historical passthrough (thinking only, None not injected)."""
+        ("none" disables thinking and is not forwarded).  glm5_next:
+        normalized reasoning_effort (low/high/max, omitted = template
+        default max) + clear_thinking, which the TEMPLATE defaults false
+        but CHAT serving defaults TRUE (GF3.13): API clients do not echo
+        reasoning_content back, so prior-turn think blocks are dropped
+        deterministically — the re-rendered transcript never depends on
+        whether a client resends reasoning.  An explicit
+        ``clear_thinking: false`` opts into re-rendering prior reasoning
+        (the client must then resend reasoning_content for it to
+        matter).  Legacy: the historical passthrough (thinking only,
+        None not injected)."""
         if self._tokenizer_mode == "deepseek_v4":
             kw: dict[str, Any] = {"thinking": self._thinking_enabled(request)}
             eff = getattr(request, "reasoning_effort", None)
             if isinstance(eff, str) and eff != "none":
                 kw["reasoning_effort"] = ("max" if eff in ("max", "xhigh")
                                           else "high")
+            return kw
+        if self._tokenizer_mode == "glm5_next":
+            ct = getattr(request, "clear_thinking", None)
+            kw = {"clear_thinking": True if ct is None else bool(ct)}
+            eff = getattr(request, "reasoning_effort", None)
+            if isinstance(eff, str):
+                kw["reasoning_effort"] = self._GLM5_EFFORT_MAP[eff]
             return kw
         return {"thinking": request.thinking}
 
@@ -870,6 +962,9 @@ class LayerStoRmServer:
             return slot
         stream_owns_slot = False
         try:
+            err = self._mode_request_error(request)
+            if err is not None:
+                return err
             err = self._tool_choice_error(request)
             if err is not None:
                 return err

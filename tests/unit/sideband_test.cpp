@@ -74,12 +74,14 @@ TEST(SidebandLayout, SubRegionSizes) {
 
 TEST(SidebandLayout, TotalSize) {
     // Phase 22 grew the sideband by the routing-export (F-4) + seam-checkpoint
-    // (F-7) regions: 26624 (through spec-checkpoint) + 65552 (routing) + 4096
-    // (seam) = 96272. Regression guard for accidental layout changes.
+    // (F-7) regions; GF3.15 grew the expert prefetch/eviction arrays to 512
+    // entries each (glm5_next: 288 routed experts): 30720 (through
+    // spec-checkpoint) + 65552 (routing) + 4096 (seam) = 100368.
+    // Regression guard for accidental layout changes.
     using L = ipc::IpcLayout;
     EXPECT_EQ(L::kRoutingExportSize, 65552u);
     EXPECT_EQ(L::kSeamCheckpointSize, 4096u);
-    EXPECT_EQ(L::kSidebandTotalSize, 96272u);
+    EXPECT_EQ(L::kSidebandTotalSize, 100368u);
 }
 
 TEST(SidebandLayout, TotalSizeIncludesSideband) {

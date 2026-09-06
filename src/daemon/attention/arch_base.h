@@ -34,6 +34,29 @@ class AttentionArch {
 public:
     virtual ~AttentionArch() = default;
 
+    /// ARCHITECTURE PROPERTY (R4b capability gate, INV-SEQ-FORK-TRUNC):
+    /// does this arch keep LOSSY POSITION-INDEXED per-sequence state --
+    /// state addressed by `slot = pos % capacity` and mutated in place
+    /// (V4: the SWA ring, the CSA/HCA compressor state rings) -- such that
+    /// the per-position entries an arbitrary interior prefix needs
+    /// ([N - window, N)) are NOT reconstructible once the sequence has
+    /// advanced past N?
+    ///
+    /// When true, any operation that needs a sequence's state AT an
+    /// arbitrary interior length N (today: the truncating fork,
+    /// CMD_SEQ_FORK with prefix_len > 0) is IMPOSSIBLE on this arch and
+    /// must be REJECTED, never approximated -- seeding from the current
+    /// rings would silently attend over post-boundary content.  Paged KV
+    /// (kMain), the DSA indexer-K tier and the KV-tiering cold pool are
+    /// NOT lossy in this sense: position-addressed but append-only per
+    /// position, so a prefix survives the frontier advancing.  A future
+    /// arch with any pos%capacity in-place ring must return true and is
+    /// excluded automatically (the gate is this PROPERTY, never a
+    /// model-name check); an arch without such state gets truncating
+    /// forks for free.  Exported to the orchestrator as
+    /// EngineInfo::seq_fork_truncatable (= !this).
+    virtual bool lossy_position_indexed_state() const = 0;
+
     /// Phase A (pre-weights / pre-kv-meta): arch shape legality gate.
     /// Sets `batch_cap` (the driver's batch_size bound for this shape).
     /// On failure: set d_.last_internal_error_* and return false.

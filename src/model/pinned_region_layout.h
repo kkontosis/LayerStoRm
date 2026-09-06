@@ -32,6 +32,7 @@ namespace layerstorm::model {
 
 class ModelConfig;
 class QuantInterface;
+struct GgufNonExpertWidths;  // weight_loader.h (GF3.15)
 
 // ── Shared sizing helpers ───────────────────────────────────────────────────
 
@@ -98,6 +99,76 @@ int64_t v4_attention_layer_bytes(const config::ModelConfig& m,
 /// Model-level output_hc_{fn,base,scale} bytes (F32; mHC head collapse).
 int64_t v4_output_hc_bytes(const config::ModelConfig& m);
 
+// ── glm5_next attention sizing (GF3.3) ──────────────────────────────────────
+//
+// GLM-5.3-Flash ships TWO per-layer attention anatomies (spec/GLM-5.3-FLASH-
+// MODELINFO.md §3a/§3b/§3c/§3e), and the per-layer bytes must be computed from
+// the one the layer actually has — ModelConfig::is_linear_attention_layer(l):
+//
+//   KDA linear attention (34 layers) — entirely BF16 except A_log/dt_bias
+//   (F32); the WHOLE layer sits in the FP8 skip list, so its size does NOT
+//   depend on the checkpoint weight quant at all:
+//     q/k/v_proj  [H*D, h] BF16 x3        column-parallel (head axis)  ÷tp
+//     b_proj      [H, h]   BF16           column-parallel              ÷tp
+//     f_a/g_a     [D, h]   BF16 x2        REPLICATED (rank-D bottleneck)
+//     f_b/g_b     [H*D, D] BF16 x2        column-parallel              ÷tp
+//     q/k/v_conv1d[H*D,1,K] BF16 x3       column-parallel              ÷tp
+//     A_log       [H]      F32            column-parallel              ÷tp
+//     dt_bias     [H*D]    F32            column-parallel              ÷tp
+//     o_norm      [D]      BF16           REPLICATED
+//     o_proj      [h, H*D] BF16           row-parallel                 ÷tp
+//
+//   NoPE sparse MLA (11 layers + the MTP block) — MIXED precision inside one
+//   layer: q_a/q_b/kv_a/o_proj are FP8 with F32 [ceil(N/128), ceil(K/128)]
+//   blockwise scales, while kv_b_proj, the two layernorms and the ENTIRE
+//   indexer (IndexPool compressor included) are BF16 in the skip list.
+//
+//   mHC (§3e) adds hc_{attn,ffn}_fn [(2+hc)*hc, hc*h] BF16 + _base [(2+hc)*hc]
+//   F32 + _scale [3] F32 to every HIDDEN layer (0..44).  NOTE the dtype mix
+//   differs from DeepSeek-V4, whose hc set is all-F32 — do not reuse the V4
+//   formula.  The MTP block layer 45 has NO hc tensors, and glm5_next has no
+//   model-level output_hc set either.
+//
+// TP: exactly the components the TpWeightSharder splits are divided here (see
+// shard_mode_for), scales included — the sharder-vs-sizing byte equality is
+// what validate_plan enforces at boot.
+//
+// GGUF releases (GF3.9) take a separate UPPER-BOUND arm: the unsloth
+// GLM-5.3-Flash GGUF ships every attention matrix packed Q8_0 and every
+// vector/norm/APE F32 (scratchpad/gf39/SURVEY_BOOT.md §3.7), so matrices are
+// sized BF16 (>= any GGUF packing, and exact for a load-time dequant to BF16)
+// and F32 tensors are sized F32 — except the four norms validate_plan halves
+// by dtype (q_a/kv_a layernorm, indexer k_norm weight+bias), sized BF16 to
+// match that correction.  The kpool compressor APE is F32 on the GGUF path
+// (BF16 on the native path) because the GGUF ships and uploads it F32.  The
+// resulting slack is legal: validate_plan's `gguf_upper_bound` allowance
+// covers glm5_next + any gguf quant, and only an UNDER-sized slot is a bug.
+//
+// GF3.15 (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND) narrows that GGUF arm: when
+// `widths` is supplied (a header-only pre-scan of the checkpoint, built once by
+// the engine — `gguf_non_expert_widths_from_path`) every PACKED matrix is sized
+// at its REAL k-quant width instead of the BF16 bound.  The upper bound was
+// never physics, only the absence of the header scan at plan time; on
+// GLM-5.3-Flash it cost 5.2 GiB of pinned VRAM on the single TP GPU.  Tensors
+// the loader TRANSFORMS at load keep their transformed width and are never
+// looked up: the split kv_b halves (assembled to one combined BF16 kv_b_proj),
+// the IndexPool compressor gate (dequanted to BF16 for a BF16-only GEMM),
+// hc_*_fn (widened to F32 for launch_mhc_pre) and the four dtype-halved norms.
+// `widths == nullptr`, or a tensor absent from it (plain-float in the file),
+// keeps the previous sizing — still an upper bound, because every remaining
+// load-time transform on those (requant_bundle_to_q8_0, F32→BF16 norms) makes
+// the uploaded tensor SMALLER.
+//
+// @throws std::runtime_error for nvfp4 — no such glm5_next artifact path is
+//         supported yet (GF3.3).
+int64_t glm5_next_attention_layer_bytes(const config::ModelConfig& m,
+                                        config::WeightQuant wq,
+                                        bool linear_attention,
+                                        bool include_hc,
+                                        int tp,
+                                        const GgufNonExpertWidths* widths = nullptr,
+                                        int layer_idx = -1);
+
 /// V4 hash-layer token→expert table bytes: tid2eid [num_experts_per_tok,
 /// vocab_size] I32 (layers l < num_hash_layers carry it INSTEAD of the
 /// exp_probs_b gating bias).
@@ -127,12 +198,16 @@ struct PinnedRegionLayout {
 /// Compute the pinned region layout for a single TP rank.
 /// Uses model dimensions + config to predict exact byte counts
 /// that will be uploaded by Engine::upload_pinned_weights().
+/// `widths` (GF3.15): the checkpoint's real per-tensor GGUF widths from a header
+/// pre-scan; nullptr keeps the pre-load upper-bound sizing.  Only the glm5_next
+/// GGUF arm consumes it today — see glm5_next_attention_layer_bytes.
 PinnedRegionLayout compute_pinned_layout(
     const ModelConfig& model_cfg,
     const config::Config& cfg,
     const QuantInterface& expert_quant,
     int tp_degree,
-    int rank);
+    int rank,
+    const GgufNonExpertWidths* widths = nullptr);
 
 /// Returns false when kv_b_proj is absorbed into the KV cache format
 /// (SnapMLA, TurboQuant MLA) and won't appear in the checkpoint.

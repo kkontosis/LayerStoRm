@@ -1028,12 +1028,30 @@ CalibrationConfig config_for_mode(CalibrationMode m) {
 LoaderConstants load_or_calibrate(CalibrationMode mode, const std::string& path,
                                   const std::vector<DeviceBackend*>& backends, NumaManager& numa,
                                   const std::vector<ExpertDevice*>& experts) {
+  // The whole precedence/self-heal control flow lives in load_or_calibrate_with;
+  // this overload only says what "calibrate" means in production. Keep it that way
+  // — the unit tier covers the control flow through the seam, not through here.
+  return load_or_calibrate_with(mode, path, [&](CalibrationMode resolved) {
+    return calibrate(backends, numa, config_for_mode(resolved), experts);
+  });
+}
+
+LoaderConstants load_or_calibrate_with(CalibrationMode mode, const std::string& path,
+                                       const CalibrateFn& calibrate_fn,
+                                       const AcceptFn& accept_fn) {
   if (mode == CalibrationMode::kLoaded) {
     if (!path.empty() && std::filesystem::exists(path)) {
       try {
         LoaderConstants c = load(path);
-        spdlog::info("gpu_loader: loaded constants from {}", path);
-        return c;
+        // A file that parsed is not automatically usable: the caller's check decides
+        // whether it belongs to this model/machine. A rejected file is treated exactly
+        // like an unreadable one — recalibrate and overwrite it.
+        if (!accept_fn || accept_fn(c)) {
+          spdlog::info("gpu_loader: loaded constants from {}", path);
+          return c;
+        }
+        spdlog::warn("gpu_loader: {} rejected by the caller's validity check; "
+                     "recalibrating (full)", path);
       } catch (const std::exception& e) {
         spdlog::warn("gpu_loader: failed to load {} ({}); recalibrating (full)", path, e.what());
       }
@@ -1043,7 +1061,7 @@ LoaderConstants load_or_calibrate(CalibrationMode mode, const std::string& path,
     }
     mode = CalibrationMode::kFull;  // fall through to produce the file
   }
-  LoaderConstants c = calibrate(backends, numa, config_for_mode(mode), experts);
+  LoaderConstants c = calibrate_fn(mode);
   if (!path.empty()) {
     try {
       save(c, path);

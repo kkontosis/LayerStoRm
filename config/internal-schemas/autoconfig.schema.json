@@ -1,0 +1,114 @@
+{
+  "type": "object",
+  "x-configFile": "autoconfig.json",
+  "description": "Internal autoconfig solver policy knobs (docs/AUTOCONFIG_MODEL.md; Python AutoconfigKnobs). Measured-policy constants with provenance — not user-facing dials. Loaded from autoconfig.json if not inlined.",
+  "properties": {
+    "vram_usable_fraction": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 1.0,
+      "default": 0.9375,
+      "description": "Usable fraction of physical (BAR1) VRAM: 15/16 covers the driver/runtime reserve and reproduces the champion's declared 30/15 GiB on 32/16 GiB boards."
+    },
+    "vram_safety_margin_gb": {
+      "type": "number",
+      "minimum": 0,
+      "default": 2.25,
+      "description": "Emitted memory.vram_safety_margin_gb (GiB). Champion-proven 2.25; KV-tiering device pools allocate OUTSIDE the VramAllocator carve, i.e. out of this margin (kv_tiering_manager.cpp:189-245)."
+    },
+    "non_tp_overhead_gib": {
+      "type": "number",
+      "minimum": 0,
+      "default": 1.25,
+      "description": "VRAM reserve on a GPU with no pinned weights (CUDA context + NCCL + transfer staging) before its expert capacity is counted."
+    },
+    "host_pin_fraction_total": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1.0,
+      "default": 0.9,
+      "description": "fraction_total for host pinned expert-arena sizing on DDR nodes (per-NUMA-node capacity is the real ceiling, INV-4.12f)."
+    },
+    "hbm_spill_fraction_free": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1.0,
+      "default": 0.6,
+      "description": "fraction_free for CPU-less HBM spill banks. 0.8 measured too tight (node-local OOM with 30 GB free system-wide); 0.6 works. Registry row hbm-fraction-free-06."
+    },
+    "prefill_scratch_gb": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0.5,
+      "description": "Emitted memory.kv_cache.prefill_scratch_preallocated_gb."
+    },
+    "min_seq_for_pairing": {
+      "type": "integer",
+      "minimum": 1024,
+      "default": 16384,
+      "description": "K1 split policy: a total-active-context lever of at least 2x this splits into 2 concurrent requests (headroom for a second sequence)."
+    },
+    "device_pool_round_pages": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1024,
+      "description": "Tiered-KV device pool page rounding granule for the derived max_pages_per_gpu."
+    },
+    "expert_gib_quantum": {
+      "type": "number",
+      "minimum": 0.0625,
+      "default": 0.5,
+      "description": "Per-GPU expert_streaming override rounding quantum (GiB) — keeps derived recipes hand-readable."
+    },
+    "min_max_seq": {
+      "type": "integer",
+      "minimum": 256,
+      "default": 4096,
+      "description": "E1 degradation floor for max_sequence_length before the solver refuses instead."
+    },
+    "moe_fit_fixed_attn_mib": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 2224,
+      "description": "P-31 free-at-fit anchor, attention-host class (MiB): CUDA ctx + arena page tables + lazy modules between physical VRAM and the modeled free at the MoE-big fit check. Calibrated to P-30 step 2's measured 5090 free 1668 MiB at the champion carve (fixed = BAR1 - block - prefit - free). Heuristic on other boards."
+    },
+    "moe_fit_fixed_expert_mib": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 1627,
+      "description": "P-31 free-at-fit anchor, expert-only class (MiB); calibrated to P-30 step 2's measured 5080 free 1685 MiB at the champion carve."
+    },
+    "moe_fit_headroom_cushion": {
+      "type": "number",
+      "minimum": 1.0,
+      "maximum": 4.0,
+      "default": 1.15,
+      "description": "Derived moe_big_fit_headroom_mb = post-check allocation demand (block tables, logits, KVT union, MoE persistent set) x this cushion — the fit check runs BEFORE those allocations, so the headroom is what reserves their room (command_dispatcher.cpp:497-521)."
+    },
+    "moe_fit_free_floor_mib": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 256,
+      "description": "Residual free-VRAM floor required after all runtime allocations when the derived stride stays at the chunk floor (the engine's fit gate is skipped there)."
+    },
+    "runtime_margin_quantum_gb": {
+      "type": "number",
+      "minimum": 0.01,
+      "default": 0.25,
+      "description": "Rounding quantum (GiB) for the raised TP-rank safety_margin_gb (TD-AUTOCONFIG-LONGCTX-RUNTIME-SCRATCH charge)."
+    },
+    "stride_margin_cap_gb": {
+      "type": "number",
+      "minimum": 0,
+      "default": 6.0,
+      "description": "Never raise a TP-rank margin above this to fund a larger prefill superchunk stride — bounds the expert-VRAM spend of the SPEED-axis stride derivation (TD-AUTOCONFIG-STRIDE-NOT-DERIVED)."
+    },
+    "block_table_budget_gb": {
+      "type": "number",
+      "minimum": 0.125,
+      "default": 1.5,
+      "description": "dev_block_tables budget per TP rank ((layers+nextn) x max_batch x pages x 4 B, command_dispatcher.cpp:1359): the derived orchestrator.max_batch_size is the largest halving of the family cap that fits (P-29 audit: 512 @1M = 5.75 GiB, undeployable)."
+    }
+  },
+  "additionalProperties": false
+}

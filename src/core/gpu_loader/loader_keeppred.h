@@ -19,8 +19,9 @@ namespace layerstorm::gpu_loader {
 
 // Max victim-window candidates the keeppred reorder considers (a bounded cheap
 // tail — see reef_orch_apply). Sized so the per-GPU miss count of the largest
-// routed union (kMaxExpertsLarge=256 over ≥4 devices ⇒ ≤64/GPU) plus headroom
-// fits; the caller stack-allocates buffers of this size (small: ~1 KiB).
+// routed union (kMaxExpertsLarge=320 over ≥4 devices ⇒ ≤80/GPU; GLM-5.3's
+// 288-expert layers give ≤72/GPU) plus headroom fits; the caller
+// stack-allocates buffers of this size (small: ~1 KiB).
 inline constexpr int kKeeppredWindow = 128;
 
 // Reorder a board cheapest-first victim candidate window under the retention

@@ -538,6 +538,42 @@ TEST(DcpPageAssignment, IndexerK_Replicated_AllTpGpus) {
     EXPECT_EQ(pages.meta(handles[0]).sequence_id, 42u);
     EXPECT_EQ(pages.meta(handles[1]).sequence_id, 42u);
     EXPECT_EQ(pages.meta(handles[0]).layer_index, 3u);
+
+    // S4 (elastic pool): replicated-mode claims are PER-RANK INDEPENDENT —
+    // each rank takes a slab from ITS OWN shared free-slab list. The S1
+    // lockstep-same-index discipline is deliberately gone: in the shared
+    // pool per-rank free-slab sets diverge (sharded-KV claims differ per
+    // rank) and a mutual-index requirement collapses capacity to the set
+    // INTERSECTION (measured live on the S4 GPU gate: admission refusals
+    // with 82/106 free slabs per rank). Nothing consumes cross-rank index
+    // equality for indexer pages — consumers are pointer-table indirected
+    // and frees are per-handle.
+    auto h2 = pages.allocate_indexer_k_for_dcp(43, 8192, 3);
+    ASSERT_EQ(h2.size(), 2u);
+    EXPECT_NE(h2[0].page_idx, handles[0].page_idx);
+
+    // A free/realloc cycle keeps working (whole-slab release).
+    for (auto& h : h2) pages.free(h);
+    auto h3 = pages.allocate_indexer_k_for_dcp(44, 8192, 3);
+    ASSERT_EQ(h3.size(), 2u);
+
+    // THE gate-finding regression lock: desync the two ranks' free-slab
+    // sets with a rank-LOCAL KV claim (sharded-KV shape), then a
+    // replicated indexer claim must still succeed on both ranks.
+    auto kv0 = pages.allocate_for_sequence(0, lmem::Pool::kMain,
+                                           /*seq=*/900, /*layer=*/0,
+                                           /*token_start=*/0,
+                                           /*token_end=*/16);
+    ASSERT_TRUE(kv0.has_value());
+    auto h4 = pages.allocate_indexer_k_for_dcp(45, 16384, 3);
+    ASSERT_EQ(h4.size(), 2u)
+        << "per-rank claims must survive diverged free-slab sets";
+    EXPECT_EQ(h4[0].gpu_idx, 0);
+    EXPECT_EQ(h4[1].gpu_idx, 1);
+    pages.free(*kv0);
+    for (auto& h : h4) pages.free(h);
+    for (auto& h : h3) pages.free(h);
+    for (auto& h : handles) pages.free(h);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -632,4 +668,74 @@ TEST(DcpPageAssignment, IndexerK_NonDcp_SingleGpu) {
     ASSERT_EQ(handles.size(), 1u);
     EXPECT_EQ(handles[0].gpu_idx, 0);
     EXPECT_EQ(handles[0].pool, lmem::Pool::kIndexerK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// S2 (TD-INDEXER-POOL-ELASTIC, RADIX_SLAB_DESIGN §5): replicated kMain under
+// position-major per-sequence bump-runs — slabs claim in LOCKSTEP by slab
+// index on every TP GPU (the INV-KV-REP argument applied to slabs) and both
+// ranks' slab states (including position watermarks) evolve identically
+// across bump rollover, CoW colocation and free.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(DcpPageAssignment, ReplicatedKv_SlabLockstepAcrossSlabBoundary) {
+    auto cfg = dcp_v32_config();
+    auto [backends_, vram, pages] = make_dcp_allocators(cfg);
+    pages.set_dcp_config(make_dcp_config(2, 16, 16, {0, 1}));
+    const int pps = pages.pages_per_slab();
+    ASSERT_GT(pps, 1) << "v3.2 DSA fixture must be slabbed";
+
+    // Allocate across a slab boundary: unique indices, contiguous within
+    // the first slab, and BOTH ranks' slab occupancy identical.
+    std::vector<lmem::PageHandle> handles;
+    for (int i = 0; i <= pps; ++i) {
+        auto h = pages.allocate_main_replicated(21, static_cast<uint32_t>(
+                                                        i * 16), 0);
+        ASSERT_TRUE(h.has_value()) << i;
+        EXPECT_TRUE(pages.meta(*h).replicated);
+        handles.push_back(*h);
+    }
+    for (int i = 1; i < pps; ++i)
+        EXPECT_EQ(handles[i].page_idx, handles[0].page_idx + i) << i;
+    EXPECT_NE(handles[pps].page_idx / pps, handles[0].page_idx / pps);
+
+    const auto f0 = pages.kv_fragmentation(0);
+    const auto f1 = pages.kv_fragmentation(1);
+    EXPECT_EQ(f0.live_slabs, 2);
+    EXPECT_EQ(f1.live_slabs, 2);
+    EXPECT_EQ(f0.used_pages, f1.used_pages);
+    EXPECT_EQ(f0.fragmented_free_pages, f1.fragmented_free_pages);
+
+    // Mirrored free returns whole slabs on BOTH ranks.
+    for (auto& h : handles) pages.free(h);
+    EXPECT_EQ(pages.kv_fragmentation(0).live_slabs, 0);
+    EXPECT_EQ(pages.kv_fragmentation(1).live_slabs, 0);
+}
+
+TEST(DcpPageAssignment, ReplicatedKv_CowSplitColocatesInLockstep) {
+    auto cfg = dcp_v32_config();
+    auto [backends_, vram, pages] = make_dcp_allocators(cfg);
+    pages.set_dcp_config(make_dcp_config(2, 16, 16, {0, 1}));
+    const int pps = pages.pages_per_slab();
+    ASSERT_GT(pps, 2);
+
+    auto h0 = pages.allocate_main_replicated(31, 0, 0);
+    auto h1 = pages.allocate_main_replicated(31, 16, 0);
+    ASSERT_TRUE(h0 && h1);
+
+    // Fork-frontier split: the replicated copy colocates with its source
+    // slab (same slab id on every rank — one lockstep index).
+    pages.add_ref(*h1);
+    auto split = pages.cow_copy(*h1, /*dst_seq_id=*/32);
+    EXPECT_NE(split.page_idx, h1->page_idx);
+    EXPECT_EQ(split.page_idx / pps, h1->page_idx / pps);
+    EXPECT_TRUE(pages.meta(split).replicated);
+    EXPECT_EQ(pages.kv_fragmentation(0).live_slabs, 1);
+    EXPECT_EQ(pages.kv_fragmentation(1).live_slabs, 1);
+
+    pages.free(split);
+    pages.free(*h1);
+    pages.free(*h0);
+    EXPECT_EQ(pages.kv_fragmentation(0).live_slabs, 0);
+    EXPECT_EQ(pages.kv_fragmentation(1).live_slabs, 0);
 }

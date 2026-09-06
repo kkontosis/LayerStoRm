@@ -58,10 +58,11 @@ bool MoeArch::select_experts(const CommandDispatcher::InternalMoeParams& mp,
 
 // Residual fold (dense early-out + Step 8): plain residual add. The V4-5b
 // mHC hc_post stream mix is the ArchDeepseekV4Moe override.
-void MoeArch::residual_update(uint32_t gpu, void* hidden_input, void* add_src,
+void MoeArch::residual_update(int layer_idx, uint32_t gpu,
+                              void* hidden_input, void* add_src,
                               int num_tokens, int hidden, int pair_idx,
                               void* stream) {
-    (void)gpu; (void)pair_idx;
+    (void)layer_idx; (void)gpu; (void)pair_idx;
     compute::launch_residual_add(hidden_input, add_src,
                                  num_tokens * hidden, stream);
 }

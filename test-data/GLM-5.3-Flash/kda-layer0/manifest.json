@@ -1,0 +1,209 @@
+{
+  "repo": "zai-org/GLM-5.3-Flash",
+  "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "source": "huggingface safetensors HTTP Range reads",
+  "hf_prefix": "model.language_model.layers.0.self_attn.",
+  "layer": 0,
+  "note": "Raw little-endian tensor bytes exactly as stored in the checkpoint shard (BF16 stays BF16). Shapes are the safetensors shapes. 64 linear heads x head_dim 128 = 8192; short_conv_kernel_size 4; gate_lower_bound -5.0.",
+  "total_bytes": 7045632,
+  "tensors": [
+    {
+      "short_name": "b_proj_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.b_proj.weight",
+      "file": "b_proj_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        64,
+        4096
+      ],
+      "byte_size": 524288,
+      "sha256": "70839d19b1443bbb87dbcd6b067137505306bd58060b82bf4e17f430c4b90320",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        53734960,
+        54259248
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "f_a_proj_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.f_a_proj.weight",
+      "file": "f_a_proj_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        128,
+        4096
+      ],
+      "byte_size": 1048576,
+      "sha256": "c6e74274834dbee17fab44cd6e860bad62ea5cd6234d25f1a7dad09bfe30c52c",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        54259248,
+        55307824
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "f_b_proj_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.f_b_proj.weight",
+      "file": "f_b_proj_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        8192,
+        128
+      ],
+      "byte_size": 2097152,
+      "sha256": "b6203a3b332479c8579403d766019f17d1438883dceaee39ebe3e0cfd7e971a5",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        55307824,
+        57404976
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "g_a_proj_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.g_a_proj.weight",
+      "file": "g_a_proj_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        128,
+        4096
+      ],
+      "byte_size": 1048576,
+      "sha256": "3ff5bafd3dfdc893becb3fd07a111582e62cc49e6b317e496b90cdfc4cfe5128",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        57404976,
+        58453552
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "g_b_proj_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.g_b_proj.weight",
+      "file": "g_b_proj_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        8192,
+        128
+      ],
+      "byte_size": 2097152,
+      "sha256": "098ca2d431e84e8c43cec05a217b90d2c38069578707a95517daf93a61abbe82",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        58453552,
+        60550704
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "q_conv1d_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.q_conv1d.weight",
+      "file": "q_conv1d_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        8192,
+        1,
+        4
+      ],
+      "byte_size": 65536,
+      "sha256": "714fbd54ce53f7ef926b4c26bb67b22bee38758862625a46f4af0db05f9f4381",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        194834224,
+        194899760
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "k_conv1d_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.k_conv1d.weight",
+      "file": "k_conv1d_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        8192,
+        1,
+        4
+      ],
+      "byte_size": 65536,
+      "sha256": "81a666b5a7f4a6211101de40cab8dd69841d967143e0426fa7fcd1d092a4f528",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        60550704,
+        60616240
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "v_conv1d_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.v_conv1d.weight",
+      "file": "v_conv1d_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        8192,
+        1,
+        4
+      ],
+      "byte_size": 65536,
+      "sha256": "c3d2ce7063c7bfddc66bbcd4707ab0e1884f5c48a863534f8ebd10fa6496746c",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        262008624,
+        262074160
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "A_log",
+      "hf_name": "model.language_model.layers.0.self_attn.A_log",
+      "file": "A_log.bin",
+      "dtype": "F32",
+      "shape": [
+        64
+      ],
+      "byte_size": 256,
+      "sha256": "07f6daa6804ea4747f3e0e5804b6aead1d1161aaab22d44a58e37beb6bbcb797",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        1164632,
+        1164888
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "dt_bias",
+      "hf_name": "model.language_model.layers.0.self_attn.dt_bias",
+      "file": "dt_bias.bin",
+      "dtype": "F32",
+      "shape": [
+        8192
+      ],
+      "byte_size": 32768,
+      "sha256": "6acb4588a9ec1c2f8e936c4b003860adbdc09aebf9f015114f4f9888473ddb64",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        1164888,
+        1197656
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    },
+    {
+      "short_name": "o_norm_weight",
+      "hf_name": "model.language_model.layers.0.self_attn.o_norm.weight",
+      "file": "o_norm_weight.bin",
+      "dtype": "BF16",
+      "shape": [
+        128
+      ],
+      "byte_size": 256,
+      "sha256": "5827105a7348f193adb1a267f88f5451488b97a34fe9663e350c1f2585c9ded0",
+      "shard": "model-00002-of-00062.safetensors",
+      "data_offsets": [
+        127725104,
+        127725360
+      ],
+      "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0"
+    }
+  ]
+}

@@ -19,6 +19,10 @@ static inline bool kv_bv_needs_dequant(const AttentionLayerWeights& w) {
     return w.kv_b_proj_is_fp8 || w.kv_b_is_gguf;
 }
 
+bool KvBvDequantPool::needs_dequant(const AttentionLayerWeights& w) {
+    return kv_bv_needs_dequant(w);
+}
+
 // ── Constructor / Destructor ────────────────────────────────────────────────
 
 KvBvDequantPool::KvBvDequantPool(Options opts) : opts_(std::move(opts)) {
@@ -63,9 +67,18 @@ KvBvDequantPool::KvBvDequantPool(Options opts) : opts_(std::move(opts)) {
         }
     }
 
-    spdlog::info("KvBvDequantPool: {} slots x {} ranks, {} MB each",
-                 opts_.num_slots, opts_.dcp_size,
-                 slot_bytes_ / (1024 * 1024));
+    if (opts_.num_slots == 0) {
+        // P-29 step 21 (TD-KVBV-DEQUANT-POOL-INERT-GLM5N): sized to zero by
+        // DcpExecutor because no layer's kv_b_proj is FP8/GGUF-packed —
+        // acquire() is always BF16-direct; no device buffers are held.
+        spdlog::info("KvBvDequantPool: 0 slots (all kv_b_proj BF16-direct) — "
+                     "{} MB/rank reclaimed vs the 5-slot carve",
+                     5 * slot_bytes_ / (1024 * 1024));
+    } else {
+        spdlog::info("KvBvDequantPool: {} slots x {} ranks, {} MB each",
+                     opts_.num_slots, opts_.dcp_size,
+                     slot_bytes_ / (1024 * 1024));
+    }
 }
 
 KvBvDequantPool::~KvBvDequantPool() {
@@ -155,6 +168,21 @@ void KvBvDequantPool::prime(int layer_idx,
         return;
     }
 
+    // P-29 step 21: a zero-slot (inert) pool has nothing to prime. A weight
+    // that needs dequant reaching a zero-slot pool is a sizing bug — fail
+    // loudly rather than serve garbage.
+    if (layer_idx >= static_cast<int>(slots_.size())) {
+        if (kv_bv_needs_dequant(*weights_by_rank[0])) {
+            throw std::runtime_error(
+                "KvBvDequantPool::prime: layer " + std::to_string(layer_idx)
+                + " needs dequant but the pool was sized to "
+                + std::to_string(slots_.size())
+                + " slot(s) — DcpExecutor::set_layer_weights mis-sized the "
+                  "pool (TD-KVBV-DEQUANT-POOL-INERT-GLM5N)");
+        }
+        return;
+    }
+
     auto& slot = slots_[layer_idx];
     slot.layer_idx = layer_idx;
 
@@ -172,6 +200,9 @@ void KvBvDequantPool::prime(int layer_idx,
         attn->device_sync();  // Synchronous for init.
     }
     slot.state = SlotState::kReady;
+    // Synchronous + device_sync: every rank is dequanted and globally ordered.
+    slot.launched_ranks = slot.synced_ranks =
+        (opts_.dcp_size >= 32) ? ~0u : ((1u << opts_.dcp_size) - 1u);
 }
 
 // ── Schedule predictive dequant ─────────────────────────────────────────────
@@ -192,6 +223,12 @@ void KvBvDequantPool::schedule_dequant(
     auto& slot = slots_[slot_idx];
     slot.layer_idx = layer_idx;
     slot.state = SlotState::kDequanting;
+    // All ranks are launched below on their kAsyncDequant streams; no
+    // consumer stream is ordered after them yet (acquire() inserts the
+    // per-rank stream_wait_event).
+    slot.launched_ranks =
+        (opts_.dcp_size >= 32) ? ~0u : ((1u << opts_.dcp_size) - 1u);
+    slot.synced_ranks = 0;
 
     for (int r = 0; r < opts_.dcp_size; ++r) {
         auto* attn = opts_.attention_devices[r];
@@ -243,25 +280,43 @@ KvBvDequantPool::AcquireResult KvBvDequantPool::acquire(
     // FP8 or GGUF weight: check for existing slot.
     int slot_idx = find_slot(layer_idx);
 
+    const uint32_t rank_bit = 1u << rank;
+    const uint32_t all_ranks =
+        (opts_.dcp_size >= 32) ? ~0u : ((1u << opts_.dcp_size) - 1u);
+
     if (slot_idx >= 0) {
+        // P-29 step 21 (TD-KVBV-DEQUANT-POOL-INERT-GLM5N latent bug fix):
+        // readiness is PER RANK, not per slot. The old code (a) marked the
+        // slot kReady after the synchronous fallback dequanted only the
+        // acquiring rank — every other rank then received its buffer with
+        // the PREVIOUS layer's weights still in it; and (b) let the first
+        // acquiring rank's event wait flip kDequanting→kReady, so later
+        // ranks skipped the stream_wait_event on their OWN async dequant.
         auto& slot = slots_[slot_idx];
-        if (slot.state == SlotState::kReady) {
-            return {slot.buffers[rank],
-                    static_cast<int64_t>(V) * D_c,  // contiguous
-                    false};
-        }
-        if (slot.state == SlotState::kDequanting) {
-            // Wait for async dequant to complete on attention stream.
+        if (!(slot.launched_ranks & rank_bit)) {
+            // This rank was never dequanted (sync-fallback slot): dequant it
+            // now, synchronously on its consumer stream.
+            launch_dequant_rank(slot_idx, rank, weights, attn_stream);
+            slot.launched_ranks |= rank_bit;
+            slot.synced_ranks |= rank_bit;
+        } else if (!(slot.synced_ranks & rank_bit)) {
+            // Async dequant launched on this rank's kAsyncDequant stream:
+            // order this rank's consumer stream after ITS event.
             if (opts_.stream_manager && slot.events[rank]) {
                 int gpu_pos = opts_.attention_devices[rank]->gpu().position;
                 opts_.stream_manager->wait_event(
                     gpu_pos, compute::StreamId::kAttention, slot.events[rank]);
             }
-            slot.state = SlotState::kReady;
-            return {slot.buffers[rank],
-                    static_cast<int64_t>(V) * D_c,
-                    false};
+            slot.synced_ranks |= rank_bit;
         }
+        // Evictable (kReady) only once every rank is launched AND ordered.
+        slot.state = ((slot.launched_ranks & all_ranks) == all_ranks
+                      && (slot.synced_ranks & all_ranks) == all_ranks)
+                         ? SlotState::kReady
+                         : SlotState::kDequanting;
+        return {slot.buffers[rank],
+                static_cast<int64_t>(V) * D_c,  // contiguous
+                false};
     }
 
     // No slot — synchronous dequant on attention stream.
@@ -269,13 +324,22 @@ KvBvDequantPool::AcquireResult KvBvDequantPool::acquire(
     if (slot_idx < 0) {
         throw std::runtime_error(
             "KvBvDequantPool: no evictable slot for layer " +
-            std::to_string(layer_idx));
+            std::to_string(layer_idx) + " (pool has "
+            + std::to_string(slots_.size())
+            + " slot(s); 0 means DcpExecutor sized the pool inert for an "
+              "all-BF16 kv_b model — a dequant-needing weight here is a "
+              "sizing bug, TD-KVBV-DEQUANT-POOL-INERT-GLM5N)");
     }
 
     auto& slot = slots_[slot_idx];
     slot.layer_idx = layer_idx;
     launch_dequant_rank(slot_idx, rank, weights, attn_stream);
-    slot.state = SlotState::kReady;
+    // Only THIS rank is dequanted; other ranks dequant on their own
+    // acquire() (see above). kReady only when every rank is covered.
+    slot.launched_ranks = rank_bit;
+    slot.synced_ranks = rank_bit;
+    slot.state = (rank_bit == all_ranks) ? SlotState::kReady
+                                         : SlotState::kDequanting;
 
     return {slot.buffers[rank],
             static_cast<int64_t>(V) * D_c,

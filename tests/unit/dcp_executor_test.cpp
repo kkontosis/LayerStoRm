@@ -310,10 +310,18 @@ static lp::DcpExecutor::Options executor_opts(int dcp_size) {
 static std::vector<std::vector<lp::AttentionLayerWeights>>
         fake_attn_weights_storage;  // kept alive for test duration
 
-static void init_dequant_pool(lp::DcpExecutor& exec, int dcp_size,
-                               int num_layers = 6) {
+/// mutate: optional per-weight tweak (e.g. kv_b_is_gguf) so the pool is sized
+/// for the weights the test will actually execute with — set_layer_weights
+/// sizes the dequant pool to 0 slots when no weight needs a dequant slot
+/// (P-29 step 21, TD-KVBV-DEQUANT-POOL-INERT-GLM5N).
+static void init_dequant_pool(
+        lp::DcpExecutor& exec, int dcp_size, int num_layers = 6,
+        const std::function<void(lp::AttentionLayerWeights&)>& mutate = {}) {
     fake_attn_weights_storage.assign(
         num_layers, std::vector<lp::AttentionLayerWeights>(dcp_size));
+    if (mutate)
+        for (auto& per_rank : fake_attn_weights_storage)
+            for (auto& w : per_rank) mutate(w);
     std::vector<std::vector<const lp::AttentionLayerWeights*>> ptrs(num_layers);
     for (int l = 0; l < num_layers; ++l)
         for (int r = 0; r < dcp_size; ++r)
@@ -666,21 +674,25 @@ TEST(DcpExecutor, GgufRoutingIntDecodeUsesMmvq) {
 }
 
 TEST(DcpExecutor, GgufRoutingIntPrefillUsesMmq) {
-    // int strategy, M > 8 (prefill) → all four projections go through gguf_mmq.
+    // int strategy, M ABOVE the mmvq/mmq crossover (prefill) → all four
+    // projections go through gguf_mmq.  The crossover is 32 by default since
+    // 2026-08-17 (TD-CHUNK-SMALLM-DEFAULT: speculative-verify chunk shapes
+    // M=9..32 are faster on mmvq), so a prefill-shaped M must exceed 32 —
+    // the old M=12 now legitimately routes to mmvq.
     using GT = layerstorm::model::GgufKQuantType;
     std::vector<std::string> log;
 
     auto opts = executor_opts(1);
     opts.gguf_active = true;
     opts.gguf_strategy = layerstorm::config::GgufStrategy::int_strategy;
-    opts.max_batch_size = 16;  // allow batch > 8
+    opts.max_batch_size = 64;  // allow batch > the crossover
     RecordingBackends rec(1, log);
     rec.apply(opts);
 
     auto exec = lp::DcpExecutor(opts);
     init_dequant_pool(exec, exec.dcp_size());
 
-    TestExecParamsBuilder builder(1, /*batch=*/12);  // M=12 > 8 → prefill
+    TestExecParamsBuilder builder(1, /*batch=*/40);  // M=40 > 32 → prefill
     set_gguf_projections(builder.weights_data,
                          GT::Q4_K, GT::Q4_K, GT::Q4_K, GT::Q4_K);
     log.clear();
@@ -770,7 +782,10 @@ TEST(DcpExecutor, GgufKvBAbsorbGuardThrowsOnBadShape) {
     rec.apply(opts);
 
     auto exec = lp::DcpExecutor(opts);
-    init_dequant_pool(exec, exec.dcp_size());
+    init_dequant_pool(exec, exec.dcp_size(), 6, [](lp::AttentionLayerWeights& w) {
+        w.kv_b_is_gguf = true;
+        w.kv_b_gguf_type = GT::Q4_K;
+    });
 
     TestExecParamsBuilder builder(1, /*batch=*/2);
     for (auto& w : builder.weights_data) {
@@ -794,7 +809,10 @@ TEST(DcpExecutor, GgufKvBAbsorbGuardAcceptsDivisibleShape) {
     rec.apply(opts);
 
     auto exec = lp::DcpExecutor(opts);
-    init_dequant_pool(exec, exec.dcp_size());
+    init_dequant_pool(exec, exec.dcp_size(), 6, [](lp::AttentionLayerWeights& w) {
+        w.kv_b_is_gguf = true;
+        w.kv_b_gguf_type = GT::Q8_0;
+    });
 
     TestExecParamsBuilder builder(1, /*batch=*/2);
     for (auto& w : builder.weights_data) {
@@ -1129,7 +1147,16 @@ static void run_sparse_chunk_prefill_case(bool gate_on,
 
     auto params = builder.build(/*use_graph=*/false);
     // Blessed chunk: 3 consecutive positions starting at token_pos 4 —
-    // per-row prefixes {5, 6, 7} (arena storage: no indexer_k_pages).
+    // per-row prefixes {5, 6, 7}. Paged storage is the ONLY key storage
+    // (S4 deleted the executor arena): host page table with one PT=8 page
+    // covering [0, 7) on layer 0 (the computing layer). Fake device
+    // pointers — never dereferenced (recorder kernels are no-ops).
+    constexpr int kPageStride = 1;
+    static std::vector<const void*> table(3 * kPageStride);
+    for (size_t s = 0; s < table.size(); ++s)
+        table[s] = reinterpret_cast<const void*>(0x1000 + s * 0x10);
+    static std::vector<const void* const*> table_bases(1);
+    table_bases[0] = table.data();
     std::vector<int> host_seqlens{5, 6, 7};
     params.host_seqlens_k = host_seqlens.data();
     params.chunk_start = 4;
@@ -1137,6 +1164,10 @@ static void run_sparse_chunk_prefill_case(bool gate_on,
     params.max_seqlen_k = 7;
     params.indexer_step_key = 0xC0FFEE;
     params.indexer_prefill_append = true;
+    params.indexer_k_pages = table_bases.data();
+    params.indexer_k_page_stride = kPageStride;
+    params.indexer_k_batch_stride = kPageStride;  // single layer row
+    params.indexer_k_page_tokens = 8;
     exec.execute_attention(params);
 }
 
@@ -1156,7 +1187,7 @@ TEST(DcpExecutor, SparseChunkPrefillGateOn) {
         if (entry.find("idx_topk(") != std::string::npos) ++topk_calls;
         if (entry.find("idx_topk_batched(") != std::string::npos)
             ++batched_calls;
-        if (entry == "idx_topk_batched(rows=3,nb=[5,6,7],qpos=[4,5,6],paged=0)")
+        if (entry == "idx_topk_batched(rows=3,nb=[5,6,7],qpos=[4,5,6],paged=1)")
             batched_rows = true;
         if (entry.find("prefill(") != std::string::npos) ++prefill_count;
         if (entry == "prefill(B=3,skv=7,sparse=1,causal=1)")
@@ -1430,6 +1461,17 @@ void run_tiered_prefill_chunk_case(FakeTieringHook& hook,
     auto params = builder.build(/*use_graph=*/false);
     std::vector<int> host_seqlens(static_cast<size_t>(batch));
     for (int b = 0; b < batch; ++b) host_seqlens[static_cast<size_t>(b)] = 5 + b;
+    // Paged indexer-K storage — the only key storage (S4): one PT=64 page
+    // per batch row on layer 0; fake pointers, never dereferenced.
+    constexpr int kPageStride = 1;
+    std::vector<const void*> table(static_cast<size_t>(batch) * kPageStride);
+    for (size_t s = 0; s < table.size(); ++s)
+        table[s] = reinterpret_cast<const void*>(0x1000 + s * 0x10);
+    std::vector<const void* const*> table_bases{table.data()};
+    params.indexer_k_pages = table_bases.data();
+    params.indexer_k_page_stride = kPageStride;
+    params.indexer_k_batch_stride = kPageStride;  // single layer row
+    params.indexer_k_page_tokens = 64;
     params.host_seqlens_k = host_seqlens.data();
     params.chunk_start = 4;
     params.chunk_len = batch;
@@ -1634,6 +1676,23 @@ TEST(DcpExecutor, ShardedSparseChunkPrefillTranslatesAndConsumesPerRow) {
     params.max_seqlen_k = 7;
     params.indexer_step_key = 0xC0FFEE;
     params.indexer_prefill_append = true;
+    // Paged indexer-K storage — the only key storage (S4). Replicated
+    // indexer under sharded KV: each rank's table holds its replica; one
+    // PT=64 page per batch row on layer 0 (fake pointers, recorder no-ops).
+    constexpr int kIdxPageStride = 1;
+    std::vector<std::vector<const void*>> idx_tables(2);
+    std::vector<const void* const*> idx_table_bases(2);
+    for (int r = 0; r < 2; ++r) {
+        idx_tables[r].resize(3 * kIdxPageStride);
+        for (size_t s = 0; s < idx_tables[r].size(); ++s)
+            idx_tables[r][s] = reinterpret_cast<const void*>(
+                0x1000 + r * 0x100 + s * 0x10);
+        idx_table_bases[r] = idx_tables[r].data();
+    }
+    params.indexer_k_pages = idx_table_bases.data();
+    params.indexer_k_page_stride = kIdxPageStride;
+    params.indexer_k_batch_stride = kIdxPageStride;  // single layer row
+    params.indexer_k_page_tokens = 64;
     FakeTieringHook hook;   // all rows resident: real-bt per-row consumption
     params.kv_tiering = &hook;
     log.clear();

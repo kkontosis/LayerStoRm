@@ -556,7 +556,10 @@ void CommandDispatcher::ensure_loader_stats_boards() {
     loader_stats_boards_built_ = true;  // build-once (also on the no-config path)
     if (!deps_.live_config) return;     // cannot size → leave inert
     const auto& m = deps_.live_config->model;
-    const int num_layers = m.num_hidden_layers > 0 ? m.num_hidden_layers : 0;
+    // P-29 step 13 phase B: moe_layer_bound covers armed MTP/NextN layers
+    // (glm5_next flag-on: 46) so layer 45 gets a real flat expert id in
+    // the shadow-solve boards. Flag off: == num_hidden_layers.
+    const int num_layers = m.num_hidden_layers > 0 ? moe_layer_bound(m) : 0;
     const int experts_per_layer = m.n_routed_experts > 0 ? m.n_routed_experts : 0;
     const int first_moe = m.first_k_dense_replace > 0 ? m.first_k_dense_replace : 0;
     const int M = static_cast<int>(deps_.device_backends.size());
@@ -573,11 +576,20 @@ void CommandDispatcher::ensure_loader_stats_boards() {
     const int flat_experts =
         static_cast<int>(loader_num_moe_layers_) * experts_per_layer;
     place_table_.emplace(flat_experts, M);
-    // cap_per_gpu: a GPU's stable-zone resident count is the natural cap; use the
-    // expert-cache stable slot count when available, else a generous default.
+    // cap_per_gpu: a GPU's stable-zone resident count is the natural sizing;
+    // use the LARGEST per-GPU stable slot count when available, else a
+    // generous default. This is a reserve HINT ONLY — EvictScoreBoard's
+    // alloc_slot grows past it — so it needs no live republish when 44z
+    // elastic grants change total_slots at runtime, and MEMBERSHIP is
+    // listener-driven truth regardless (TD-EVICT-BOARD-DESYNC). The caps
+    // that DO need republish are the REEF service's — handled at
+    // ensure_reef_service (TD-KVXP-CAPACITY-REPUBLISH).
     int cap = 1024;
     if (deps_.expert_cache && M > 0) {
-        int s = deps_.expert_cache->total_slots(0, memory::CacheZone::kStable);
+        int s = 0;
+        for (int g = 0; g < M; ++g)
+            s = std::max(s, deps_.expert_cache->total_slots(
+                                g, memory::CacheZone::kStable));
         if (s > 0) cap = s;
     }
     evict_board_.emplace(M, cap);

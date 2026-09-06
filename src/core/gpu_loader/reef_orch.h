@@ -87,9 +87,10 @@ struct ReefOrch {
     LoaderConstants K;
     LoaderSolver solver;
     // Large unions (> kMaxExperts: batched-verify / prompt-prefill chunks):
-    // the 256-bound instantiation. Unions <= 64 keep the frozen production
-    // solver (decode byte-identity); beyond kMaxExpertsLarge callers fail
-    // loud before route.
+    // the kMaxExpertsLarge-bound instantiation (320 since GF3.3 — GLM-5.3's
+    // 288-expert layers exceed the old 256). Unions <= 64 keep the frozen
+    // production solver (decode byte-identity); beyond kMaxExpertsLarge
+    // callers fail loud before route.
     LoaderSolver256 solver_big;
     EvictScoreBoard board;
     SolveRequest req;  // persistent scratch
@@ -99,6 +100,33 @@ struct ReefOrch {
     // Landed REEF policy defaults (mirror dispatch_loader's env defaults).
     double freq_w = 60.0, freq_mult = 0.9048374180359595;  // exp(-0.1)
     double reuse_w = 2000.0, reuse_tau = 300.0;
+    // ── TD-MOE-PLACEMENT-CAPACITY-CAP: per-layer route capacity caps ──
+    // route_cap[pos] >= 0 caps how many experts ONE route (one layer's
+    // solve) may assign to GPU position `pos`. Meant for positions whose
+    // share cannot be wave-streamed through the cache: EP-XTP (expert-only,
+    // non-DCP) ranks are excluded from wave passes (TD-MOE-EP-XTP-WAVES) —
+    // their arrived experts hold stable slots until finalize, so a single
+    // layer's whole share must fit the stable zone SIMULTANEOUSLY. Cap
+    // value = the MEASURED stable-zone slot count (the same number as
+    // `cap[pos]`), never a tuned constant. -1 (or pos beyond the vector)
+    // = uncapped: wave-capable DCP ranks stream over-capacity shares
+    // (INV-FAR-WAVE rolling waves) and must NOT be capped. Empty (default)
+    // = legacy path, byte-identical solve output.
+    // Enforcement is a POST-SOLVE repair in reef_orch_route (the frozen
+    // production solver is untouched): overflow experts on a capped device
+    // are re-homed one at a time — resident hits keep their device (they
+    // already hold a slot; only misses move) — onto the device with
+    // headroom that minimizes the solver's full evaluate() objective
+    // (deterministic lowest-index tie-break). If no destination has
+    // headroom the residual overflow is left in place (counted below;
+    // the serving-level degraded retry remains the safety net).
+    // NOTE: route_cap is part of the decision-stream identity contract
+    // (TD-BRIDGE-CPP-GAP): two consumers compare byte-identical only when
+    // they install identical caps.
+    std::vector<int> route_cap;
+    uint64_t route_cap_moves = 0;     // experts re-homed by the cap repair
+    uint64_t route_cap_residual = 0;  // overflow left unrepairable (no headroom)
+    std::vector<int> route_scratch;   // per-route device-index scratch (persistent)
     // EPM-0 keeppred (LS_LOADER_KEEPPRED_W; default 0 = OFF). Retention bias
     // on eviction victim selection: keeppred_union[L] = experts routed at
     // layer L the previous time L was visited (the free prev-round-union
@@ -132,6 +160,8 @@ struct ReefOrch {
 /// SolveRequest (hits pinned to their resident device, reuse place reward,
 /// bank_of via bank_node_fn) → exact solve (64) / bounded greedy (256).
 /// Fills assign[i] (size >= topk.size()) with the target GPU position.
+/// route_cap (when installed) is enforced by a post-solve repair — see the
+/// ReefOrch::route_cap field docs (TD-MOE-PLACEMENT-CAPACITY-CAP).
 void reef_orch_route(ReefOrch& o, int layer,
                      const std::vector<uint16_t>& topk,
                      std::vector<uint8_t>& assign);
@@ -146,6 +176,27 @@ void reef_orch_apply(ReefOrch& o, int layer, const ReefEntry* entries,
                      ReefVictim* evicts, uint32_t count,
                      const std::vector<uint8_t>* stream_mask = nullptr,
                      int64_t cur_step = -1);
+
+/// TD-KVXP-CAPACITY-REPUBLISH: refresh the per-GPU stable-capacity caps of a
+/// LIVE ReefOrch between solves (44z elastic grants/reclaims change
+/// total_slots(kStable) at runtime; a boot-latched cap goes stale on every
+/// one). `new_caps.size()` must equal `o.cap.size()` (logged + ignored
+/// otherwise — a wrong-shaped refresh must never corrupt the model).
+/// Re-arms `route_cap` from the refreshed caps on exactly the positions in
+/// `xtp_positions` IFF route caps are currently armed (`route_cap`
+/// non-empty); a disarmed route_cap (LS_REEF_ROUTE_CAP=0 diagnostic, or no
+/// XTP ranks) stays disarmed. Board capacity is a reserve hint that grows on
+/// demand, so it needs no resize. When the decision dump is armed, emits a
+/// `C <solve_count> <cap0> ... <capN-1>` line so the offline replay
+/// (tools/reef_sim) can apply the same refresh at the same point in the
+/// stream. Caller contract: invoke only BETWEEN solves (both production
+/// consumers are single-threaded, so any per-command seam qualifies).
+/// Decision-stream identity (TD-BRIDGE-CPP-GAP): two consumers stay
+/// byte-identical only when they apply identical refreshes at identical
+/// solve counts — with the 44z rebalancer OFF the elastic generation never
+/// changes and this is never called.
+void reef_orch_refresh_caps(ReefOrch& o, const std::vector<int>& new_caps,
+                            const std::vector<int>& xtp_positions);
 
 /// INV-REEF-BANK (2026-08-23, TD-BRIDGE-CPP-GAP Q1 flip): install the ONE
 /// shared paired-bank-input seam used by BOTH consumers (the daemon REEF

@@ -18,6 +18,7 @@
 #include "model/quantization/gguf_kquant.h"
 #include "sm120/gemm/nvfp4/nvfp4_gemm.h"
 #include "compute/kernels/attention/dcp_attention_wrapper.h"
+#include "compute/kernels/sm120/indexer/indexer_decode_bounds.h"  // P-29 step 7 kIndexer span
 #include "compute/stream_manager.h"
 #include "daemon/buffer_registry.h"
 #include "daemon/kv_shard_math.h"  // round-robin ownership math (local indexer)
@@ -27,6 +28,7 @@
 #include "daemon/attention/arch_mla.h"
 #include "daemon/kv_tiering_manager.h"  // GLM-25k KV tiering (P2 hook move)
 
+#include <atomic>   // S4: throttled contract-violation logs (paged indexer)
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -53,6 +55,15 @@ void DcpExecutor::execute_common_prefix(const AttentionExecParams& params) {
         attn->set_device();
         void* stream = attn_streams_[r];
         const auto& w = *params.weights[r];
+
+        // P-29 step 7 (INV-0.6(b) span graph): the whole common prefix is a
+        // fixed-shape single-stream span at B == 1 — every grid depends on
+        // (B, dims) only; positions flow through DEVICE-read seqlens
+        // (absorb_q / rope_rotate) and the k_append destination through the
+        // DEVICE slot_mapping whose content the per-command kv-meta H2D
+        // refreshes. Wrapped in a lambda so the eager path stays
+        // byte-for-byte when disabled.
+        auto emit_prefix = [&] {
 
         // input_layernorm(hidden_states) → normed_hidden [REPLICATED]
         attn->rmsnorm(normed_hidden_[r], params.hidden_states[r], w.input_layernorm,
@@ -168,23 +179,32 @@ void DcpExecutor::execute_common_prefix(const AttentionExecParams& params) {
             // IS global. Requires the uploaded cos/sin table and per-seq
             // lengths; without either, the rope half passes through
             // unrotated (legacy behavior).
-            const int* seqlens = params.global_seqlens_k
-                ? params.global_seqlens_k[r]
-                : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
-            if (rope_cos_sin_[r] && seqlens) {
-                qa.apply_rope = true;
-                qa.seqlens_k  = seqlens;
-                qa.cos_sin    = rope_cos_sin_[r];
-                qa.max_pos    = opts_.rope_max_pos;
-            } else {
-                // Silent-skip would mean position-incorrect attention — surface it.
-                static std::once_flag rope_off_logged;
-                std::call_once(rope_off_logged, [&] {
-                    spdlog::warn("DcpExecutor: RoPE SKIPPED (cos_sin {}, seqlens "
-                                 "{}) — attention runs without positions",
-                                 rope_cos_sin_[r] ? "ok" : "missing",
-                                 seqlens ? "ok" : "missing");
-                });
+            // GF3.9 (NoPE, deferred from GF3.4): at qk_rope_head_dim == 0
+            // there IS no rope half — skipping is the correct geometry, not
+            // a missing-table condition, so neither apply_rope nor the
+            // "RoPE SKIPPED" once-warn may engage (the warn would mislabel
+            // glm5_next NoPE as position-incorrect attention).
+            if (opts_.qk_rope_head_dim > 0) {
+                const int* seqlens = params.global_seqlens_k
+                    ? params.global_seqlens_k[r]
+                    : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
+                if (rope_cos_sin_[r] && seqlens) {
+                    qa.apply_rope = true;
+                    qa.seqlens_k  = seqlens;
+                    qa.cos_sin    = rope_cos_sin_[r];
+                    qa.max_pos    = opts_.rope_max_pos;
+                } else {
+                    // Silent-skip would mean position-incorrect attention —
+                    // surface it.
+                    static std::once_flag rope_off_logged;
+                    std::call_once(rope_off_logged, [&] {
+                        spdlog::warn("DcpExecutor: RoPE SKIPPED (cos_sin {}, "
+                                     "seqlens {}) — attention runs without "
+                                     "positions",
+                                     rope_cos_sin_[r] ? "ok" : "missing",
+                                     seqlens ? "ok" : "missing");
+                    });
+                }
             }
             attn->absorb_q(qa, stream);
         }
@@ -242,9 +262,16 @@ void DcpExecutor::execute_common_prefix(const AttentionExecParams& params) {
         // Step 6: fused_k_append(c_kv, k_pe) → paged KV cache [DCP-LOCAL]
         if (params.slot_mappings && params.kv_cache_ptrs) {
             // kv_compressed layout: [B, kv_lora_rank + qk_rope] BF16
+            // GF3.9 (NoPE, deferred from GF3.4): at qk_rope_head_dim == 0 the
+            // rope block does not exist — kv_lora_rank*2 would form a one-
+            // past-end pointer into row 0. k_append is runtime-d_rope-clean
+            // at nullptr (GF3.4 audit), so pass nullptr instead of a
+            // formed-but-never-dereferenced edge pointer.
             const void* c_kv = kv_compressed_[r];
-            void* k_rope = static_cast<char*>(kv_compressed_[r]) +
-                static_cast<size_t>(opts_.kv_lora_rank) * 2;  // BF16 = 2 bytes
+            void* k_rope = opts_.qk_rope_head_dim > 0
+                ? static_cast<char*>(kv_compressed_[r]) +
+                    static_cast<size_t>(opts_.kv_lora_rank) * 2  // BF16
+                : nullptr;
 
             // Step 5b (TD-ROPE): rotate k_pe in place by its token position before
             // the cache write — the cache stores ROTATED rope (SnapMLA paper Eq. 2;
@@ -253,7 +280,10 @@ void DcpExecutor::execute_common_prefix(const AttentionExecParams& params) {
             const int* seqlens = params.global_seqlens_k
                 ? params.global_seqlens_k[r]
                 : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
-            if (rope_cos_sin_[r] && seqlens) {
+            // GF3.9 (NoPE): guard on the GEOMETRY (d_rope > 0), not just on
+            // whether a cos/sin table happens to be uploaded — a stray table
+            // at rope dim 0 must not launch a zero-width rotate.
+            if (opts_.qk_rope_head_dim > 0 && rope_cos_sin_[r] && seqlens) {
                 compute::RopeRotateParams rr{};
                 rr.x              = k_rope;
                 rr.seqlens_k      = seqlens;
@@ -279,6 +309,62 @@ void DcpExecutor::execute_common_prefix(const AttentionExecParams& params) {
                 params.page_size,
                 params.layer_idx, stream);
         }
+        };  // emit_prefix
+
+        // Span-graph the B == 1 shape only (decode and 1-row chunks emit the
+        // identical launch sequence; B > 1 chunk shapes vary per chunk and
+        // would churn the variant cache). Fingerprint everything baked into
+        // the launches; per-token variation is device-buffer CONTENT.
+        // GGUF-dequant is NOT graph-eligible (INV-0.6a: host-loop syncs
+        // mid-sequence) — spans stay eager under that strategy.
+        if (span_graphs_.enabled() && B == 1
+            && opts_.gguf_strategy != config::GgufStrategy::dequant) {
+            const int* seqlens_fp = params.global_seqlens_k
+                ? params.global_seqlens_k[r]
+                : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
+            compute::DecodeSpanGraphs::Fp fp;
+            fp.add(params.hidden_states[r]);
+            fp.add(normed_hidden_[r]);
+            fp.add(fp8_hidden_[r]);
+            fp.add(q_compressed_[r]);
+            fp.add(fp8_q_compressed_[r]);
+            fp.add(q_heads_[r]);
+            fp.add(q_absorbed_[r]);
+            fp.add(kv_compressed_[r]);
+            fp.add(gemm_workspace_[r]);
+            fp.add(rope_cos_sin_[r]);
+            fp.add(seqlens_fp);
+            fp.add(params.slot_mappings ? params.slot_mappings[r] : nullptr);
+            fp.add(params.kv_cache_ptrs ? params.kv_cache_ptrs[r] : nullptr);
+            fp.add(w.input_layernorm);
+            fp.add(w.q_a_proj);
+            fp.add(w.q_a_norm);
+            fp.add(w.q_b_proj);
+            fp.add(w.kv_b_proj);
+            fp.add(w.kv_a_proj);
+            fp.add(w.kv_a_norm);
+            fp.add(w.q_a_proj_scales);
+            fp.add(w.q_b_proj_scales);
+            fp.add(w.kv_a_proj_scales);
+            fp.add(w.kv_b_proj_scales);
+            fp.add(r < static_cast<int>(gguf_q8_1_ws_.size())
+                       ? gguf_q8_1_ws_[r] : nullptr);
+            fp.add_s(B);
+            fp.add_s(params.cache_stride_block);
+            fp.add_s(params.cache_stride_row);
+            fp.add_s(params.page_size);
+            fp.add_s((params.slot_mappings && params.kv_cache_ptrs) ? 1 : 0);
+            span_graphs_.run(
+                stream,
+                compute::DecodeSpanGraphs::make_key(
+                    compute::DecodeSpanGraphs::kMlaPrefix,
+                    params.layer_idx,
+                    // P-29 step 13: row axis (spec-verify variants).
+                    r + 16 * (params.batch_row_offset & 7)),
+                fp, emit_prefix);
+        } else {
+            emit_prefix();
+        }
     }
 }
 
@@ -293,6 +379,7 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     const int NIH = opts_.index_n_heads;
     const int IHD = opts_.index_head_dim;
     const int ITK = opts_.index_topk;
+    const int ITKR = opts_.index_topk_rows();  // GF3.5 row stride
     const int d_rope = opts_.qk_rope_head_dim;  // indexer rope width = n_rot()
     void* stream = attn_streams_[r];
 
@@ -300,8 +387,7 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     // each ("one new token per seq per step"). TD-GLM-INDEXER-BATCH: B>1 is
     // supported when the dispatcher provisioned per-entry indexer-K page rows
     // AND per-entry host seqlens — each entry appends/scores against ITS OWN
-    // sequence's pages. The executor arena remains a B==1-only fallback (it is
-    // structurally single-sequence). TD-GLM-INDEXER-DCP (replicated mode):
+    // sequence's pages. TD-GLM-INDEXER-DCP (replicated mode):
     // dcp>=2 runs this producer ON EVERY RANK against that rank's own replica
     // storage — KV metadata is replicated across TP ranks (KD-4f-d.1b), the
     // per-rank activations are identical, so every rank derives the identical
@@ -363,7 +449,7 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     // Sparse requires DISPATCHER BLESSING: a nonzero step key proves the
     // coverage guard ran for this step (contiguous appends, pinned storage
     // mode). Without it — non-dispatcher callers, or any path that skipped
-    // provisioning — the arena/pages may hold garbage for earlier positions,
+    // provisioning — the pages may hold garbage for earlier positions,
     // so the only safe answer is dense.
     const uint64_t step_key = params.indexer_step_key;
     if (step_key == 0) return false;
@@ -383,19 +469,31 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
 
     // Storage per entry: paged (dispatcher-provisioned Pool::kIndexerK rows,
     // TD-GLM-INDEXER-PAGED/-BATCH) when the table covers [0, len_b) for this
-    // layer; the executor arena covers the B==1 case only. Only computing
-    // layers (full ∪ {layer 0}) have K storage — a shared layer with no
-    // storage and no reusable result cannot compute → dense.
+    // layer — paged storage is the ONLY key storage (S4 deleted the legacy
+    // B==1 executor arena). Only computing layers (full ∪ {layer 0}) have K
+    // storage — a shared layer with no storage and no reusable result
+    // cannot compute → dense; a COMPUTING layer of a blessed sparse row
+    // without covering rows is a dispatcher/executor contract violation
+    // (the coverage guard provisions before blessing) → ERROR + dense.
     const int PT = params.indexer_k_page_tokens;
 
     // TD-GLM-INDEXER-LOCAL-MERGE: local mode requires the dispatcher-
     // provisioned page shape at the OWNERSHIP unit this executor was built
-    // with (the local→global index math depends on it) — the executor arena
-    // is replicated-shape only, so no arena fallback exists here.
+    // with (the local→global index math depends on it).
     if (indexer_local_ && PT != opts_.indexer_k_page_tokens) return false;
 
+    // GF3.5 IndexPool: pooled entry domain. A page spans PT positions and
+    // stores E = PT/kpool entries; selection picks SELK = ITK/kpool POOLS
+    // (expanded + tail afterwards, kpool_expand). Candidate rows pack at
+    // SELK stride under pooling (CSTR == ITKR when unpooled).
+    const int P = std::max(opts_.index_kpool, 1);
+    const bool pooled = P > 1;
+    if (pooled && (PT % P != 0 || ITK % P != 0)) return false;  // validator-held
+    const int SELK = pooled ? ITK / P : ITK;
+    const int E = pooled && PT > 0 ? PT / P : PT;
+    const int CSTR = pooled ? SELK : ITKR;
+
     auto& rows = indexer_page_rows_;  // preallocated [max_batch]
-    bool all_paged = true;
     for (int b = 0; b < B; ++b) {
         if (row_dense && row_dense[b]) {  // dense row: no storage needed
             rows[b] = nullptr;
@@ -404,17 +502,18 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
         const int len_b = hseq ? hseq[b] : seqlen0;
         if (len_b < 1) return false;
         rows[b] = indexer_page_row(params, r, layer, b, len_b);
-        if (!rows[b]) all_paged = false;
-    }
-
-    int slot = -1;
-    if (!all_paged) {
-        if (indexer_local_) return false;  // paged-only (no arena in local)
-        if (B != 1) return false;  // arena is single-sequence only
-        slot = (layer < static_cast<int>(indexer_layer_slot_.size()))
-            ? indexer_layer_slot_[layer] : -1;
-        if (slot < 0) return false;
-        if (seqlen0 > indexer_cache_tokens_) return false;  // arena ceiling
+        if (!rows[b]) {
+            if (indexer_layer_computes(layer)) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 3)
+                    spdlog::error(
+                        "produce_sparse_indices: blessed sparse step has no "
+                        "covering indexer-K page row (rank {} layer {} row "
+                        "{} len {}) — provision/blessing contract violated; "
+                        "running this step DENSE", r, layer, b, len_b);
+            }
+            return false;
+        }
     }
 
     const auto& w = *params.weights[rank];
@@ -422,6 +521,16 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     // defaults to 2048, so has_dsa is true even for non-DSA GGUFs like GLM-4.7).
     if (!w.q_idx_b || !w.k_idx || !w.k_idx_norm || !w.k_idx_norm_bias || !w.weights_proj)
         return false;
+    // IndexPool: the learned compressor (gate proj [head_dim, hidden] BF16 +
+    // APE [kpool, head_dim] F32 on device) is REQUIRED — pooling has no
+    // unlearned variant (fail closed, like the validator).
+    if (pooled && (!w.indexer_compressor_wgate || !w.indexer_compressor_ape
+                   || !indexer_gate_[r]))
+        return false;
+    // glm5_next indexer k_norm eps is a hard 1e-6 (Options override); legacy
+    // keeps rms_norm_eps.
+    const float ln_eps = opts_.indexer_norm_eps > 0.0
+        ? static_cast<float>(opts_.indexer_norm_eps) : opts_.rms_norm_eps;
     auto rope = [&](void* x, int rows_per_token) {
         if (!rope_cos_sin_[r] || !seqlens || d_rope <= 0) return;
         compute::RopeRotateParams rr{};
@@ -438,6 +547,211 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
         g.C = C; g.ldc = m; g.strideC = 0; g.batch_count = 1;
         attn->batched_gemm_bf16(g, stream);
     };
+
+    // ── P-29 step 7 (INV-0.6(b) kIndexer span) ───────────────────────────
+    // B=1 pooled replicated decode: emit the whole producer chain — q/k
+    // projections, LayerNorm, Hadamard, gate proj, key append, weights,
+    // score + top-k, pool expansion — as ONE captured span per (layer,
+    // rank). Every per-token value flows through DEVICE state: the append
+    // resolves its page from the device page table + seqlens (device-
+    // indexed kpool_append), the scoring bounds are computed on device
+    // from seqlens (indexer_decode_bounds), and the batched score/top-k
+    // kernels read their per-row bound/cutoff from that slot —
+    // INV-DSA-BATCH: the batched kernels run the exact single-query device
+    // bodies, so the selection is bit-identical to the per-row loop. The
+    // page table restages eagerly only when this layer's page row content
+    // drifts (once per indexer page growth). Any missing precondition —
+    // switch off, B>1, unpooled, local indexer mode, GGUF-dequant — falls
+    // through to the legacy per-row loop below, byte-for-byte.
+    if (span_graphs_.enabled() && B == 1 && pooled && !indexer_local_
+        && !row_dense
+        && opts_.gguf_strategy != config::GgufStrategy::dequant
+        && rows[0] && hseq && E > 0 && PT > 0) {
+        const int len0 = hseq[0];
+        // Page need is TOKEN-domain — ceil(len/PT) — NOT the scoring-domain
+        // ceil(settled_entries/E): at len = k*PT + 1 the APPEND lands in
+        // page k while the settled-pool count still fits page k-1. Staging
+        // only the scoring pages handed the in-graph append an unstaged
+        // page_table[k] → IMA at the first token past a page boundary
+        // (found in vivo at 7796+397 = 8193, PT 8192 — the 2026-09-04
+        // nsys-boot crash). indexer_page_row validated rows[0] with the
+        // same token-domain need, so the row always covers this count.
+        const int need_pages = std::max(1, (len0 + PT - 1) / PT);
+        const size_t cap = static_cast<size_t>(
+            params.indexer_k_page_stride > 0 ? params.indexer_k_page_stride
+                                             : 0);
+        if (indexer_dec_ptab_dev_.empty()) {
+            indexer_dec_ptab_dev_.assign(dcp_size_, nullptr);
+            indexer_dec_bounds_dev_.assign(dcp_size_, nullptr);
+            indexer_dec_ptab_mirror_.assign(dcp_size_, {});
+            indexer_dec_ptab_cap_ = cap;
+        }
+        const bool ok = cap > 0 && indexer_dec_ptab_cap_ == cap
+            && static_cast<size_t>(need_pages) <= cap && total_layers > 0
+            && static_cast<int64_t>(need_pages) * E <= indexer_score_tokens_;
+        if (ok && !indexer_dec_ptab_dev_[r]) {
+            attn->set_device();
+            indexer_dec_ptab_dev_[r] = attn->device_alloc(
+                static_cast<size_t>(total_layers) * cap * sizeof(void*));
+            indexer_dec_bounds_dev_[r] = attn->device_alloc(2 * sizeof(int));
+            indexer_dec_ptab_mirror_[r].assign(
+                static_cast<size_t>(total_layers) * cap, nullptr);
+        }
+        if (ok && indexer_dec_ptab_dev_[r] && indexer_dec_bounds_dev_[r]) {
+            attn->set_device();
+            const void** mirror = indexer_dec_ptab_mirror_[r].data()
+                + static_cast<size_t>(layer) * cap;
+            bool drift = false;
+            for (int pg = 0; pg < need_pages && !drift; ++pg)
+                drift = mirror[pg] != rows[0][pg];
+            auto* ptab_dev = static_cast<void**>(indexer_dec_ptab_dev_[r])
+                + static_cast<size_t>(layer) * cap;
+            if (drift) {
+                for (int pg = 0; pg < need_pages; ++pg)
+                    mirror[pg] = rows[0][pg];
+                // Pageable H2D from the persistent mirror — EAGER, ahead of
+                // the span (never captured), like the kv-meta staging.
+                attn->memcpy_h2d_async(
+                    ptab_dev, mirror,
+                    static_cast<size_t>(need_pages) * sizeof(void*), stream);
+            }
+            int* bounds_dev = static_cast<int*>(indexer_dec_bounds_dev_[r]);
+            auto emit_indexer = [&] {
+                // 1/1b) q projection + rope + Hadamard (verbatim).
+                if (w.q_idx_b_is_gguf)
+                    route_gguf_gemm(attn, r, B, NIH * IHD, Q,
+                                    q_compressed_[r], w.q_idx_b,
+                                    indexer_q_[r], w.q_idx_b_gguf_type,
+                                    stream);
+                else
+                    bf16_gemm(w.q_idx_b, q_compressed_[r], indexer_q_[r],
+                              NIH * IHD, Q);
+                rope(indexer_q_[r], NIH);
+                attn->indexer_hadamard(indexer_q_[r], B * NIH, IHD, stream);
+                // 2/2c) k projection + LayerNorm + rope + raw gate (pooled:
+                // the raw key is never rotated — GF35_KPOOL_REFERENCE §1d).
+                if (w.k_idx_is_gguf)
+                    route_gguf_gemm(attn, r, B, IHD, H, normed_hidden_[r],
+                                    w.k_idx, indexer_k_[r],
+                                    w.k_idx_gguf_type, stream);
+                else
+                    bf16_gemm(w.k_idx, normed_hidden_[r], indexer_k_[r],
+                              IHD, H);
+                attn->indexer_layernorm_bias(indexer_k_[r], w.k_idx_norm,
+                                             w.k_idx_norm_bias, B, IHD,
+                                             ln_eps, stream);
+                rope(indexer_k_[r], 1);
+                bf16_gemm(w.indexer_compressor_wgate, normed_hidden_[r],
+                          indexer_gate_[r], IHD, H);
+                // 3) device-indexed append: page + in-page offset resolved
+                // from device seqlens + the staged page table at execution
+                // time — identical writes to the host-computed arm.
+                compute::IndexerKpoolAppendArgs ka{};
+                ka.k_row = indexer_k_[r];
+                ka.gate_row = indexer_gate_[r];
+                ka.ape = w.indexer_compressor_ape;
+                ka.page_base = nullptr;
+                ka.page_entries = E;
+                ka.pos_in_page = 0;
+                ka.kpool = P;
+                ka.head_dim = IHD;
+                ka.page_table = ptab_dev;
+                ka.seqlen = seqlens;
+                ka.page_tokens = PT;
+                attn->indexer_kpool_append(ka, stream);
+                // 4) weights + scale (verbatim).
+                bf16_gemm(w.weights_proj, normed_hidden_[r],
+                          indexer_weights_[r], NIH, H);
+                attn->indexer_scale_weights(
+                    indexer_weights_[r], indexer_score_proj_[r], B, NIH,
+                    1.0f / std::sqrt(static_cast<float>(IHD)
+                                     * static_cast<float>(NIH)),
+                    stream);
+                // 5) bounds on device, then ONE batched score + top-k
+                // (device-read bound/cutoff — launch-count invariant).
+                compute::launch_indexer_decode_bounds(seqlens, P,
+                                                      bounds_dev, stream);
+                compute::IndexerScoreTopkBatchedArgs ba{};
+                ba.q_all = indexer_q_[r];
+                ba.score_proj_all = indexer_score_proj_[r];
+                ba.row_num_blocks = bounds_dev;
+                ba.row_query_position = bounds_dev + 1;
+                ba.k_page_table = ptab_dev;
+                ba.page_table_stride = static_cast<int>(cap);
+                ba.page_tokens = E;
+                ba.block_endpoints = indexer_block_endpoints_[r];
+                ba.scores_scratch = indexer_scores_[r];
+                ba.scores_stride = indexer_score_tokens_;
+                ba.topk_scores_out = indexer_topk_scores_[r];
+                ba.sparse_indices_out = indexer_pool_ids_[r];
+                ba.topk_lengths_out = topk_lengths_dev_[r];
+                ba.num_rows = 1;
+                ba.max_num_blocks = need_pages * E;
+                ba.n_heads = NIH;
+                ba.head_dim = IHD;
+                ba.topk = SELK;
+                attn->indexer_score_topk_batched(ba, stream);
+                // 6) pool-id expansion (verbatim, row 0).
+                compute::IndexerKpoolExpandArgs xa{};
+                xa.pool_ids = static_cast<int*>(indexer_pool_ids_[r]);
+                xa.eff_pools = static_cast<int*>(topk_lengths_dev_[r]);
+                xa.row_seq_len = seqlens;
+                xa.indices_out = static_cast<int*>(sparse_indices_dev_[r]);
+                xa.lengths_out = static_cast<int*>(topk_lengths_dev_[r]);
+                xa.num_rows = 1; xa.kpool = P;
+                xa.pool_stride = SELK; xa.out_stride = ITKR;
+                xa.out_cols = ITKR;
+                attn->indexer_kpool_expand(xa, stream);
+            };
+            compute::DecodeSpanGraphs::Fp fp;
+            fp.add(q_compressed_[r]);
+            fp.add(normed_hidden_[r]);
+            fp.add(indexer_q_[r]);
+            fp.add(indexer_k_[r]);
+            fp.add(indexer_gate_[r]);
+            fp.add(indexer_weights_[r]);
+            fp.add(indexer_score_proj_[r]);
+            fp.add(indexer_scores_[r]);
+            fp.add(indexer_block_endpoints_[r]);
+            fp.add(indexer_pool_ids_[r]);
+            fp.add(indexer_topk_scores_[r]);
+            fp.add(sparse_indices_dev_[r]);
+            fp.add(topk_lengths_dev_[r]);
+            fp.add(ptab_dev);
+            fp.add(bounds_dev);
+            fp.add(seqlens);
+            fp.add(rope_cos_sin_[r]);
+            fp.add(w.q_idx_b);
+            fp.add(w.k_idx);
+            fp.add(w.k_idx_norm);
+            fp.add(w.k_idx_norm_bias);
+            fp.add(w.weights_proj);
+            fp.add(w.indexer_compressor_wgate);
+            fp.add(w.indexer_compressor_ape);
+            fp.add_s(need_pages);  // page growth re-captures (grid bound)
+            fp.add_s(P);
+            fp.add_s(E);
+            fp.add_s(PT);
+            fp.add_s(SELK);
+            span_graphs_.run(
+                stream,
+                compute::DecodeSpanGraphs::make_key(
+                    compute::DecodeSpanGraphs::kIndexer, layer,
+                    // P-29 step 13: row axis (spec-verify variants).
+                    r + 16 * (params.batch_row_offset & 7)),
+                fp, emit_indexer);
+            if (!indexer_dec_span_logged_) {
+                indexer_dec_span_logged_ = true;
+                spdlog::info(
+                    "DcpExecutor: B=1 decode indexer chain SPANNED — "
+                    "batched score/topk + device-indexed append "
+                    "(kIndexer, first layer {}, rank {})", layer, r);
+            }
+            if (!indexer_local_) indexer_reuse_key_[r][row_off] = step_key;
+            indexer_step_fresh_ = true;
+            return true;
+        }
+    }
 
     // 1) indexer_q = wq_b · q_a_norm_latent → [B, NIH*IHD]; RoPE the rope slice.
     if (w.q_idx_b_is_gguf)
@@ -463,13 +777,21 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
     else
         bf16_gemm(w.k_idx, normed_hidden_[r], indexer_k_[r], IHD, H);
     attn->indexer_layernorm_bias(indexer_k_[r], w.k_idx_norm, w.k_idx_norm_bias,
-                                 B, IHD, opts_.rms_norm_eps, stream);
+                                 B, IHD, ln_eps, stream);
     rope(indexer_k_[r], 1);
     // 2b) Hadamard-rotate k (single head row per token): AFTER LayerNorm +
     //     RoPE, BEFORE the FP8 quant append — the stored-K convention is the
     //     ROTATED key (ref/llama.cpp/src/models/deepseek32.cpp:281-290:
     //     Hadamard then cpy_k to the indexer KV cache).
-    attn->indexer_hadamard(indexer_k_[r], B, IHD, stream);
+    //     IndexPool: the RAW key is NEVER rotated — rotation happens on the
+    //     POOLED entry inside the compress kernel (GF35_KPOOL_REFERENCE §1d);
+    //     q (step 1b) stays rotated to match the rotated pooled entries.
+    if (!pooled) attn->indexer_hadamard(indexer_k_[r], B, IHD, stream);
+    // 2c) IndexPool: raw gate vectors — gate proj · normed_hidden → [B, IHD]
+    //     BF16, deliberately not upcast (GF35_KPOOL_REFERENCE §1b/§7).
+    if (pooled)
+        bf16_gemm(w.indexer_compressor_wgate, normed_hidden_[r],
+                  indexer_gate_[r], IHD, H);
 
     // 3) FP8-quantize each entry's key + append into ITS sequence's storage at
     //    its position (slot = seqlens_k[b] − 1: the seqlens array is the
@@ -489,24 +811,30 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
             && daemon::kvshard::owner_rank(static_cast<uint32_t>(pos_b), PT,
                                            dcp_size_) != r)
             continue;
-        void* k_dst;
-        void* s_dst;
-        int bias;
-        if (rows[b]) {
-            const int pg = pos_b / PT;
-            const int pg_slot = indexer_local_ ? pg / dcp_size_ : pg;
-            auto* base = const_cast<std::byte*>(
-                static_cast<const std::byte*>(rows[b][pg_slot]));
-            k_dst = base;                                   // FP8 rows
-            s_dst = base + static_cast<size_t>(PT) * IHD;   // F32 tail
-            bias = -1 - pg * PT;  // slot = seqlens[b]−1−page_start
-        } else {
-            k_dst = static_cast<std::byte*>(indexer_k_cache_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_ * IHD;
-            s_dst = static_cast<float*>(indexer_k_scales_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_;
-            bias = -1;
+        const int pg = pos_b / PT;
+        const int pg_slot = indexer_local_ ? pg / dcp_size_ : pg;
+        auto* base = const_cast<std::byte*>(
+            static_cast<const std::byte*>(rows[b][pg_slot]));
+        if (pooled) {
+            // IndexPool: tail stash + pool completion in one kernel (the
+            // page layout carries E entries + the in-progress-pool tail).
+            compute::IndexerKpoolAppendArgs ka{};
+            ka.k_row = static_cast<std::byte*>(indexer_k_[r])
+                + static_cast<size_t>(b) * IHD * 2;
+            ka.gate_row = static_cast<std::byte*>(indexer_gate_[r])
+                + static_cast<size_t>(b) * IHD * 2;
+            ka.ape = w.indexer_compressor_ape;
+            ka.page_base = base;
+            ka.page_entries = E;
+            ka.pos_in_page = pos_b - pg * PT;
+            ka.kpool = P;
+            ka.head_dim = IHD;
+            attn->indexer_kpool_append(ka, stream);
+            continue;
         }
+        void* k_dst = base;                                   // FP8 rows
+        void* s_dst = base + static_cast<size_t>(PT) * IHD;   // F32 tail
+        const int bias = -1 - pg * PT;  // slot = seqlens[b]−1−page_start
         attn->indexer_k_quant_append(
             static_cast<std::byte*>(indexer_k_[r])
                 + static_cast<size_t>(b) * IHD * 2,          // BF16 row b
@@ -522,8 +850,8 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
         1.0f / std::sqrt(static_cast<float>(IHD) * static_cast<float>(NIH)), stream);
 
     // 5) Per entry: score all len_b cached positions of ITS sequence (MQA
-    //    single-K, paged per-page launches in the backend or the contiguous
-    //    arena slice) then causal top-k at its position → row b of
+    //    single-K, paged per-page launches in the backend) then causal
+    //    top-k at its position → row b of
     //    sparse_indices / topk_lengths. The scores scratch is reused
     //    sequentially — all launches are stream-ordered.
     //    LOCAL MODE (TD-GLM-INDEXER-LOCAL-MERGE): score only THIS RANK's
@@ -558,47 +886,71 @@ bool DcpExecutor::produce_sparse_indices(compute::AttentionDevice* attn, int ran
             + static_cast<size_t>(b) * NIH * IHD * 2;        // BF16 row b
         sa.score_proj_all = static_cast<float*>(indexer_score_proj_[r])
             + static_cast<size_t>(b) * NIH;
-        int nb = len_b;
+        // GF3.5: the scored unit is the ENTRY — token positions (legacy) or
+        // settled pools floor(len/kpool) (IndexPool; the frontier's
+        // incomplete pool has no entry and its tokens ride the expansion
+        // tail instead). Pages hold `unit` entries.
+        const int total_entries = pooled ? len_b / P : len_b;
+        const int unit = pooled ? E : PT;
+        int nb = total_entries;
         if (indexer_local_) {
             nb = daemon::kvshard::owned_len(
-                r, static_cast<uint32_t>(len_b), PT, dcp_size_);
+                r, static_cast<uint32_t>(total_entries), unit, dcp_size_);
             sa.k_pages = rows[b];
-            sa.num_k_pages = (nb + PT - 1) / PT;
-            sa.page_tokens = PT;
+            sa.num_k_pages = (nb + unit - 1) / unit;
+            sa.page_tokens = unit;
             // Candidate outputs into the packed send buffer:
-            // [B*ITK int32 local indices][B*ITK f32 scores], row b.
+            // [B*CSTR int32 local indices][B*CSTR f32 scores], row b
+            // (CSTR = SELK under pooling — pool-id candidates).
             int* cand = static_cast<int*>(indexer_cand_send_[r]);
-            sa.sparse_indices_out = cand + static_cast<size_t>(b) * ITK;
+            sa.sparse_indices_out = cand + static_cast<size_t>(b) * CSTR;
             sa.topk_scores_scratch = reinterpret_cast<float*>(
-                cand + static_cast<size_t>(B) * ITK)
-                + static_cast<size_t>(b) * ITK;
+                cand + static_cast<size_t>(B) * CSTR)
+                + static_cast<size_t>(b) * CSTR;
             // Scratch only — the merge overwrites it with the final length.
             // (Offset by the sub-chunk row range so it never clobbers another
             // sub-chunk's persisted lengths, TD-PREFILL-SUPERCHUNK.)
             sa.topk_lengths_out = static_cast<int*>(topk_lengths_dev_[r])
                 + row_off + b;
-        } else if (rows[b]) {
-            sa.k_pages = rows[b];
-            sa.num_k_pages = (len_b + PT - 1) / PT;
-            sa.page_tokens = PT;
         } else {
-            sa.k_cache = static_cast<std::byte*>(indexer_k_cache_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_ * IHD;
-            sa.k_scales = static_cast<float*>(indexer_k_scales_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_;
+            sa.k_pages = rows[b];
+            sa.num_k_pages = (nb + unit - 1) / unit;
+            sa.page_tokens = unit;
         }
         if (!indexer_local_) {
             sa.topk_scores_scratch = indexer_topk_scores_[r];
-            sa.sparse_indices_out = static_cast<int*>(sparse_indices_dev_[r])
-                + static_cast<size_t>(b) * ITK;
+            // IndexPool: pool ids land in the pool-id scratch; the expansion
+            // below writes the token rows into sparse_indices_dev_.
+            sa.sparse_indices_out = pooled
+                ? static_cast<int*>(indexer_pool_ids_[r])
+                      + static_cast<size_t>(b) * SELK
+                : static_cast<void*>(
+                      static_cast<int*>(sparse_indices_dev_[r])
+                      + static_cast<size_t>(b) * ITKR);
             sa.topk_lengths_out = static_cast<int*>(topk_lengths_dev_[r]) + b;
         }
-        sa.block_endpoints = indexer_block_endpoints_[r];  // static iota
+        sa.block_endpoints = indexer_block_endpoints_[r];  // static strided iota
         sa.scores_scratch = indexer_scores_[r];
         sa.num_tokens = 1; sa.num_blocks = nb;
-        sa.n_heads = NIH; sa.head_dim = IHD; sa.topk = ITK;
+        sa.n_heads = NIH; sa.head_dim = IHD; sa.topk = SELK;
         sa.query_position_base = len_b - 1;  // entry b's causal cutoff
         attn->indexer_score_topk(sa, stream);
+        if (pooled && !indexer_local_) {
+            // Expand pool ids ×kpool + append the always-selected un-pooled
+            // tail; lengths_out ALIASES eff_pools (pool count → token count,
+            // kernel-sync-safe). row_seq_len is the device seqlens entry.
+            compute::IndexerKpoolExpandArgs xa{};
+            xa.pool_ids = static_cast<int*>(indexer_pool_ids_[r])
+                + static_cast<size_t>(b) * SELK;
+            xa.eff_pools = static_cast<int*>(topk_lengths_dev_[r]) + b;
+            xa.row_seq_len = seqlens + b;
+            xa.indices_out = static_cast<int*>(sparse_indices_dev_[r])
+                + static_cast<size_t>(b) * ITKR;
+            xa.lengths_out = static_cast<int*>(topk_lengths_dev_[r]) + b;
+            xa.num_rows = 1; xa.kpool = P;
+            xa.pool_stride = SELK; xa.out_stride = ITKR; xa.out_cols = ITKR;
+            attn->indexer_kpool_expand(xa, stream);
+        }
     }
     // Shared layers may now reuse this step's result. Local mode defers the
     // reuse blessing to execute_attention (post-merge): candidates alone are
@@ -645,10 +997,10 @@ const void* const* DcpExecutor::indexer_page_row(
 // position via the same seqlens array the decode producer uses), Hadamard,
 // FP8 quant-append — into the SAME storage the decode producer scores later
 // (dispatcher-provisioned Pool::kIndexerK page rows, replicated per rank
-// under dcp>=2; executor arena for a blessed single-sequence chunk). NO
-// scoring, NO sparse consumption: the chunk's own attention stays dense
-// prefill. IndexShare: only layers that OWN indexer-K storage append
-// (slot-map rule: full ∪ layer 0); shared layers store nothing → no-op.
+// under dcp>=2). NO scoring, NO sparse consumption: the chunk's own
+// attention stays dense prefill. IndexShare: only layers that OWN indexer-K
+// storage append (computes rule: full ∪ layer 0); shared layers store
+// nothing → no-op.
 //
 // Contract with the dispatcher's coverage guard: blessing (indexer_step_key
 // != 0 + indexer_prefill_append) means contiguity and storage pinning were
@@ -674,9 +1026,7 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
     if (layer < 0 || layer >= total_layers) return false;
 
     // IndexShare: shared layers own no indexer-K storage — nothing to append.
-    const int slot = (layer < static_cast<int>(indexer_layer_slot_.size()))
-        ? indexer_layer_slot_[layer] : -1;
-    if (slot < 0) return true;
+    if (!indexer_layer_computes(layer)) return true;
 
     // INV-KVS-POS: GLOBAL positions (see produce_sparse_indices note).
     const int* seqlens = params.global_seqlens_k
@@ -690,12 +1040,25 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
     // Same weight-presence gate as the decode producer's K side.
     if (!w.k_idx || !w.k_idx_norm || !w.k_idx_norm_bias) return false;
 
-    // Storage per row (same resolution as the decode producer): page rows
-    // when provisioned, else the executor arena (the dispatcher blesses the
-    // arena only for a single-sequence chunk — the arena is structurally
-    // single-sequence).
-    // TD-GLM-INDEXER-LOCAL-MERGE: local mode is paged-only at the executor's
-    // ownership unit (no arena — replicated shape).
+    // GF3.5 IndexPool constants (see produce_sparse_indices).
+    const int P = std::max(opts_.index_kpool, 1);
+    const bool pooled = P > 1;
+    if (pooled && (!w.indexer_compressor_wgate || !w.indexer_compressor_ape
+                   || !indexer_gate_[r]))
+        return false;
+    const float ln_eps = opts_.indexer_norm_eps > 0.0
+        ? static_cast<float>(opts_.indexer_norm_eps) : opts_.rms_norm_eps;
+    // A mid-pool chunk START is legal here: a continuation prefill from an
+    // arbitrary decode frontier (multi-turn), where the kernel assembles
+    // the leading pool from the page tail. WHEN a mid-pool start is
+    // semantically valid is the COVERAGE GUARD's job (stage_step): it
+    // blesses advancing starts (tail = the in-progress pool by
+    // construction) and pool-safe rewinds only.
+
+    // Storage per row (same resolution as the decode producer):
+    // dispatcher-provisioned page rows — the only key storage (S4).
+    // TD-GLM-INDEXER-LOCAL-MERGE: local mode requires the executor's
+    // ownership unit (the local→global index math depends on it).
     const int PT_check = params.indexer_k_page_tokens;
     if (indexer_local_ && PT_check != opts_.indexer_k_page_tokens)
         return false;
@@ -705,9 +1068,17 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
         const int len_b = hseq[b];
         if (len_b < 1) return false;
         rows[b] = indexer_page_row(params, r, layer, b, len_b);
-        if (indexer_local_ && !rows[b]) return false;  // paged-only
-        if (!rows[b] && len_b > indexer_cache_tokens_)
-            return false;  // arena ceiling
+        if (!rows[b]) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 3)
+                spdlog::error(
+                    "append_indexer_chunk: blessed chunk append has no "
+                    "covering indexer-K page row (rank {} layer {} row {} "
+                    "len {}) — provision/blessing contract violated; "
+                    "skipping the append (this layer stays unwritten and "
+                    "its producer will score dense)", r, layer, b, len_b);
+            return false;
+        }
     }
 
     // K producer chain — mirrors produce_sparse_indices steps 2/2b exactly.
@@ -727,7 +1098,7 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
         attn->batched_gemm_bf16(g, stream);
     }
     attn->indexer_layernorm_bias(indexer_k_[r], w.k_idx_norm, w.k_idx_norm_bias,
-                                 B, IHD, opts_.rms_norm_eps, stream);
+                                 B, IHD, ln_eps, stream);
     // RoPE rotates each row at ITS OWN position (pos = seqlens_k[t] − 1 per
     // token inside the kernel) — chunk rows carry consecutive positions
     // through the per-row seqlens array, so the decode producer's
@@ -740,13 +1111,24 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
         rr.d_rope = d_rope; rr.max_pos = opts_.rope_max_pos;
         attn->rope_rotate(rr, stream);
     }
-    attn->indexer_hadamard(indexer_k_[r], B, IHD, stream);
+    // IndexPool: raw keys are never rotated (rotation happens on the pooled
+    // entry in the compress kernel); gate rows for all chunk rows.
+    if (!pooled) attn->indexer_hadamard(indexer_k_[r], B, IHD, stream);
+    if (pooled) {
+        compute::StridedBatchedGemmBf16Params g{};
+        g.m = IHD; g.n = B; g.k = H;
+        g.A = w.indexer_compressor_wgate; g.lda = H;   g.strideA = 0;
+        g.B = normed_hidden_[r];          g.ldb = H;   g.strideB = 0;
+        g.C = indexer_gate_[r];           g.ldc = IHD; g.strideC = 0;
+        g.batch_count = 1;
+        attn->batched_gemm_bf16(g, stream);
+    }
 
     // FP8 quant-append, batched per destination page: a run of rows whose
     // positions land in the SAME physical page (same base pointer + same
     // slot_bias) goes in ONE launch — the kernel is one CTA per row with
     // slot = seqlens_k[t] + slot_bias, identical math to the decode
-    // producer's per-row launches. Arena rows share one base — single run.
+    // producer's per-row launches.
     // Local mode: each rank appends ONLY the chunk rows it OWNS (page-
     // granular round-robin); rows within one page share the owner, so the
     // same-page run grouping is automatically owner-uniform. The owner's
@@ -760,29 +1142,40 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
             ++b;
             continue;
         }
-        void* k_dst;
-        void* s_dst;
-        int bias;
         int e = b + 1;
-        if (rows[b]) {
-            const int pg = (hseq[b] - 1) / PT;
-            const int pg_slot = indexer_local_ ? pg / dcp_size_ : pg;
-            auto* base = const_cast<std::byte*>(
-                static_cast<const std::byte*>(rows[b][pg_slot]));
-            k_dst = base;                                   // FP8 rows
-            s_dst = base + static_cast<size_t>(PT) * IHD;   // F32 tail
-            bias = -1 - pg * PT;
-            while (e < B && rows[e] && (hseq[e] - 1) / PT == pg
-                   && rows[e][pg_slot] == rows[b][pg_slot])
-                ++e;
-        } else {
-            k_dst = static_cast<std::byte*>(indexer_k_cache_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_ * IHD;
-            s_dst = static_cast<float*>(indexer_k_scales_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_;
-            bias = -1;
-            while (e < B && !rows[e]) ++e;
+        const int pg = (hseq[b] - 1) / PT;
+        const int pg_slot = indexer_local_ ? pg / dcp_size_ : pg;
+        auto* base = const_cast<std::byte*>(
+            static_cast<const std::byte*>(rows[b][pg_slot]));
+        while (e < B && (hseq[e] - 1) / PT == pg
+               && rows[e][pg_slot] == rows[b][pg_slot])
+            ++e;
+        if (pooled) {
+            // IndexPool: one launch per page-run — composes the run's
+            // complete pools and, on the chunk's FINAL run, stashes the
+            // trailing partial pool into the page tail. Page runs split on
+            // PT boundaries (multiples of kpool), so every non-final run is
+            // pool-exact and only the final run can carry a remainder.
+            compute::IndexerKpoolChunkAppendArgs ca{};
+            ca.k_rows = static_cast<std::byte*>(indexer_k_[r])
+                + static_cast<size_t>(b) * IHD * 2;
+            ca.gate_rows = static_cast<std::byte*>(indexer_gate_[r])
+                + static_cast<size_t>(b) * IHD * 2;
+            ca.ape = w.indexer_compressor_ape;
+            ca.page_base = base;
+            ca.page_entries = PT / P;
+            ca.pos0_in_page = (hseq[b] - 1) - pg * PT;
+            ca.num_rows = e - b;
+            ca.kpool = P;
+            ca.head_dim = IHD;
+            ca.seed_tail = (e == B);
+            attn->indexer_kpool_chunk_append(ca, stream);
+            b = e;
+            continue;
         }
+        void* k_dst = base;                                   // FP8 rows
+        void* s_dst = base + static_cast<size_t>(PT) * IHD;   // F32 tail
+        const int bias = -1 - pg * PT;
         attn->indexer_k_quant_append(
             static_cast<std::byte*>(indexer_k_[r])
                 + static_cast<size_t>(b) * IHD * 2,          // BF16 row b
@@ -810,8 +1203,7 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
 // IndexShare: same full/shared reuse rule as the decode producer — a shared
 // layer reuses the per-row top-k the most recent full layer produced under
 // this step key. Storage: dispatcher-provisioned page rows (row b's slice
-// covers [0, len_b)) or the executor arena (a blessed chunk is ONE sequence,
-// so the arena is valid at any B — unlike decode's multi-sequence B>1).
+// covers [0, len_b)) — the only key storage (S4).
 //
 // LOCAL indexer mode (TD-SPARSE-PREFILL-LOCAL-INDEXER): same shard-score →
 // shard-top-k → cross-rank-merge structure as the decode producer, PER CHUNK
@@ -825,8 +1217,8 @@ bool DcpExecutor::append_indexer_chunk(compute::AttentionDevice* attn, int rank,
 // top-k lands as a CANDIDATE row (LOCAL slot indices + scores) in the packed
 // send buffer; execute_attention then allgathers and merges per row
 // (merge_local_indexer_candidates) into the same GLOBAL per-row top-k the
-// replicated producer emits. Paged storage only (no arena — replicated
-// shape); the IndexShare reuse blessing is deferred to post-merge.
+// replicated producer emits. The IndexShare reuse blessing is deferred to
+// post-merge.
 bool DcpExecutor::produce_sparse_indices_prefill(
     compute::AttentionDevice* attn, int rank,
     const AttentionExecParams& params) {
@@ -837,6 +1229,7 @@ bool DcpExecutor::produce_sparse_indices_prefill(
     const int NIH = opts_.index_n_heads;
     const int IHD = opts_.index_head_dim;
     const int ITK = opts_.index_topk;
+    const int ITKR = opts_.index_topk_rows();  // GF3.5 row stride
     const int d_rope = opts_.qk_rope_head_dim;
     void* stream = attn_streams_[r];
 
@@ -879,25 +1272,41 @@ bool DcpExecutor::produce_sparse_indices_prefill(
     }
 
     // Storage per chunk row (same resolution as append_indexer_chunk, which
-    // already stored this chunk's keys there): page rows when provisioned,
-    // else the arena slot (single-sequence chunk).
+    // already stored this chunk's keys there): dispatcher-provisioned page
+    // rows — the only key storage (S4). A shared layer with no reusable
+    // result recomputes as if full but owns no storage → dense; a COMPUTING
+    // layer of a blessed chunk without covering rows is a contract
+    // violation (the appender would have failed the same way) → dense.
     // TD-SPARSE-PREFILL-LOCAL-INDEXER: local mode requires the dispatcher-
     // provisioned page shape at the OWNERSHIP unit this executor was built
-    // with (same rule as the decode producer) — the arena is replicated-
-    // shape, so no arena fallback exists in local mode.
+    // with (same rule as the decode producer).
     const int PT = params.indexer_k_page_tokens;
     if (indexer_local_ && PT != opts_.indexer_k_page_tokens) return false;
-    const int slot = (layer < static_cast<int>(indexer_layer_slot_.size()))
-        ? indexer_layer_slot_[layer] : -1;
+    // GF3.5 IndexPool constants (see produce_sparse_indices).
+    const int P = std::max(opts_.index_kpool, 1);
+    const bool pooled = P > 1;
+    if (pooled && (PT % P != 0 || ITK % P != 0)) return false;
+    const int SELK = pooled ? ITK / P : ITK;
+    const int E = pooled && PT > 0 ? PT / P : PT;
+    const int CSTR = pooled ? SELK : ITKR;
+    if (pooled && (!indexer_pool_ids_[r] || !indexer_gate_[r])) return false;
     auto& rows = indexer_page_rows_;  // preallocated [max_batch]
     for (int b = 0; b < B; ++b) {
         const int len_b = hseq[b];
         if (len_b < 1) return false;
         rows[b] = indexer_page_row(params, r, layer, b, len_b);
         if (!rows[b]) {
-            if (indexer_local_) return false;  // paged-only (no arena)
-            if (slot < 0) return false;  // no storage (shared layer)
-            if (len_b > indexer_cache_tokens_) return false;  // arena ceiling
+            if (indexer_layer_computes(layer)) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 3)
+                    spdlog::error(
+                        "produce_sparse_indices_prefill: blessed sparse "
+                        "chunk has no covering indexer-K page row (rank {} "
+                        "layer {} row {} len {}) — provision/blessing "
+                        "contract violated; running this chunk DENSE",
+                        r, layer, b, len_b);
+            }
+            return false;
         }
     }
 
@@ -964,7 +1373,7 @@ bool DcpExecutor::produce_sparse_indices_prefill(
     //    and cutoff (INV-DSA-BATCH: bit-identical outputs to this loop; the
     //    kernels run the exact single-query device bodies per row). The
     //    per-row loop below is the authoritative fallback.
-    if (prefill_score_topk_batched(attn, r, params, slot)) {
+    if (prefill_score_topk_batched(attn, r, params)) {
         if (!indexer_local_) indexer_reuse_key_[r][row_off] = step_key;
         indexer_step_fresh_ = true;
         return true;
@@ -976,50 +1385,70 @@ bool DcpExecutor::produce_sparse_indices_prefill(
             + static_cast<size_t>(b) * NIH * IHD * 2;        // BF16 row b
         sa.score_proj_all = static_cast<float*>(indexer_score_proj_[r])
             + static_cast<size_t>(b) * NIH;
-        int nb = len_b;
+        // GF3.5: entry domain (settled pools under IndexPool) — see the
+        // decode producer.
+        const int total_entries = pooled ? len_b / P : len_b;
+        const int unit = pooled ? E : PT;
+        int nb = total_entries;
         if (indexer_local_) {
             nb = daemon::kvshard::owned_len(
-                r, static_cast<uint32_t>(len_b), PT, dcp_size_);
+                r, static_cast<uint32_t>(total_entries), unit, dcp_size_);
             sa.k_pages = rows[b];
-            sa.num_k_pages = (nb + PT - 1) / PT;
-            sa.page_tokens = PT;
+            sa.num_k_pages = (nb + unit - 1) / unit;
+            sa.page_tokens = unit;
             // Candidate outputs into the packed send buffer:
-            // [B*ITK int32 local indices][B*ITK f32 scores], row b.
+            // [B*CSTR int32 local indices][B*CSTR f32 scores], row b.
             int* cand = static_cast<int*>(indexer_cand_send_[r]);
-            sa.sparse_indices_out = cand + static_cast<size_t>(b) * ITK;
+            sa.sparse_indices_out = cand + static_cast<size_t>(b) * CSTR;
             sa.topk_scores_scratch = reinterpret_cast<float*>(
-                cand + static_cast<size_t>(B) * ITK)
-                + static_cast<size_t>(b) * ITK;
+                cand + static_cast<size_t>(B) * CSTR)
+                + static_cast<size_t>(b) * CSTR;
             // Scratch only — the merge overwrites it with the final length.
             // (Offset by the sub-chunk row range so it never clobbers another
             // sub-chunk's persisted lengths, TD-PREFILL-SUPERCHUNK.)
             sa.topk_lengths_out = static_cast<int*>(topk_lengths_dev_[r])
                 + row_off + b;
-        } else if (rows[b]) {
-            sa.k_pages = rows[b];
-            sa.num_k_pages = (len_b + PT - 1) / PT;
-            sa.page_tokens = PT;
         } else {
-            sa.k_cache = static_cast<std::byte*>(indexer_k_cache_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_ * IHD;
-            sa.k_scales = static_cast<float*>(indexer_k_scales_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_;
+            sa.k_pages = rows[b];
+            sa.num_k_pages = (nb + unit - 1) / unit;
+            sa.page_tokens = unit;
         }
         if (!indexer_local_) {
             sa.topk_scores_scratch = indexer_topk_scores_[r];
             // TD-PREFILL-SUPERCHUNK: persistent rows at the sub-chunk's
             // global row range (row_off = 0 for legacy prefill).
-            sa.sparse_indices_out = static_cast<int*>(sparse_indices_dev_[r])
-                + (static_cast<size_t>(row_off) + b) * ITK;
+            // IndexPool: pool ids to the pool-id scratch (same row range),
+            // expanded below into sparse_indices_dev_.
+            sa.sparse_indices_out = pooled
+                ? static_cast<int*>(indexer_pool_ids_[r])
+                      + (static_cast<size_t>(row_off) + b) * SELK
+                : static_cast<void*>(
+                      static_cast<int*>(sparse_indices_dev_[r])
+                      + (static_cast<size_t>(row_off) + b) * ITKR);
             sa.topk_lengths_out = static_cast<int*>(topk_lengths_dev_[r])
                 + row_off + b;
         }
-        sa.block_endpoints = indexer_block_endpoints_[r];  // static iota
+        sa.block_endpoints = indexer_block_endpoints_[r];  // static strided iota
         sa.scores_scratch = indexer_scores_[r];
         sa.num_tokens = 1; sa.num_blocks = nb;
-        sa.n_heads = NIH; sa.head_dim = IHD; sa.topk = ITK;
+        sa.n_heads = NIH; sa.head_dim = IHD; sa.topk = SELK;
         sa.query_position_base = len_b - 1;  // row b's causal cutoff
         attn->indexer_score_topk(sa, stream);
+        if (pooled && !indexer_local_) {
+            compute::IndexerKpoolExpandArgs xa{};
+            xa.pool_ids = static_cast<int*>(indexer_pool_ids_[r])
+                + (static_cast<size_t>(row_off) + b) * SELK;
+            xa.eff_pools = static_cast<int*>(topk_lengths_dev_[r])
+                + row_off + b;
+            xa.row_seq_len = seqlens + b;
+            xa.indices_out = static_cast<int*>(sparse_indices_dev_[r])
+                + (static_cast<size_t>(row_off) + b) * ITKR;
+            xa.lengths_out = static_cast<int*>(topk_lengths_dev_[r])
+                + row_off + b;
+            xa.num_rows = 1; xa.kpool = P;
+            xa.pool_stride = SELK; xa.out_stride = ITKR; xa.out_cols = ITKR;
+            attn->indexer_kpool_expand(xa, stream);
+        }
     }
     // Shared layers may reuse this chunk step's per-row result. Local mode
     // defers the reuse blessing to execute_attention (post-merge):
@@ -1046,27 +1475,27 @@ bool DcpExecutor::produce_sparse_indices_prefill(
 // attention stream, so reusing the scores scratch across waves is safe —
 // exactly like the retired sequential per-row reuse.
 //
-// Paged storage stages a row-major [B, pages_per_row] device page-pointer
-// table (per-row page rows may differ under the dispatcher's batch-strided
-// tables even for one sequence). Arena storage addresses the contiguous
-// slot directly — identical to the single-query contiguous mode.
+// Storage stages a row-major [B, pages_per_row] device page-pointer table
+// (per-row page rows may differ under the dispatcher's batch-strided
+// tables even for one sequence).
 //
 // Returns false → caller runs the authoritative per-row loop: B < 2 (no
 // batching win), batched scratch unallocated (sparse_prefill off — cannot
 // happen on this path — or allocation was skipped), per-row dense mask
 // present (INV-DSA-ROWMIX defensive: the dispatcher never sets it on
 // prefill steps; the per-row loop preserves exact legacy behavior if that
-// ever changes), mixed paged/arena rows, a bound beyond the endpoints iota
-// (indexer_cache_tokens_ — the same latent ceiling the per-row scratch
-// has), page-table overflow, or rows_per_wave < 2.
+// ever changes), a bound beyond the endpoints iota (indexer_score_tokens_ —
+// the same ceiling the per-row scratch has), page-table overflow, or
+// rows_per_wave < 2.
 bool DcpExecutor::prefill_score_topk_batched(
     compute::AttentionDevice* attn, int rank,
-    const AttentionExecParams& params, int slot) {
+    const AttentionExecParams& params) {
     const int r = rank;
     const int B = params.batch_size;
     const int NIH = opts_.index_n_heads;
     const int IHD = opts_.index_head_dim;
     const int ITK = opts_.index_topk;
+    const int ITKR = opts_.index_topk_rows();  // GF3.5 row stride
     const int PT = params.indexer_k_page_tokens;
     void* stream = attn_streams_[r];
     const int* hseq = params.host_seqlens_k;  // caller verified non-null
@@ -1080,29 +1509,41 @@ bool DcpExecutor::prefill_score_topk_batched(
         return false;
     if (static_cast<int>(indexer_row_bounds_host_.size()) < 2 * B)
         return false;
+    // GF3.5 IndexPool constants (see produce_sparse_indices).
+    const int P = std::max(opts_.index_kpool, 1);
+    const bool pooled = P > 1;
+    if (pooled && (PT % P != 0 || ITK % P != 0)) return false;
+    const int SELK = pooled ? ITK / P : ITK;
+    const int E = pooled && PT > 0 ? PT / P : PT;
+    const int unit = pooled ? E : PT;
+    const int CSTR = pooled ? SELK : ITKR;
+    const int TSTR = pooled ? SELK : ITKR;  // topk output row stride
+    if (pooled && (!indexer_pool_ids_[r] || !indexer_gate_[r])) return false;
 
-    // Uniform storage across rows (a blessed chunk is one sequence, so this
-    // holds in practice; fall back on any mix).
+    // Paged rows resolved by the caller for every row (S4: the paged pool
+    // is the only key storage); defensive re-check.
     auto& rows = indexer_page_rows_;
-    const bool paged = rows[0] != nullptr;
-    for (int b = 1; b < B; ++b)
-        if ((rows[b] != nullptr) != paged) return false;
-    if (!paged && slot < 0) return false;   // caller-guaranteed; keep safe
-    if (paged && PT <= 0) return false;
+    for (int b = 0; b < B; ++b)
+        if (!rows[b]) return false;
+    if (PT <= 0) return false;
 
-    // Per-row bounds + cutoffs — the same values the per-row loop passes.
+    // Per-row bounds + cutoffs — the same values the per-row loop passes
+    // (entry domain under IndexPool: settled pools; cutoffs stay token
+    // positions — the strided endpoints iota carries the pool → position
+    // mapping).
     int nb_max = 0;
     for (int b = 0; b < B; ++b) {
         const int len_b = hseq[b];
-        int nb = len_b;
+        const int total_entries = pooled ? len_b / P : len_b;
+        int nb = total_entries;
         if (indexer_local_)
             nb = static_cast<int>(daemon::kvshard::owned_len(
-                r, static_cast<uint32_t>(len_b), PT, dcp_size_));
+                r, static_cast<uint32_t>(total_entries), unit, dcp_size_));
         indexer_row_bounds_host_[static_cast<size_t>(b)] = nb;
         indexer_row_bounds_host_[static_cast<size_t>(B) + b] = len_b - 1;
         nb_max = std::max(nb_max, nb);
     }
-    if (nb_max > indexer_cache_tokens_) return false;  // endpoints ceiling
+    if (nb_max > indexer_score_tokens_) return false;  // endpoints ceiling
 
     // Wave capacity from the batched scores scratch.
     int rpw = B;
@@ -1112,10 +1553,9 @@ bool DcpExecutor::prefill_score_topk_batched(
             indexer_scores_batched_floats_ / static_cast<size_t>(nb_max)));
     if (rpw < 2) return false;
 
-    // Paged: stage the row-major per-row page-pointer table.
-    int pages_per_row = 0;
-    if (paged) {
-        pages_per_row = (nb_max + PT - 1) / PT;
+    // Stage the row-major per-row page-pointer table (entry-unit pages).
+    const int pages_per_row = (nb_max + unit - 1) / unit;
+    {
         if (!indexer_page_table_dev_[r] || pages_per_row < 1
             || static_cast<size_t>(B) * pages_per_row
                    > indexer_page_table_entries_)
@@ -1124,8 +1564,8 @@ bool DcpExecutor::prefill_score_topk_batched(
             static_cast<size_t>(B) * pages_per_row, nullptr);
         for (int b = 0; b < B; ++b) {
             const int np =
-                (indexer_row_bounds_host_[static_cast<size_t>(b)] + PT - 1)
-                / PT;
+                (indexer_row_bounds_host_[static_cast<size_t>(b)] + unit - 1)
+                / unit;
             for (int p = 0; p < np; ++p)
                 indexer_page_table_host_[
                     static_cast<size_t>(b) * pages_per_row + p] = rows[b][p];
@@ -1153,37 +1593,38 @@ bool DcpExecutor::prefill_score_topk_batched(
             + static_cast<size_t>(w0) * NIH;
         ba.row_num_blocks = bounds_dev + w0;
         ba.row_query_position = bounds_dev + B + w0;
-        if (paged) {
-            ba.k_page_table = static_cast<const void* const*>(
-                indexer_page_table_dev_[r])
-                + static_cast<size_t>(w0) * pages_per_row;
-            ba.page_table_stride = pages_per_row;
-            ba.page_tokens = PT;
-        } else {
-            ba.k_cache = static_cast<std::byte*>(indexer_k_cache_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_ * IHD;
-            ba.k_scales = static_cast<float*>(indexer_k_scales_[r])
-                + static_cast<size_t>(slot) * indexer_cache_tokens_;
-        }
+        ba.k_page_table = static_cast<const void* const*>(
+            indexer_page_table_dev_[r])
+            + static_cast<size_t>(w0) * pages_per_row;
+        ba.page_table_stride = pages_per_row;
+        ba.page_tokens = unit;
         ba.block_endpoints = indexer_block_endpoints_[r];
         ba.scores_scratch = indexer_scores_batched_[r];
         ba.scores_stride = nb_max;
         if (indexer_local_) {
             // Candidate rows into the packed send buffer, exactly as the
-            // per-row loop: [B*ITK int32 local indices][B*ITK f32 scores].
+            // per-row loop: [B*CSTR int32 local indices][B*CSTR f32 scores]
+            // (CSTR = SELK pool-id candidates under IndexPool; the batched
+            // top-k's internal row stride is ba.topk == the same value).
             int* cand = static_cast<int*>(indexer_cand_send_[r]);
-            ba.sparse_indices_out = cand + static_cast<size_t>(w0) * ITK;
+            ba.sparse_indices_out = cand + static_cast<size_t>(w0) * CSTR;
             ba.topk_scores_out = reinterpret_cast<float*>(
-                cand + static_cast<size_t>(B) * ITK)
-                + static_cast<size_t>(w0) * ITK;
+                cand + static_cast<size_t>(B) * CSTR)
+                + static_cast<size_t>(w0) * CSTR;
         } else {
             // TD-PREFILL-SUPERCHUNK: persistent rows at the sub-chunk's global
             // row range (row_off = 0 for legacy prefill). topk_scores is a
             // per-launch scratch — wave-local rows suffice.
-            ba.sparse_indices_out = static_cast<int*>(sparse_indices_dev_[r])
-                + (static_cast<size_t>(row_off) + w0) * ITK;
+            // IndexPool: pool ids at SELK stride into the pool-id scratch;
+            // ONE batched expansion below writes the token rows.
+            ba.sparse_indices_out = pooled
+                ? static_cast<int*>(indexer_pool_ids_[r])
+                      + (static_cast<size_t>(row_off) + w0) * SELK
+                : static_cast<void*>(
+                      static_cast<int*>(sparse_indices_dev_[r])
+                      + (static_cast<size_t>(row_off) + w0) * ITKR);
             ba.topk_scores_out = static_cast<float*>(indexer_topk_scores_[r])
-                + static_cast<size_t>(w0) * ITK;
+                + static_cast<size_t>(w0) * TSTR;
         }
         ba.topk_lengths_out = static_cast<int*>(topk_lengths_dev_[r])
             + row_off + w0;
@@ -1191,16 +1632,38 @@ bool DcpExecutor::prefill_score_topk_batched(
         ba.max_num_blocks = wave_nb_max;
         ba.n_heads = NIH;
         ba.head_dim = IHD;
-        ba.topk = ITK;
+        ba.topk = SELK;
         attn->indexer_score_topk_batched(ba, stream);
+    }
+
+    // GF3.5 IndexPool (replicated): one batched expansion over ALL chunk
+    // rows — pool ids ×kpool + per-row always-selected tail; lengths become
+    // token counts (aliased eff read, kernel-sync-safe). Local mode expands
+    // post-merge.
+    if (pooled && !indexer_local_) {
+        const int* seqlens_dev = params.global_seqlens_k
+            ? params.global_seqlens_k[r]
+            : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
+        if (!seqlens_dev) return false;
+        compute::IndexerKpoolExpandArgs xa{};
+        xa.pool_ids = static_cast<int*>(indexer_pool_ids_[r])
+            + static_cast<size_t>(row_off) * SELK;
+        xa.eff_pools = static_cast<int*>(topk_lengths_dev_[r]) + row_off;
+        xa.row_seq_len = seqlens_dev;
+        xa.indices_out = static_cast<int*>(sparse_indices_dev_[r])
+            + static_cast<size_t>(row_off) * ITKR;
+        xa.lengths_out = static_cast<int*>(topk_lengths_dev_[r]) + row_off;
+        xa.num_rows = B; xa.kpool = P;
+        xa.pool_stride = SELK; xa.out_stride = ITKR; xa.out_cols = ITKR;
+        attn->indexer_kpool_expand(xa, stream);
     }
 
     if (!indexer_batch_logged_) {
         indexer_batch_logged_ = true;
         spdlog::info("DcpExecutor: sparse-prefill BATCHED indexer score+topk "
-                     "ACTIVE (B={}, rows/wave={}, waves={}, paged={}, "
+                     "ACTIVE (B={}, rows/wave={}, waves={}, "
                      "local={})",
-                     B, rpw, (B + rpw - 1) / rpw, paged, indexer_local_);
+                     B, rpw, (B + rpw - 1) / rpw, indexer_local_);
     }
     return true;
 }
@@ -1221,12 +1684,22 @@ bool DcpExecutor::prefill_score_topk_batched(
 void DcpExecutor::merge_local_indexer_candidates(
     const AttentionExecParams& params) {
     const int ITK = opts_.index_topk;
+    const int ITKR = opts_.index_topk_rows();  // GF3.5 row stride
     const int B = params.batch_size;
+    // GF3.5 IndexPool constants (see produce_sparse_indices): candidates are
+    // POOL ids at SELK stride; the merge re-selects in the pool domain and
+    // the expansion afterwards writes token rows.
+    const int P = std::max(opts_.index_kpool, 1);
+    const bool pooled = P > 1;
+    const int SELK = pooled ? ITK / P : ITK;
+    const int PTm = opts_.indexer_k_page_tokens;
+    const int Em = pooled && PTm > 0 ? PTm / P : PTm;
+    const int CSTR = pooled ? SELK : ITKR;
     // TD-PREFILL-SUPERCHUNK: merged output rows land at the sub-chunk's global
     // row range (candidate send/recv buffers stay launch-local, rows [0, B)).
     const uint32_t row_off = static_cast<uint32_t>(
         params.batch_row_offset > 0 ? params.batch_row_offset : 0);
-    const size_t cand_words = 2 * static_cast<size_t>(B) * ITK;
+    const size_t cand_words = 2 * static_cast<size_t>(B) * CSTR;
     std::vector<const void*> sends(dcp_size_);
     std::vector<void*> recvs(dcp_size_);
     for (int r = 0; r < dcp_size_; ++r) {
@@ -1246,6 +1719,56 @@ void DcpExecutor::merge_local_indexer_candidates(
                 continue;
             const int len_b = params.host_seqlens_k
                 ? params.host_seqlens_k[b] : params.max_seqlen_k;
+            if (pooled) {
+                // Pooled merge: scatter pool-id candidates (entry-domain
+                // round-robin ownership) + re-run the radix top-k over the
+                // pooled endpoints, then expand ×kpool + tail into the
+                // shared output buffers — mode-agnostic downstream.
+                compute::IndexerKpoolMergeArgs pm{};
+                pm.gathered = indexer_cand_recv_[r];
+                pm.seg_words = static_cast<int>(cand_words);
+                pm.batch = B;
+                pm.token = b;
+                pm.cand_stride = CSTR;
+                pm.cand_count = SELK;
+                pm.scores_scratch = indexer_scores_[r];
+                pm.block_endpoints = indexer_block_endpoints_[r];
+                pm.topk_scores_scratch = indexer_topk_scores_[r];
+                pm.pool_ids_out = static_cast<int*>(indexer_pool_ids_[r])
+                    + (static_cast<size_t>(row_off) + b) * SELK;
+                pm.eff_pools_out = static_cast<int*>(topk_lengths_dev_[r])
+                    + row_off + b;
+                pm.num_entries = len_b / P;
+                pm.topk_pools = SELK;
+                pm.query_position = len_b - 1;
+                pm.dcp_size = dcp_size_;
+                pm.page_entries = Em;
+                attn->indexer_kpool_merge(pm, attn_streams_[r]);
+
+                const int* seqlens_dev = params.global_seqlens_k
+                    ? params.global_seqlens_k[r]
+                    : (params.seqlens_k ? params.seqlens_k[r] : nullptr);
+                if (!seqlens_dev) {
+                    // Producer contract guarantees positions; defensive:
+                    // an expansion without lengths would write garbage.
+                    spdlog::error("kpool merge: no device seqlens for row "
+                                  "{} — skipping expansion (row stays "
+                                  "empty)", b);
+                    continue;
+                }
+                compute::IndexerKpoolExpandArgs xa{};
+                xa.pool_ids = pm.pool_ids_out;
+                xa.eff_pools = pm.eff_pools_out;
+                xa.row_seq_len = seqlens_dev + b;
+                xa.indices_out = static_cast<int*>(sparse_indices_dev_[r])
+                    + (static_cast<size_t>(row_off) + b) * ITKR;
+                xa.lengths_out = pm.eff_pools_out;
+                xa.num_rows = 1; xa.kpool = P;
+                xa.pool_stride = SELK; xa.out_stride = ITKR;
+                xa.out_cols = ITKR;
+                attn->indexer_kpool_expand(xa, attn_streams_[r]);
+                continue;
+            }
             compute::IndexerTopkMergeArgs ma{};
             ma.gathered = indexer_cand_recv_[r];
             ma.seg_words = static_cast<int>(cand_words);
@@ -1255,7 +1778,7 @@ void DcpExecutor::merge_local_indexer_candidates(
             ma.block_endpoints = indexer_block_endpoints_[r];
             ma.topk_scores_scratch = indexer_topk_scores_[r];
             ma.indices_out = static_cast<int*>(sparse_indices_dev_[r])
-                + (static_cast<size_t>(row_off) + b) * ITK;
+                + (static_cast<size_t>(row_off) + b) * ITKR;
             ma.length_out = static_cast<int*>(topk_lengths_dev_[r])
                 + row_off + b;
             ma.num_blocks = len_b;
@@ -1340,12 +1863,30 @@ void DcpExecutor::execute_oproj_and_reduce(
         void* stream = attn_streams_[r];
         const auto& w = *params.weights[r];
 
+        // TD-GLM5-TP-COMBINE-PRECISION: under the fp32 TP combine the
+        // o_proj partial goes to the FP32 staging buffer un-rounded; the
+        // single bf16 rounding happens after the cross-rank sum below. Only
+        // the GGUF route has an fp32-out epilogue today — the NVFP4/FP8
+        // arms refuse loudly rather than silently round partials to bf16
+        // (glm5_next, the only arch with the fp32 default, is GGUF o_proj
+        // on every layer).
+        if (tp_combine_fp32_active_ && !w.o_proj_is_gguf)
+            throw std::runtime_error(
+                "execute_oproj_and_reduce: fp32 TP combine "
+                "(TD-GLM5-TP-COMBINE-PRECISION) supports GGUF o_proj only; "
+                "layer " + std::to_string(params.layer_idx)
+                + " has a non-GGUF o_proj. Set LS_TP_COMBINE_FP32=0 to run "
+                "the bf16 partial combine instead.");
+
         if (w.o_proj_is_gguf) {
             // ── GGUF path: BF16 activation (kv_bv_out_) straight into the GGUF
             // GEMM (mmvq/mmq/dequant). o_proj weight is packed [H, HL*V]. ──
             route_gguf_gemm(attn, r, B, H, HL * V,
-                            kv_bv_out_[r], w.o_proj, hidden_out_[r],
-                            w.o_proj_gguf_type, stream);
+                            kv_bv_out_[r], w.o_proj,
+                            tp_combine_fp32_active_ ? hidden_f32_[r]
+                                                    : hidden_out_[r],
+                            w.o_proj_gguf_type, stream,
+                            /*c_fp32=*/tp_combine_fp32_active_);
         } else if (w.o_proj_is_nvfp4) {
             // ── NVFP4 path: BF16 → FP4 activation quant, then NVFP4 grouped GEMM ──
 
@@ -1462,11 +2003,16 @@ void DcpExecutor::execute_oproj_and_reduce(
                     ids[r] = opts_.gpus[r].id;
                     comms[r] = opts_.communicator->comm(r);
                     strms[r] = attn_streams_[r];
-                    if (!comms[r] || !strms[r] || !hidden_out_[r])
+                    if (!comms[r] || !strms[r] || !hidden_out_[r]
+                        || (tp_combine_fp32_active_ && !hidden_f32_[r]))
                         have_all = false;
-                    ops[r] = {{hidden_out_[r],
+                    // TD-GLM5-TP-COMBINE-PRECISION: under the fp32
+                    // combine the captured allreduce runs on the FP32
+                    // staging buffers with a FP32 sum.
+                    ops[r] = {{tp_combine_fp32_active_ ? hidden_f32_[r]
+                                                       : hidden_out_[r],
                                static_cast<size_t>(opts_.hidden_size),
-                               /*fp32=*/false}};
+                               /*fp32=*/tp_combine_fp32_active_}};
                 }
                 if (have_all) {
                     oproj_reduce_graph_ =
@@ -1489,9 +2035,25 @@ void DcpExecutor::execute_oproj_and_reduce(
         }
         if (!replayed) {
             opts_.dcp_wrapper->reduce_hidden(
-                hidden_out_.data(), B, attn_streams_.data());
+                tp_combine_fp32_active_ ? hidden_f32_.data()
+                                        : hidden_out_.data(),
+                B, attn_streams_.data(),
+                /*fp32=*/tp_combine_fp32_active_);
+        }
+        // TD-GLM5-TP-COMBINE-PRECISION: the ONE bf16 rounding, after the
+        // fp32 sum (per rank, same kAttention stream) — replayed or eager.
+        if (tp_combine_fp32_active_) {
+            for (int r = 0; r < dcp_size_; ++r) {
+                auto* attn = opts_.attention_devices[r];
+                attn->set_device();
+                attn->cast_f32_to_bf16(hidden_out_[r], hidden_f32_[r],
+                                       static_cast<int64_t>(B)
+                                           * opts_.hidden_size,
+                                       attn_streams_[r]);
+            }
         }
     }
+    tp_hidden_probe("mla-out", params.layer_idx, hidden_out_.data(), B);
 }
 
 // ── Graph-mode execution (decode) ───────────────────────────────────────────
@@ -1742,7 +2304,7 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                 params.page_size,
                 /*is_sparse=*/true, /*chunk_causal=*/true,
                 utv.sparse_indices, params.topk_lengths[r],
-                opts_.index_topk,
+                opts_.index_topk_rows(),
                 prefill_out_[r], prefill_lse_[r],
                 params.layer_idx, stream);
         } else if (tiered_chunk) {
@@ -1788,9 +2350,9 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                     /*is_sparse=*/true, /*chunk_causal=*/false,
                     rt ? rtv.sparse_indices
                        : params.sparse_indices[r]
-                             + static_cast<size_t>(b) * opts_.index_topk,
+                             + static_cast<size_t>(b) * opts_.index_topk_rows(),
                     params.topk_lengths[r] + b,
-                    opts_.index_topk,
+                    opts_.index_topk_rows(),
                     static_cast<char*>(prefill_out_[r]) + b * out_row_b,
                     prefill_lse_[r]
                         + static_cast<size_t>(b) * attn_num_heads_,
@@ -1829,11 +2391,11 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                     /*is_sparse=*/row_sparse, /*chunk_causal=*/false,
                     row_sparse && params.sparse_indices
                         ? params.sparse_indices[r]
-                              + static_cast<size_t>(b) * opts_.index_topk
+                              + static_cast<size_t>(b) * opts_.index_topk_rows()
                         : nullptr,
                     row_sparse && params.topk_lengths
                         ? params.topk_lengths[r] + b : nullptr,
-                    opts_.index_topk,
+                    opts_.index_topk_rows(),
                     static_cast<char*>(prefill_out_[r]) + b * out_row_b,
                     prefill_lse_[r]
                         + static_cast<size_t>(b) * attn_num_heads_,
@@ -1848,7 +2410,7 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                 params.page_size,
                 /*is_sparse=*/true, /*chunk_causal=*/false,
                 tv.sparse_indices, params.topk_lengths[r],
-                opts_.index_topk,
+                opts_.index_topk_rows(),
                 prefill_out_[r], prefill_lse_[r],
                 params.layer_idx, stream);
         } else {
@@ -1875,7 +2437,7 @@ void DcpExecutor::execute_attention_nongraph(const AttentionExecParams& params) 
                 ? nullptr : params.sparse_indices[r],
             (chunk_rows && !sparse_chunk) || !params.topk_lengths
                 ? nullptr : params.topk_lengths[r],
-            opts_.index_topk,
+            opts_.index_topk_rows(),
             prefill_out_[r], prefill_lse_[r],
             params.layer_idx, stream);
         }
@@ -1996,7 +2558,7 @@ void DcpExecutor::execute_attention(const AttentionExecParams& params) {
             // [0, B) off the OFFSET base (0 for legacy prefill).
             const size_t sc_off = static_cast<size_t>(
                 params.batch_row_offset > 0 ? params.batch_row_offset : 0);
-            const int itk = std::max(opts_.index_topk, 1);
+            const int itk = std::max(opts_.index_topk_rows(), 1);
             bool all = true;
             for (int r = 0; r < dcp_size_; ++r) {
                 opts_.attention_devices[r]->set_device();
@@ -2035,7 +2597,7 @@ void DcpExecutor::execute_attention(const AttentionExecParams& params) {
                         sparse_indices_ptrs_[r], topk_lengths_ptrs_[r],
                         sparse_local_indices_dev_[r],
                         topk_local_lengths_dev_[r],
-                        params.batch_size, opts_.index_topk,
+                        params.batch_size, opts_.index_topk_rows(),
                         opts_.dcp_chunk_tokens, dcp_size_, r,
                         attn_streams_[r]);
                     sparse_indices_ptrs_[r] =
@@ -2133,7 +2695,7 @@ void DcpExecutor::execute_attention(const AttentionExecParams& params) {
                         sparse_indices_dev_[r], topk_lengths_dev_[r],
                         sparse_local_indices_dev_[r],
                         topk_local_lengths_dev_[r],
-                        params.batch_size, opts_.index_topk,
+                        params.batch_size, opts_.index_topk_rows(),
                         opts_.dcp_chunk_tokens, dcp_size_, r,
                         attn_streams_[r]);
                     sparse_indices_ptrs_[r] =
@@ -2241,6 +2803,10 @@ bool ArchMla::stage_step(
     using IndexerSeqMode = CommandDispatcher::IndexerSeqMode;
     using IndexerPageResult = CommandDispatcher::IndexerPageResult;
 
+    // TD-INDEXER-STEPKEY-TOKEN-BLIND introspection: reflect THIS dispatch —
+    // stays 0 unless the step is sparse-blessed below.
+    d_.last_indexer_step_key_ = 0;
+
     // TD-INDEXER-POOL-EVICT: a Pool::kIndexerK exhaustion that would
     // downgrade a KV-DEMOTED sequence to dense is FATAL, not merely lossy.
     // Two reasons compound: (a) a dense step skips the indexer append, so
@@ -2259,8 +2825,23 @@ bool ArchMla::stage_step(
     // sequence) and re-issues the identical step, which provisions and
     // stays SPARSE. Sequences with no demotions keep the old lossy dense
     // downgrade — legal there, and no behavior change off tiering.
+    // TD-INDEXER-NO-DENSE-FALLBACK (Route 1): a RESERVED sequence
+    // (indexer_reserved_tokens > 0 — every serving-path sequence since
+    // reserve-at-admission) must NEVER downgrade to dense: its pages were
+    // committed at admission, so a provisioning failure here is a bug or an
+    // overrun past the reservation — raise the retryable error (exact
+    // re-issue after holder eviction) rather than punch a permanent
+    // coverage hole. Demoted-KV sequences keep their pre-existing fatal
+    // treatment (INV-KVT-14b).
     auto indexer_exhaustion_fatal = [&](uint64_t sid) {
-        return d_.kv_tiering_ && d_.kv_tiering_->seq_has_demotions(sid);
+        if (d_.kv_tiering_ && d_.kv_tiering_->seq_has_demotions(sid))
+            return true;
+        const auto* ss = d_.find_seq(sid);
+        return ss && ss->indexer_reserved_tokens > 0;
+    };
+    auto indexer_reserved = [&](uint64_t sid) {
+        const auto* ss = d_.find_seq(sid);
+        return ss && ss->indexer_reserved_tokens > 0;
     };
     auto raise_indexer_exhausted = [&]() {
         d_.last_internal_error_cat_ = ipc::CmpErrorCategory::kKvPoolExhausted;
@@ -2284,14 +2865,14 @@ bool ArchMla::stage_step(
     // steps now APPEND their chunk's indexer keys (TD-GLM-INDEXER-PREFILL,
     // append-only branch below) and advance coverage by chunk_len, so
     // prefill + sparse decode compose. Non-appending steps (graph replay,
-    // drafts, unsupported prefill shapes) leave a gap that permanently
-    // downgrades the sequence to DENSE. With LS_INDEXER_REWIND=1
+    // drafts) leave a gap that permanently downgrades the sequence to
+    // DENSE; a MALFORMED prefill shape (descriptors not one sequence at
+    // consecutive positions) is REFUSED outright instead — see the shape_ok
+    // check below (TD-KVT-BATCH-COHORT). With LS_INDEXER_REWIND=1
     // (INV-DSA-REWIND) a same-sequence contiguous OVERWRITE-REWIND (pos0 <=
     // next_pos — the speculative-verify partial-acceptance re-feed) is
     // additionally valid: position-keyed appends overwrite the re-fed rows
-    // in place and next_pos becomes the high-water mark. A sequence that ever fell back to
-    // the arena (pool exhaustion) is pinned there: switching to
-    // later-allocated pages would score never-written memory.
+    // in place and next_pos becomes the high-water mark.
     // INV-DCP-5 pairing legality (KVS-4; TD-GLM-INDEXER-LOCAL-MERGE
     // resolved): BOTH dcp_indexer_mode values are legal with BOTH KV modes.
     // replicated: every rank's producer emits the identical GLOBAL top-k.
@@ -2319,6 +2900,32 @@ bool ArchMla::stage_step(
         });
     }
     const bool indexer_prefill_step = (p.is_prefill != 0) || (p.chunk_len > 0);
+    // TD-DECODE-GRAPH coverage rider (indexer-coverage-under-replay,
+    // P-29 step 7): a graph-replayed decode step cannot append its indexer
+    // key — the captured chain has no producer/appender — so letting a
+    // use_graph step bypass the coverage block below would punch a
+    // position gap that the NEXT nongraph step reads as pos > next_pos,
+    // marking the sequence kDead: it then SILENTLY serves DENSE (~10x
+    // slower, no error) for the rest of its life. Until decode-graph
+    // capture wires the append (the TD's exit condition), sparse liveness
+    // WINS on a DSA model: force the step down the nongraph path so
+    // coverage advances exactly as an eager step (shape (a) of the TD's
+    // two sanctioned shapes). Behaviour-neutral for every live engine
+    // path — no engine site sends use_graph=1 today (TD-DECODE-GRAPH
+    // dormant; glm5_next refuses graph decode outright, arch_deepseek_v4
+    // forces use_graph off) — but any future wiring now fails SAFE
+    // (slower step) instead of SILENT (dense sequence).
+    if (d_.deps_.live_config && d_.deps_.live_config->model.index_topk > 0
+        && params.use_graph && p.is_draft == 0) {
+        static std::once_flag graph_cov_warned;
+        std::call_once(graph_cov_warned, [] {
+            spdlog::warn("ArchMla::stage_step: decode-graph step on a DSA "
+                         "model forced NONGRAPH — graph replay does not "
+                         "append indexer keys and would kDead the sequence "
+                         "(TD-DECODE-GRAPH coverage rider)");
+        });
+        params.use_graph = false;
+    }
     // V4-7b: V4 carries index_topk for its Lightning indexer but the DSA
     // provisioning/coverage machinery is MLA-only — the V4 pipeline manages
     // its own LID tier (ensure_v4_tier_pages).
@@ -2329,7 +2936,16 @@ bool ArchMla::stage_step(
             d_.deps_.sideband_base + ipc::IpcLayout::kBatchDescriptorOff);
 
         // Step fingerprint: FNV-1a over (seq, pos) — the IndexShare reuse key
-        // and the producer/appender blessing token.
+        // and the producer/appender blessing token. TD-INDEXER-STEPKEY-
+        // TOKEN-BLIND (INV-DSA-EPOCH): positions alone hash WHERE, never
+        // WHAT — a blessed overwrite re-feed (INV-DSA-REWIND) reproduces an
+        // earlier step's exact (seq, pos) set with possibly different
+        // tokens, so each branch below additionally mixes the per-sequence
+        // REWIND EPOCH into the key (after the layer-0 re-feed detection
+        // has had its chance to advance it): same positions at a different
+        // epoch yield a different key and a stale selection can never
+        // validate. The mix is one xor-mul per row on the same host loop —
+        // the key stays cheap and a pure function of the command stream.
         uint64_t key = 1469598103934665603ULL;
         for (int b = 0; b < batch_size; ++b) {
             key = (key ^ be[b].seq_id) * 1099511628211ULL;
@@ -2347,11 +2963,37 @@ bool ArchMla::stage_step(
             // unchanged (a single dead row IS the all-dense case).
             d_.indexer_row_dense_.assign(static_cast<size_t>(batch_size), 0);
             int n_dense = 0;
-            bool pages_ok = true;   // every SPARSE row on the paged path
+            // P-29 step 13 phase B: MTP layers (>= num_hidden_layers) track their
+            // OWN per-seq coverage — the MTP store lags the trunk by design
+            // (catch-up rows land one round late), so classifying it
+            // against the trunk frontier would refuse/kill valid appends.
+            // The step key keeps mixing the SEQ epoch (trunk cov) so a
+            // trunk re-feed invalidates MTP IndexShare reuse too.
+            const bool mtp_cov_layer = d_.deps_.live_config
+                && layer >= d_.deps_.live_config->model.num_hidden_layers;
             for (int b = 0; b < batch_size; ++b) {
-                auto& cov = d_.sequences_[be[b].seq_id].indexer_cov;
+                auto& seq_st = d_.sequences_[be[b].seq_id];
+                auto& cov = mtp_cov_layer ? seq_st.mtp_indexer_cov
+                                          : seq_st.indexer_cov;
                 const uint32_t pos = be[b].token_pos;
+                // INV-DSA-EPOCH: a row BEHIND the frontier at the step's
+                // FIRST layer is an overwrite re-feed (later layers of the
+                // same step see the identical shape and must NOT re-bump —
+                // every layer of one step must emit one key). This includes
+                // pos + 1 == next_pos, which at layer 0 is never the
+                // later-layer `repeat` but a re-dispatch of the previous
+                // position (the guided fed-1 re-feed / a retried step).
+                // GF3.9: keyed on the step's FIRST indexer-computing layer
+                // (legacy: 0 — byte-identical; glm5_next: 3, since layers
+                // 0-2 are KDA and never run this machine).
+                if (layer == d_.indexer_first_compute_layer()
+                    && pos < cov.next_pos)
+                    cov.epoch = ++d_.indexer_epoch_next_;
+                // P-29 step 13: ALWAYS the seq (trunk) epoch — MTP-layer rows mix
+                // it too, so a trunk re-feed invalidates their reuse keys.
+                key = (key ^ seq_st.indexer_cov.epoch) * 1099511628211ULL;
                 if (cov.mode == IndexerSeqMode::kDead) {
+                    d_.step_indexer_dense_ = 1;  // dense step (witness byte)
                     d_.indexer_row_dense_[b] = 1;
                     ++n_dense;
                     continue;
@@ -2367,25 +3009,77 @@ bool ArchMla::stage_step(
                     && pos < cov.next_pos;
                 if (!advancing && !repeat && !rewind) {  // gap
                     cov.mode = IndexerSeqMode::kDead;
+                    d_.indexer_mark_dead(be[b].seq_id, layer, pos,
+                                         cov.next_pos,
+                                         "decode-step position gap (step "
+                                         "neither advances, repeats, nor "
+                                         "rewinds coverage)");
                     d_.indexer_row_dense_[b] = 1;
                     ++n_dense;
                     continue;
                 }
-                if (cov.mode == IndexerSeqMode::kArena) {
-                    if (batch_size > 1) {  // arena is B==1-only → this row
-                        cov.mode = IndexerSeqMode::kDead;  // is dense → gap
-                        d_.indexer_row_dense_[b] = 1;
-                        ++n_dense;
-                        continue;
+                // GF3.5 IndexPool rewind pool-safety (the INV-DSA-REWIND
+                // refinement for pooled stores): a position-keyed overwrite
+                // re-feed can only recompose the pools it re-feeds when its
+                // START is a pool boundary, OR lies inside the still-in-
+                // progress frontier pool (whose tail slots are position-
+                // keyed and intact). A deeper unaligned rewind would need
+                // raw keys of a COMPLETED pool's leading slots — discarded
+                // at pooling — so it REFUSES (kComputeValidation, coverage
+                // untouched, never silent-dense): the rewind producer
+                // (GF3.11 speculation/guided re-feeds) must round its
+                // re-feed start DOWN to a pool boundary.
+                {
+                    const int kp =
+                        d_.deps_.live_config->model.index_kpool;
+                    // P-29 step 13 (INV-DSA-REWIND contiguity): a pooled rewind
+                    // must start at a pool boundary or inside the frontier
+                    // pool — a completed pool's leading RAW keys are
+                    // discarded at compression, so a mid-pool restart into
+                    // it cannot recompose (measured: a mid-pool spec
+                    // restore perturbed the compressed pool -> top-k
+                    // selection -> latent argmax flips). A CONTIGUOUS run
+                    // from a legal start rewrites every later pool from
+                    // its first member, so continuation rows are blessed
+                    // through the per-seq window. The window must absorb
+                    // EVERY legal row (advancing/repeat included): the
+                    // step's FIRST indexer layer advances next_pos, so a
+                    // later layer re-walks the same rows BEHIND the
+                    // frontier and re-earns their legality only from the
+                    // window.
+                    auto& run = seq_st.rewind_run;
+                    const bool static_ok = kp <= 1 || pos % kp == 0
+                        || pos / kp == cov.next_pos / kp;
+                    const bool blessed = run.start <= run.end
+                        && pos >= run.start && pos <= run.end + 1;
+                    if (rewind && !advancing && !repeat
+                        && !static_ok && !blessed) {
+                        spdlog::error(
+                            "pooled rewind refused: layer {} pos {} "
+                            "next_pos {} run [{},{}]",
+                            layer, pos, cov.next_pos, run.start, run.end);
+                        d_.last_internal_error_cat_ =
+                            ipc::CmpErrorCategory::kComputeValidation;
+                        d_.last_internal_error_msg_ =
+                            "pooled indexer rewind start not pool-safe "
+                            "(round re-feed down to index_kpool boundary)";
+                        return false;
                     }
-                    pages_ok = false;  // stay pinned to the arena
-                    continue;
+                    if (blessed) {
+                        if (pos > run.end) run.end = pos;
+                    } else {
+                        // Legal non-continuation (advancing/repeat/static
+                        // rewind start): re-base the window here.
+                        run.start = pos;
+                        run.end = pos;
+                    }
                 }
                 // kUnset or kPaged: (re)provision — idempotent for repeats,
                 // grows one page group at page boundaries otherwise.
-                // Local indexer mode never blesses the arena (the executor
-                // arena is replicated-shape) — provisioning failure is a
-                // permanent dense downgrade instead.
+                // Provisioning failure for an UNRESERVED sequence is a
+                // permanent dense downgrade (S4 deleted the legacy B==1
+                // executor arena; reserved sequences take the fatal /
+                // refusal arms below instead).
                 const auto ipr =
                     d_.ensure_indexer_pages(be[b].seq_id, pos, b, dcp_size);
                 if (ipr == IndexerPageResult::kOk) {
@@ -2394,16 +3088,28 @@ bool ArchMla::stage_step(
                            && indexer_exhaustion_fatal(be[b].seq_id)) {
                     raise_indexer_exhausted();  // leave cov.mode intact
                     return false;
-                } else if (cov.mode == IndexerSeqMode::kUnset
-                           && batch_size == 1 && advancing
-                           && !indexer_local_mode) {
-                    cov.mode = IndexerSeqMode::kArena;  // arena from pos 0
-                    pages_ok = false;
+                } else if (ipr == IndexerPageResult::kUnavailable
+                           && indexer_reserved(be[b].seq_id)) {
+                    // A RESERVED sequence past the serving window (or a
+                    // wiring regression): refuse the step outright — dense
+                    // would be the silent 10x path this ticket ends, and a
+                    // retry cannot help (kUnavailable is permanent).
+                    d_.last_internal_error_cat_ =
+                        ipc::CmpErrorCategory::kComputeValidation;
+                    d_.last_internal_error_msg_ =
+                        "indexer-K unavailable past the reserved window "
+                        "(reserved seq must serve sparse or refuse)";
+                    return false;
                 } else {
-                    // kPaged growth failure (can't switch to arena: earlier
-                    // positions live in pages) or B>1 without pages → dense
-                    // row → gap.
+                    // Provisioning failure (pool exhausted for an
+                    // unreserved sequence, or unavailable shape) → dense
+                    // row → gap. Unreachable for reserved sequences (their
+                    // exhaustion/unavailable arms return above).
                     cov.mode = IndexerSeqMode::kDead;
+                    d_.indexer_mark_dead(
+                        be[b].seq_id, layer, pos, cov.next_pos,
+                        "decode-step indexer-K provisioning failed "
+                        "(unreserved legacy sequence)");
                     d_.indexer_row_dense_[b] = 1;
                     ++n_dense;
                 }
@@ -2414,23 +3120,22 @@ bool ArchMla::stage_step(
                 // suppression contract as before.
                 params.indexer_sparse_suppress = true;
             } else {
-                if (pages_ok) {
-                    params.indexer_k_pages        = d_.indexer_table_bases_.data();
-                    params.indexer_k_page_stride  = d_.indexer_page_stride_;
-                    params.indexer_k_batch_stride = d_.indexer_batch_stride_;
-                    params.indexer_k_page_tokens  = d_.deps_.live_config
-                        ->memory.kv_cache.indexer_k_page_size_tokens;
-                }
-                // Commit coverage for SPARSE rows only: paged batches append
-                // every live entry; the B==1 arena path appends via the
-                // executor arena. A dense row's key is never appended — its
-                // coverage stays behind (it is kDead already). (pages_ok=
-                // false at B>1 is unreachable here — the arena branch above
-                // kills it.)
+                params.indexer_k_pages        = d_.indexer_table_bases_.data();
+                params.indexer_k_page_stride  = d_.indexer_page_stride_;
+                params.indexer_k_batch_stride = d_.indexer_batch_stride_;
+                params.indexer_k_page_tokens  = d_.deps_.live_config
+                    ->memory.kv_cache.indexer_k_page_size_tokens;
+                // Commit coverage for SPARSE rows only: paged batches
+                // append every live entry. A dense row's key is never
+                // appended — its coverage stays behind (it is kDead
+                // already).
                 params.indexer_step_key = key ? key : 1;
+                d_.last_indexer_step_key_ = params.indexer_step_key;
                 for (int b = 0; b < batch_size; ++b) {
                     if (d_.indexer_row_dense_[b]) continue;
-                    auto& cov = d_.sequences_[be[b].seq_id].indexer_cov;
+                    auto& seq_st2 = d_.sequences_[be[b].seq_id];
+                    auto& cov = mtp_cov_layer ? seq_st2.mtp_indexer_cov
+                                              : seq_st2.indexer_cov;
                     if (be[b].token_pos == cov.next_pos) ++cov.next_pos;
                 }
                 // MIXED cohort (only possible at B>1): hand the executor the
@@ -2445,21 +3150,80 @@ bool ArchMla::stage_step(
             // chunk APPEND (executor runs the producer's K half, batched; no
             // scoring, no sparse consumption — attention stays dense prefill)
             // and advance coverage by chunk_len. Supported shape: ONE
-            // sequence, consecutive ascending positions (the only shape the
-            // engine's prefill emits). Anything else cannot append → the
-            // skipped positions form a permanent gap (legacy behavior).
+            // sequence, consecutive ascending positions — the ONLY shape any
+            // live producer can even express: every prefill descriptor
+            // writer (RingBridge.write_batch_descriptors(seq_id, pos0, n);
+            // the orchestrator loop's superchunk / verify-batch descriptor
+            // comprehensions) takes (seq_id, pos0, n) and emits exactly
+            // this, matching the command's own single chunk_start/chunk_len
+            // window.
+            //
+            // TD-KVT-BATCH-COHORT (indexer-coverage rider, 2026-08-28): a
+            // failing shape is therefore a MALFORMED COMMAND STREAM — the
+            // sideband contradicting the command's own chunk descriptor —
+            // never a real batch composition. This site used to mark EVERY
+            // involved sequence kDead and then let the step execute dense:
+            // healthy sequences died for a neighbour's fault, and the chunk
+            // ran against an attention contract (one contiguous window of
+            // one sequence — chunk_rows staging, position-keyed k_append)
+            // that the descriptors already violate, so no row of such a
+            // step can be served correctly and the step cannot be split
+            // (there is one chunk_start/chunk_len per command). REFUSE it
+            // outright instead: kComputeValidation, coverage untouched — no
+            // sequence dies, no dense step is served (zero-kDead,
+            // INV-DSA-RESERVE (f)), no cross-sequence k_append can land,
+            // and the bug surfaces as a loud command error instead of a
+            // permanent 10x dense downgrade.
             bool shape_ok = batch_size >= 1;
             for (int b = 1; b < batch_size && shape_ok; ++b)
                 shape_ok = be[b].seq_id == be[0].seq_id
                         && be[b].token_pos
                                == be[0].token_pos + static_cast<uint32_t>(b);
             if (!shape_ok) {
-                for (int b = 0; b < batch_size; ++b)
-                    d_.sequences_[be[b].seq_id].indexer_cov.mode =
-                        IndexerSeqMode::kDead;
+                spdlog::error(
+                    "ArchMla::stage_step: malformed prefill chunk — batch "
+                    "descriptors are not ONE sequence at consecutive "
+                    "ascending positions (b0: seq {} pos {}, B {}, layer {})"
+                    " — refusing the step, coverage untouched "
+                    "(TD-KVT-BATCH-COHORT)",
+                    be[0].seq_id, be[0].token_pos, batch_size, layer);
+                d_.last_internal_error_cat_ =
+                    ipc::CmpErrorCategory::kComputeValidation;
+                d_.last_internal_error_msg_ =
+                    "malformed prefill chunk: descriptors not one sequence "
+                    "at consecutive positions";
+                return false;
             } else {
-                auto& cov = d_.sequences_[be[0].seq_id].indexer_cov;
+                // P-29 step 13: MTP layers (>= num_hidden_layers) track their own
+                // coverage — the MTP prompt-fill chunks advance IT, not the
+                // trunk frontier (see the decode-branch note).
+                auto& pf_seq = d_.sequences_[be[0].seq_id];
+                const bool mtp_cov_layer = d_.deps_.live_config
+                    && layer >=
+                           d_.deps_.live_config->model.num_hidden_layers;
+                auto& cov = mtp_cov_layer ? pf_seq.mtp_indexer_cov
+                                          : pf_seq.indexer_cov;
                 const uint32_t pos0 = be[0].token_pos;
+                // INV-DSA-EPOCH: a chunk starting BEHIND the frontier at the
+                // step's FIRST layer is an overwrite re-feed (the dsp52
+                // partial-acceptance verify chunk) — advance the epoch ONCE
+                // for the step; later layers replay the same chunk (repeat /
+                // rewind shape, layer != 0) and re-mix the same epoch, so
+                // all layers of the step emit one key. Superchunk sub-chunks
+                // are never re-feeds (their layer-0 sweep starts AT the
+                // frontier; behind-frontier superchunks fail closed below).
+                // NOTE: if the superchunk rewind exclusion is ever un-gated
+                // (see the rewind arm below), THIS `!p.superchunk` must be
+                // deleted in the same change — a re-feed with different
+                // tokens at unchanged positions must re-draw the epoch or a
+                // stale IndexShare selection could validate (INV-DSA-EPOCH).
+                // Per-sub-chunk multi-bump is safe: an epoch bump only
+                // invalidates reuse (recompute-as-full), never coverage.
+                if (layer == d_.indexer_first_compute_layer()
+                    && !p.superchunk && pos0 < cov.next_pos)
+                    cov.epoch = ++d_.indexer_epoch_next_;
+                // P-29 step 13: ALWAYS the seq (trunk) epoch (decode-branch twin).
+                key = (key ^ pf_seq.indexer_cov.epoch) * 1099511628211ULL;
                 const uint32_t end  = pos0 + static_cast<uint32_t>(batch_size);
                 const bool advancing = (pos0 == cov.next_pos);
                 // TD-PREFILL-SUPERCHUNK: a superchunk advances the frontier by
@@ -2484,58 +3248,107 @@ bool ArchMla::stage_step(
                 // overwrites) and extends the high-water mark when end >
                 // next_pos. Superchunk sub-chunks keep their own repeat
                 // shape and are never rewinds (fail-closed together).
+                // TD-INDEXER-SUPERCHUNK-REWIND CLOSED-AS-UNREACHABLE
+                // (2026-08-29, 5th and final re-check — post R4a/R4c/S3/S4):
+                // every producer of superchunk=1 (fresh-prompt sc prefill,
+                // hit-child delta sc prefill — grid-clamped AND sub-grid
+                // opt-in both start at pos0 == the fork-clamped next_pos —
+                // longctx/restore continue) starts its layer-0 sweep AT the
+                // frontier; pool-evict retries re-issue the whole superchunk
+                // with IDENTICAL sub-chunk slicing (a pure function of
+                // (pos0, n, sub)), so behind-frontier re-issues land in the
+                // repeat arm, and every genuine rewind producer (dsp52
+                // verify re-feed, guided bonus re-feed, masked step) is
+                // superchunk=0 by construction. IF a future producer routes
+                // a re-feed through the superchunk path: delete BOTH
+                // `!p.superchunk` gates (this arm AND the epoch bump above),
+                // together, behind compute.dsa_indexer_rewind — the shapes
+                // stay disambiguated by the action code (replay-as-rewind is
+                // an idempotent position-keyed overwrite, action-identical
+                // to repeat). Full verdict: spec/TECH_DEBT.md history at
+                // commit 0e0f6496.
                 const bool rewind = d_.indexer_rewind_ok_
                     && !p.superchunk && pos0 < cov.next_pos;
+                // GF3.5 IndexPool rewind pool-safety — the decode-arm twin
+                // (see there): a pooled chunk re-feed must start at a pool
+                // boundary or inside the in-progress frontier pool.
+                if (rewind && !advancing && !repeat) {
+                    const int kp =
+                        d_.deps_.live_config->model.index_kpool;
+                    if (kp > 1 && pos0 % kp != 0
+                        && pos0 / kp != cov.next_pos / kp) {
+                        d_.last_internal_error_cat_ =
+                            ipc::CmpErrorCategory::kComputeValidation;
+                        d_.last_internal_error_msg_ =
+                            "pooled indexer chunk-rewind start not "
+                            "pool-safe (round down to index_kpool "
+                            "boundary)";
+                        return false;
+                    }
+                }
                 if (cov.mode == IndexerSeqMode::kDead) {
                     // stays dead — no append, no blessing
+                    d_.step_indexer_dense_ = 1;  // witness byte
                 } else if (!advancing && !repeat && !rewind) {
                     cov.mode = IndexerSeqMode::kDead;  // gap (or rewind with
                                                        // LS_INDEXER_REWIND
                                                        // unset)
+                    d_.indexer_mark_dead(
+                        be[0].seq_id, layer, pos0, cov.next_pos,
+                        "prefill-chunk position gap (neither advancing, "
+                        "layer-replay repeat, nor blessed rewind — "
+                        "LS_INDEXER_REWIND off or superchunk shape)");
                 } else {
-                    bool pages_ok = true;
-                    if (cov.mode == IndexerSeqMode::kArena) {
-                        pages_ok = false;  // pinned to the arena
+                    // Provision pages covering [pos0, end): per-row calls
+                    // grow the pool allocation cumulatively AND fill each
+                    // batch row's table slice (the appender reads row b's
+                    // slice for position b). Idempotent for repeats.
+                    // Provisioning failure for an UNRESERVED sequence is a
+                    // permanent dense downgrade (S4 deleted the legacy
+                    // B==1 executor arena; reserved sequences take the
+                    // fatal / refusal arms below instead).
+                    auto ipr = IndexerPageResult::kOk;
+                    for (int b = 0;
+                         b < batch_size && ipr == IndexerPageResult::kOk;
+                         ++b)
+                        ipr = d_.ensure_indexer_pages(be[0].seq_id,
+                                                  be[b].token_pos, b,
+                                                  dcp_size);
+                    const bool ok = ipr == IndexerPageResult::kOk;
+                    if (ok) {
+                        cov.mode = IndexerSeqMode::kPaged;
+                    } else if (ipr == IndexerPageResult::kExhausted
+                               && indexer_exhaustion_fatal(
+                                      be[0].seq_id)) {
+                        raise_indexer_exhausted();  // cov.mode intact
+                        return false;
+                    } else if (ipr == IndexerPageResult::kUnavailable
+                               && indexer_reserved(be[0].seq_id)) {
+                        // Reserved sequence past its window: refuse the
+                        // step (see the decode-branch twin) — never
+                        // dense.
+                        d_.last_internal_error_cat_ =
+                            ipc::CmpErrorCategory::kComputeValidation;
+                        d_.last_internal_error_msg_ =
+                            "indexer-K unavailable past the reserved "
+                            "window (reserved seq must serve sparse or "
+                            "refuse)";
+                        return false;
                     } else {
-                        // Provision pages covering [pos0, end): per-row calls
-                        // grow the pool allocation cumulatively AND fill each
-                        // batch row's table slice (the appender reads row b's
-                        // slice for position b). Idempotent for repeats.
-                        auto ipr = IndexerPageResult::kOk;
-                        for (int b = 0;
-                             b < batch_size && ipr == IndexerPageResult::kOk;
-                             ++b)
-                            ipr = d_.ensure_indexer_pages(be[0].seq_id,
-                                                      be[b].token_pos, b,
-                                                      dcp_size);
-                        const bool ok = ipr == IndexerPageResult::kOk;
-                        if (ok) {
-                            cov.mode = IndexerSeqMode::kPaged;
-                        } else if (ipr == IndexerPageResult::kExhausted
-                                   && indexer_exhaustion_fatal(
-                                          be[0].seq_id)) {
-                            raise_indexer_exhausted();  // cov.mode intact
-                            return false;
-                        } else if (cov.mode == IndexerSeqMode::kUnset
-                                   && advancing && !indexer_local_mode) {
-                            // Fresh sequence (next_pos == pos0 == 0): the
-                            // arena is fine for a single-sequence chunk.
-                            // (Never in local mode — replicated-shape arena.)
-                            cov.mode = IndexerSeqMode::kArena;
-                            pages_ok = false;
-                        } else {
-                            cov.mode = IndexerSeqMode::kDead;  // growth failed
-                        }
+                        cov.mode = IndexerSeqMode::kDead;  // growth failed
+                        d_.indexer_mark_dead(
+                            be[0].seq_id, layer, pos0, cov.next_pos,
+                            "prefill-chunk indexer-K provisioning "
+                            "failed (unreserved legacy sequence)");
                     }
                     if (cov.mode != IndexerSeqMode::kDead) {
-                        if (pages_ok) {
-                            params.indexer_k_pages = d_.indexer_table_bases_.data();
-                            params.indexer_k_page_stride  = d_.indexer_page_stride_;
-                            params.indexer_k_batch_stride = d_.indexer_batch_stride_;
-                            params.indexer_k_page_tokens  = d_.deps_.live_config
-                                ->memory.kv_cache.indexer_k_page_size_tokens;
-                        }
+                        params.indexer_k_pages = d_.indexer_table_bases_.data();
+                        params.indexer_k_page_stride  = d_.indexer_page_stride_;
+                        params.indexer_k_batch_stride = d_.indexer_batch_stride_;
+                        params.indexer_k_page_tokens  = d_.deps_.live_config
+                            ->memory.kv_cache.indexer_k_page_size_tokens;
                         params.indexer_step_key = key ? key : 1;
+                        d_.last_indexer_step_key_ = params.indexer_step_key;
                         params.indexer_prefill_append = true;
                         if (advancing) {
                             cov.next_pos = end;
@@ -2609,10 +3422,13 @@ bool ArchMla::stage_step(
         tier_pos_ = tbe[0].token_pos;
         // TD-KVT-PREFILL: a blessed prefill chunk is tierable only when the
         // executor will actually run it SPARSE — gate mirrors the
-        // executor's own sparse-prefill pass (Options::sparse_prefill on,
-        // replicated KV; replicated indexer is guaranteed by the tiering
-        // construction gate).  A dense chunk under tiering would stage the
-        // full prefix through the real block tables (INV-KVT-2).
+        // executor's own sparse-prefill pass (Options::sparse_prefill on;
+        // indexer MODE is irrelevant — under dcp_indexer_mode=local the
+        // executor's exact cross-rank merge reconstructs the identical
+        // global selection before any tiering hook runs,
+        // TD-KVT-LOCAL-INDEXER-UNBLOCK).  A dense chunk under tiering
+        // would stage the full prefix through the real block tables
+        // (INV-KVT-2).
         // TD-KVT-ADMISSION-UPFRONT (memory.kv_tiering.tiered_prefill): a
         // blessed sparse prefill CHUNK COHORT (B>1 rows of ONE sequence —
         // the indexer_prefill_append blessing already validated same-seq

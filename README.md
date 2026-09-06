@@ -251,6 +251,14 @@ Re-run it after changing the ring protocol.
 
 ## First steps (GLM-5.2 on a 4-GPU box)
 
+> **The short path.** Steps 2-4 below (calibrate, train the solver, fit a
+> config to your VRAM) are what `python python/cli/autoconfigure.py --model
+> <weights>` does for you: it probes the model, calibrates the box, derives a
+> full recipe, trains the loader constants on a real 100-token decode and
+> prints the serve command. See **spec/AUTO_RUN.md**. Read on for the manual
+> flow — it is what the automated one runs, and what you want when you are
+> tuning rather than deploying.
+
 ### 1. Get the model and prepack it
 
 Download the GLM-5.2 **UD-Q4_K_XL** GGUF (11 shards) into
@@ -269,7 +277,9 @@ io_uring O_DIRECT on a Gen3 x4 link — cold arena builds are disk-bound).
 
 ### 2. Calibrate the hardware and train the placement solver
 
-The I8 solver needs to know *your* box. Two steps:
+The I8 solver needs to know *your* box. Two steps (both automated by
+`autoconfigure --model`, which runs them through the ordinary serve
+path instead of the keeper harness):
 
 1. **Calibrate** (measure link/kernel rates): set `gpu_loader.enabled: true` with
    `gpu_loader.calibration_path` pointing at a writable JSON. On first run with

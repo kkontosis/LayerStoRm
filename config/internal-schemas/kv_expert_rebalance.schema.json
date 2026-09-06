@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "x-configFile": "kv_expert_rebalance.json",
+  "description": "KV <-> expert zone rebalancer policy knobs (44z; TD-KVXP-SCHEMA-KNOBS). Engine-side: read once at engine init into ExpertZoneRebalancerConfig. Every field keeps its LS_* env var as an override EITHER WAY (the kda_state.mapped precedence: a set env var wins over the config value, an unset one leaves the config value in force), so a measured recipe can pin the policy while an operator can still flip it in place. Loaded from kv_expert_rebalance.json if not inlined.",
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Master switch for the KV <-> expert zone rebalancer (44z). DEFAULT ON since 2026-09-03 (user decision) on the glm5_next EP4 decisive A/B: ON was the TIGHTEST of six arms (CV 0.08%/0.13% vs OFF 0.15%/0.52%) \u2014 the rebalancer does NOT cost speed stability; it recovered 99.1% of a withheld carve at matched fetch volume (+0.026%); text was byte-identical across all 66 runs with degraded=0. Measured wall gain is modest and shape-dependent (+0.24% EP4 where the fetch window is already hidden; +1.1-1.6% at GLM-5.2 512k/1M) \u2014 the value is ELASTICITY, not speed. Known cost: a grant landing mid-decode dips that one run ~0.25% (~30 ms). KNOWN WART, see TD-KVXP-BOOT-OVERGRANT-FIRST-ADMISSION: the boot grant parks free just above high water, so the FIRST admission is refused and self-heals via an eager drain (0.6-1.5 s TTFT on request 1, deterministic on both ON boots). Set false to disable; LS_KV_EXPERT_REBALANCE overrides either way."
+    },
+    "max_waste": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.1,
+      "description": "Admissibility bound (44z \u00a73): the fraction of a claimed slab run the best-fit expert packing may strand. 0 is a live value ('only perfectly-packing grants') and is SAFE: grant sizing bounds grant_slabs by the pool's actual slab count, so the historical max_waste=0 boot hang cannot recur. Env override: LS_KVXP_MAX_WASTE (either way)."
+    },
+    "low_water_frac": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.9,
+      "default": 0.02,
+      "description": "Pool-fraction FLOOR under the absolute low-water mark \u2014 NOT the operative mark itself. The marks are derived absolutely from the admission transient (max_concurrent_admissions x upfront state + per-step growth headroom); this floor only lifts the derived mark when raised. Default 0.02 means 'no meaningful floor': setting a value at or below the derived mark moves nothing, by design. Raising both fractions reproduces the old fraction-shaped behavior. Env override: LS_KVXP_LOW_FRAC (either way)."
+    },
+    "high_water_frac": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.9,
+      "default": 0.0,
+      "description": "Pool-fraction FLOOR under the absolute high-water mark \u2014 NOT the operative mark itself (see low_water_frac). Default 0.0 = no floor. A value at or below low_water_frac is subsumed by the low floor and has no effect (the runtime warns; the derived hysteresis band always has a checked width regardless, so this can no longer produce a thrashing configuration and is not a load-time refusal). Env override: LS_KVXP_HIGH_FRAC (either way)."
+    },
+    "max_slots_per_grant": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096,
+      "default": 8,
+      "description": "Bounds the ASK, not the FILL: caps how many expert SLOTS one grant may ask for (the grant claims slabs_for_slots of the capped count, then takes EVERY slot those slabs hold \u2014 stranding claimed capacity is exactly the waste max_waste forbids, so the fill is slots_in(claimed_slabs)). resolve_marks sizes grant viability at eff_cap = min(this cap, best_fit(total).num_slots), i.e. at the grant the pool can actually produce (TD-KVXP-FAT-KV-ARM). Env override: LS_KVXP_MAX_SLOTS_PER_GRANT (either way)."
+    },
+    "tick_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3600000,
+      "default": 200,
+      "description": "Minimum interval between rebalancer ticks on the daemon thread, in ms. 0 is a LIVE, reachable value \u2014 tick every daemon cycle \u2014 which the grant-cooldown tick derivation treats as 1 ms/tick so the cooldown stays a real duration. Env override: LS_KVXP_TICK_MS (either way)."
+    },
+    "grant_cooldown_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400000,
+      "default": 30000,
+      "description": "Wall-clock window after ANY completed reclaim during which no NEW grant may be issued; reclaims are never delayed. A DURATION deliberately (a tick count silently shrank whenever tick_ms was lowered, quietly reintroducing the band-edge churn it exists to damp; the equivalent tick count is derived once at resolve_marks). CHURN DAMPING ONLY \u2014 explicitly NOT load-bearing for liveness: the regrant wedge's root cause lived in the drain path (ELM bypass), not here. Default 30 s outlasts most prefills' pressure ramp (at 5 s a re-grant fired mid-prefill and was reclaimed again \u2014 pure churn). 0 disables. Env override: LS_KVXP_GRANT_COOLDOWN_MS (either way); the deprecated LS_KVXP_GRANT_COOLDOWN_TICKS alias stays env-only and converts through the tick interval with a warning."
+    }
+  },
+  "additionalProperties": false
+}

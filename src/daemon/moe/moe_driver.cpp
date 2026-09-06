@@ -7,6 +7,7 @@
 #include "daemon/dispatch_detail.h"
 #include "daemon/moe/arch_mla_moe.h"
 #include "daemon/moe/arch_deepseek_v4_moe.h"
+#include "daemon/moe/moe_internal.h"  // 44z: TD-91d zero-fill guard counters
 #include "daemon/moe/quant_routes.h"
 #include "daemon/ep_residency_dedup.h"  // INV-MOE-EP-DISJOINT force-ON dedup
 #include "daemon/expert_lifecycle_manager.h"
@@ -38,6 +39,7 @@
 #include "core/statistics/expert_stats.h"  // ExpertStats recency feed (FETCH path)
 #include "parallelism/dcp_communicator.h"
 #include "compute/kernels/elementwise/residual_add.h"
+#include "compute/kernels/elementwise/graph_node_ops.h"
 #include "compute/kernels/mhc/mhc.h"
 #include "smxx/permute/moe_permute.h"  // DET-REDUCE Phase 1b: fp32→bf16 EP-combine cast
 #include "compute/kernels/moe/moe_gemm_meta.h"
@@ -50,6 +52,28 @@
 namespace layerstorm::daemon {
 
 namespace {
+
+// ── P-29 step 2 (KCOPY, 2026-09-03): kernel-node emission for the routed
+// FFN decode graph. Every memcpy/memset NODE in a captured graph costs
+// ~1.5 us of host time at EVERY replay (driver node handling), vs ~0.1 us
+// for a kernel node — the captured FFN graph carried 3 H2D + 2 D2D + 3-4
+// memset nodes per replay (8.6 us med replay, 2.5 ms/token, measured).
+// Emitting the same byte movements as kernels (graph_node_ops.h) is
+// byte-identical and cuts the replay toward the pure-kernel floor.
+// LS_FFN_GRAPH_KCOPY=0 restores the memcpy/memset emission (A/B arm).
+// Read once per process so the emitted control flow is fixed per graph
+// variant (capture-vs-replay consistency).
+bool ffn_graph_kcopy_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("LS_FFN_GRAPH_KCOPY");
+        const bool v = !(e && e[0] == '0');
+        if (!v)
+            spdlog::warn("LS_FFN_GRAPH_KCOPY=0: routed-FFN emit keeps "
+                         "memcpy/memset nodes (slow-replay A/B arm)");
+        return v;
+    }();
+    return on;
+}
 // ── TD-DRIFT-ROOTCAUSE: DIAGNOSTIC-ONLY routing dump (off by default) ──────────
 // Gated on LS_DRIFT_DUMP=<path>. When set, dumps a binary record per
 // (sequence, layer, gpu) immediately after the top-K gate runs: the full
@@ -103,6 +127,26 @@ void drift_dump_routing(compute::DeviceBackend* dev_be, void* stream,
 }
 }  // namespace
 
+// ── P-29 step 17 (LS_FAR_ISSUE_SLIM) ───────────────────────────────────────
+// Read once: fused single-pass graph b_ptr staging fill (one residency scan +
+// ONE cache lookup per resident expert filling all three projections, with
+// live-index tracking so untouched excluded entries are never re-written).
+// The staged bytes are identical to the legacy three per-projection walks —
+// bit-identical by construction. Default ON; =0 restores the legacy fills.
+namespace {
+bool far_issue_slim_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("LS_FAR_ISSUE_SLIM");
+        const bool v = !(e && e[0] == '0');
+        if (!v)
+            spdlog::info("fused b_ptr staging fill DISABLED "
+                         "(LS_FAR_ISSUE_SLIM=0) — legacy per-projection walks");
+        return v;
+    }();
+    return on;
+}
+}  // namespace
+
 // ── TD-DECODE-FFN-GRAPH (experiment) ──────────────────────────────────────
 // Read once: is the routed-expert FFN decode CUDA graph enabled? Gated on the
 // LS_MOE_FFN_GRAPH env var. INTENTIONALLY violates INV-0.6 for measurement.
@@ -136,15 +180,24 @@ bool CommandDispatcher::nccl_graph_enabled() {
 
 // ── INV-MOE-OVERLAP: decode fetch-overlap split ────────────────────────────
 // Read once: run resident-expert compute (wave-partial pass) concurrently with
-// the missing-expert H2D fetch at decode. Default ON; LS_MOE_RESIDENT_OVERLAP=0
-// restores the wait-then-single-pass behavior byte-identically.
+// the missing-expert H2D fetch at decode. Default OFF since P-29 step 18
+// (OQ-10): the split was built to hide expert fetch; on the glm5_next tp2/EP4
+// champion fetch is already fully hidden (dma-wait ~1.5 ms of ~37 ms, 0 cold
+// fetches; NO-P2P box) and the split's second dispatch pass + extra combine
+// COST 1.4-1.8% @8k / 1.4-3.3% @0.4k (A/B/A, non-overlapping ranges; OFF is
+// byte-identical to the champion trajectory at both rungs, fresh and repeat).
+// OFF also removes drift mechanism (i) of TD-MOE-EP-XTP-PLACEMENT-DRIFT (the
+// +2 cross-placement layer). LS_MOE_RESIDENT_OVERLAP=1 re-arms the split for
+// fetch-EXPOSED regimes (cold arena, tp1, dma-wait >~5 ms) — re-A/B there
+// before trusting either default.
 bool CommandDispatcher::moe_resident_overlap_enabled() {
     if (moe_resident_overlap_enabled_ < 0) {
         const char* e = std::getenv("LS_MOE_RESIDENT_OVERLAP");
-        moe_resident_overlap_enabled_ = (e && e[0] == '0') ? 0 : 1;
-        if (!moe_resident_overlap_enabled_)
+        moe_resident_overlap_enabled_ = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+        if (moe_resident_overlap_enabled_)
             spdlog::info("INV-MOE-OVERLAP: decode resident-overlap pass "
-                         "DISABLED (LS_MOE_RESIDENT_OVERLAP=0)");
+                         "ENABLED (LS_MOE_RESIDENT_OVERLAP=1; default OFF "
+                         "since P-29 step 18)");
     }
     return moe_resident_overlap_enabled_ == 1;
 }
@@ -227,17 +280,24 @@ void CommandDispatcher::publish_seam_routing(const InternalMoeParams& mp,
 void CommandDispatcher::publish_routing_export(uint32_t gpu, int num_tokens,
                                                int topk, uint32_t layer_idx,
                                                void* stream,
-                                               int src_row_offset) {
+                                               int src_row_offset,
+                                               int dst_row) {
     if (!deps_.sideband_base || gpu >= moe_scratch_.size())
         return;
     const auto& scratch = moe_scratch_[gpu];
     if (!scratch.topk_weights || !scratch.topk_indices)
         return;
-    const int export_tokens =
-        std::min(num_tokens, static_cast<int>(ipc::kMaxRoutingExportTokens));
+    // P-29 step 13 (spec-verify per-row loop): dst_row > 0 lands this command's
+    // rows at sideband rows [dst_row, dst_row+B) with a CUMULATIVE header
+    // (num_tokens = dst_row + B), so R per-row exports accumulate into one
+    // R-row export for the cross-row union. dst_row == 0 is the historical
+    // overwrite.
+    const int export_tokens = std::min(
+        num_tokens,
+        static_cast<int>(ipc::kMaxRoutingExportTokens) - dst_row);
     const int export_topk =
         std::min(topk, static_cast<int>(ipc::kRoutingExportMaxTopk));
-    if (export_tokens <= 0 || export_topk <= 0)
+    if (export_tokens <= 0 || export_topk <= 0 || dst_row < 0)
         return;
     // TD-PREFILL-SUPERCHUNK: export a sub-chunk's rows stored at its row
     // offset in moe_scratch_ (sideband rows stay [0, export_tokens)).
@@ -247,12 +307,14 @@ void CommandDispatcher::publish_routing_export(uint32_t gpu, int num_tokens,
         + static_cast<size_t>(src_row_offset) * topk;
     auto* hdr = reinterpret_cast<ipc::RoutingExportHeader*>(
         deps_.sideband_base + ipc::IpcLayout::kRoutingExportOff);
-    hdr->num_tokens = static_cast<uint32_t>(export_tokens);
+    hdr->num_tokens = static_cast<uint32_t>(dst_row + export_tokens);
     hdr->topk       = static_cast<uint32_t>(export_topk);
     hdr->layer_idx  = layer_idx;
     hdr->_pad       = 0;
-    void* w_dst = deps_.sideband_base + ipc::IpcLayout::kRoutingExportWeightsOff;
-    void* i_dst = deps_.sideband_base + ipc::IpcLayout::kRoutingExportIndicesOff;
+    void* w_dst = deps_.sideband_base + ipc::IpcLayout::kRoutingExportWeightsOff
+        + static_cast<size_t>(dst_row) * export_topk * sizeof(float);
+    void* i_dst = deps_.sideband_base + ipc::IpcLayout::kRoutingExportIndicesOff
+        + static_cast<size_t>(dst_row) * export_topk * sizeof(int32_t);
     const size_t w_bytes =
         static_cast<size_t>(export_tokens) * export_topk * sizeof(float);
     const size_t i_bytes =
@@ -286,6 +348,35 @@ void CommandDispatcher::publish_routing_export(uint32_t gpu, int num_tokens,
             }
         }
     }
+}
+
+// MoE arch selection — the ONE capability predicate for the by-model split
+// (moe/arch_base.h), shared by the single-shot driver below AND the chunked
+// sibling (moe_big.cpp) so the two paths cannot diverge
+// (TD-MOE-BIG-GLM5NEXT-MHC-POST). Every hook body keeps its original
+// data-gated condition verbatim and falls back to the common base body
+// (INV-MOE-ARCH), so behavior is identical under any config. The arch
+// objects are stateless facades over this dispatcher (friends),
+// constructed once.
+// GF3.9: selection is by CAPABILITY, not model name — the "V4" arch is
+// really the mHC-residual arch: every override is data-gated
+// (INV-MOE-ARCH: hash gating on moe_hash_layers, raw-BF16 shexp on its
+// gguf mix, hc_pre/hc_post on hc_streams > 1), so any mHC model takes
+// it losslessly. glm5_next (hc_mult 4) NEEDS the hc_post residual
+// stream mix — the base plain residual add dumps the raw FFN output
+// onto every stream (~8x residual inflation, the first-boot ladder
+// finding). Pre-GF3.9 models: hc_streams > 1 ⇔ deepseek_v4, so the
+// selection is byte-identical for them.
+MoeArch& CommandDispatcher::select_moe_arch() {
+    if (!moe_arch_mla_) {
+        moe_arch_mla_ = std::make_unique<ArchMlaMoe>(*this);
+        moe_arch_v4_  = std::make_unique<ArchDeepseekV4Moe>(*this);
+    }
+    const bool is_v4 =
+        deps_.live_config->model.architecture
+            == config::Architecture::deepseek_v4
+        || deps_.hc_streams > 1;
+    return is_v4 ? *moe_arch_v4_ : *moe_arch_mla_;
 }
 
 bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
@@ -326,19 +417,10 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     const int expanded_tokens = num_tokens * topk;
 
     // MoE by-model split (moe/arch_base.h): the model-special driver phases
-    // run through the MoeArch hooks. Selection mirrors the attention
-    // driver's is_v4 condition; every hook body keeps its original
-    // data-gated condition verbatim and falls back to the common base body
-    // (INV-MOE-ARCH), so behavior is identical under any config. The arch
-    // objects are stateless facades over this dispatcher (friends),
-    // constructed once.
-    const bool is_v4 =
-        mc.architecture == config::Architecture::deepseek_v4;
-    if (!moe_arch_mla_) {
-        moe_arch_mla_ = std::make_unique<ArchMlaMoe>(*this);
-        moe_arch_v4_  = std::make_unique<ArchDeepseekV4Moe>(*this);
-    }
-    MoeArch& arch = is_v4 ? *moe_arch_v4_ : *moe_arch_mla_;
+    // run through the MoeArch hooks — selection via the SHARED capability
+    // predicate (select_moe_arch, command_dispatcher.h), also used by the
+    // chunked sibling (moe_big.cpp, TD-MOE-BIG-GLM5NEXT-MHC-POST).
+    MoeArch& arch = select_moe_arch();
 
     dev->set_device();
     void* stream = deps_.stream_manager->stream(
@@ -347,8 +429,24 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // KD-R2: resolve pair for this GPU (if TP).
     const int pair_idx = resolve_pair_idx(gpu);
 
+    // P-29 step 16 (LS_FAR_PROLOGUE_PREISSUE): the FAR pre-issue already
+    // enqueued this rank's attn-event wait + mHC collapse + ffn RMSNorm on
+    // this same kExpertFfn stream (prime_cpu_input_only pass at FAR
+    // attention-dispatch time). Consume the primed buffers instead of
+    // re-emitting: the recompute is idempotent (same kernels, same inputs,
+    // same stream), so skipping it changes WHEN nothing and WHAT nothing —
+    // it only removes the duplicate from the post-readback critical path.
+    // Never applies to the prime pass itself, to extras (mask covers TP
+    // ranks only), or outside the pre-issued layer.
+    const bool prologue_primed = !mp.prime_cpu_input_only
+        && far_prologue_layer_ == mp.layer_idx
+        && gpu < 32
+        && ((far_prologue_gpu_mask_ >> (gpu & 31)) & 1u) != 0;
+
     // KD-R2: wait for attention residual on kAttention before reading.
-    if (pair_idx >= 0) {
+    // (Primed: the wait is already on-stream ahead of the primed prologue —
+    // stream order makes a second wait redundant.)
+    if (pair_idx >= 0 && !prologue_primed) {
         const auto& pair = deps_.hidden_state_pairs[pair_idx];
         if (pair.attn_moe_event) {
             deps_.stream_manager->wait_event(
@@ -381,7 +479,13 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // the norm then reads the collapsed x. Gated on norm_w presence — EP-xTP
     // extras (no norm weights) receive the already collapsed+normed broadcast.
     void* norm_input = hidden_input;
-    if (deps_.cuda_kernels_enabled && hidden_input && scratch.normalized_hidden) {
+    if (prologue_primed && hidden_input && scratch.normalized_hidden) {
+        // P-29 step 16: collapse+norm already primed on this stream at FAR
+        // time (prime returned true => norm weights existed and
+        // normalized_hidden was produced). The C-6 input-ready event was
+        // recorded by the prime pass itself.
+        norm_input = scratch.normalized_hidden;
+    } else if (deps_.cuda_kernels_enabled && hidden_input && scratch.normalized_hidden) {
         const parallelism::AttentionLayerWeights* lw = nullptr;
         const int layer = static_cast<int>(mp.layer_idx);
         // KD-R2: use pair.rank directly instead of scanning tp_gpus.
@@ -516,19 +620,30 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                          "metadata buffers on gpu {}", mp.layer_idx, gpu);
             return false;
         }
-        const int32_t d_offsets[2] = {0, num_tokens};
-        gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets, d_offsets,
-                                  2 * sizeof(int32_t), stream);
-        const int32_t d_gu_ps[3] = {num_tokens, 2 * I_dense_local, hidden};
-        gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_gu_ps,
-                                  3 * sizeof(int32_t), stream);
-        const int32_t d_gu_sf[2] = {0, ((num_tokens + 127) / 128) * 128};
-        gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, d_gu_sf,
-                                  2 * sizeof(int32_t), stream);
+        // MPOKE: the {0,B} offsets upload is cached behind a B fingerprint;
+        // the GGUF route never reads problem_sizes / sf_offsets / alphas /
+        // input_scales (GG-5b comment on GroupedGemmArgs), so those uploads
+        // are skipped outright under GGUF. LS_MOE_META_CACHE=0 restores the
+        // legacy per-token upload stream.
+        const bool meta_cache = moe_meta_cache_enabled();
+        if (!meta_cache || scratch.shared_offsets_last_b != num_tokens) {
+            const int32_t d_offsets[2] = {0, num_tokens};
+            gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets, d_offsets,
+                                      2 * sizeof(int32_t), stream);
+            scratch.shared_offsets_last_b = num_tokens;
+        }
+        if (!meta_cache || !use_gguf) {
+            const int32_t d_gu_ps[3] = {num_tokens, 2 * I_dense_local, hidden};
+            gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_gu_ps,
+                                      3 * sizeof(int32_t), stream);
+            const int32_t d_gu_sf[2] = {0, ((num_tokens + 127) / 128) * 128};
+            gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, d_gu_sf,
+                                      2 * sizeof(int32_t), stream);
+        }
 
         // Upload NVFP4 alpha (ws2 * input_scale, precomputed at engine load)
         // and the activation input_scale for the quantizer (FP4-ACT-SCALE).
-        if (!use_fp8 && scratch.nvfp4_alpha) {
+        if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
             gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                        &dw->alpha, sizeof(float), stream);
             gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -577,6 +692,11 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
             gu.strategy = gguf_strategy;
             gu.gate_up_weight = dw->gate_up;
             gu.single_b_ptr = scratch.gguf_single_b_ptr;
+            if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                gu.bind_cache = GgufBindCache{scratch.gguf_layer_b_ptrs,
+                                 scratch.gguf_layer_b_host.data(),
+                                 static_cast<int>(mp.layer_idx)};
+            }
             gu.expert_offsets =
                 static_cast<const int32_t*>(scratch.shared_expert_offsets);
             gu.dev = dev;
@@ -604,12 +724,15 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                       static_cast<float>(mc.swiglu_limit));
 
         // Re-populate problem_sizes for down GEMM dimensions.
-        const int32_t d_dn_ps[3] = {num_tokens, hidden, I_dense_local};
-        gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_dn_ps,
-                                  3 * sizeof(int32_t), stream);
+        // MPOKE: dead under GGUF (route reads neither) — skipped there.
+        if (!meta_cache || !use_gguf) {
+            const int32_t d_dn_ps[3] = {num_tokens, hidden, I_dense_local};
+            gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_dn_ps,
+                                      3 * sizeof(int32_t), stream);
+        }
 
         // Upload down_proj alpha + input_scale (may differ from gate+up).
-        if (!use_fp8 && scratch.nvfp4_alpha) {
+        if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
             gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                        &dw->alpha_down, sizeof(float), stream);
             gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -626,17 +749,69 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 use_fp8 ? nullptr : scratch.moe_input_scales});
         }
         // GG-5b: rebind the 1-element B_ptrs array to the dense down weight.
+        // MPOKE: cached per-(layer, slot 2) when the meta cache is on.
+        const void** dense_down_bptrs = nullptr;
         if (use_gguf) {
-            gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr, &dw->down,
-                                      sizeof(void*), stream);
+            if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                dense_down_bptrs = bind_gguf_b_slot(
+                    gpu_dev,
+                    GgufBindCache{scratch.gguf_layer_b_ptrs,
+                     scratch.gguf_layer_b_host.data(), static_cast<int>(mp.layer_idx)},
+                    /*slot=*/2, dw->down, stream);
+            } else {
+                gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr, &dw->down,
+                                          sizeof(void*), stream);
+                dense_down_bptrs =
+                    static_cast<const void**>(scratch.gguf_single_b_ptr);
+            }
         }
+
+        // LS_TP_FFN_PROBE (TD-GLM5-TP-COMBINE-PRECISION diagnostic): asum of
+        // the post-SwiGLU activation + (below) the post-combine output.
+        static const bool ffn_probe = [] {
+            const char* e = std::getenv("LS_TP_FFN_PROBE");
+            return e && e[0] && e[0] != '0';
+        }();
+        auto probe_bf16 = [&](const char* tag, const void* dbuf, int n) {
+            if (!ffn_probe || !dbuf) return;
+            std::vector<uint16_t> h(static_cast<size_t>(n));
+            gpu_dev->device_sync();
+            gpu_dev->memcpy_d2h_async(h.data(), dbuf,
+                                      static_cast<size_t>(n) * 2, nullptr);
+            gpu_dev->device_sync();
+            double asum = 0, sum = 0;
+            for (int i2 = 0; i2 < n; ++i2) {
+                uint32_t u = static_cast<uint32_t>(h[static_cast<size_t>(i2)]) << 16;
+                float f; std::memcpy(&f, &u, 4);
+                asum += std::fabs(f); sum += f;
+            }
+            spdlog::warn("[ffn-probe] {} L{} gpu{} n={} sum={:.10e} asum={:.10e}",
+                         tag, mp.layer_idx, mp.gpu_idx, n, sum, asum);
+        };
+        probe_bf16("dense-act", scratch.activation_output,
+                   num_tokens * I_dense_local);
 
         // Dense down GEMM. GGUF: BF16 activation_output → expert_output.
         // FP8/NVFP4: quant_act × W_down → expert_output [B, H].
+        // TD-GLM5-TP-COMBINE-PRECISION: under the fp32 TP combine the
+        // row-parallel partial goes to ffn_combine_f32 UN-ROUNDED; the
+        // caller allreduces fp32 and rounds to bf16 once into
+        // expert_output (dispatch_moe_all_ranks Phase 2).
+        const bool dense_fp32_partial =
+            mp.phase == MoeDispatchPhase::kPreAllreduce
+            && deps_.dcp_executor
+            && deps_.dcp_executor->tp_combine_fp32_active()
+            && scratch.ffn_combine_f32;
+        if (dense_fp32_partial && !use_gguf)
+            throw std::runtime_error(
+                "dense FFN down GEMM: fp32 TP combine "
+                "(TD-GLM5-TP-COMBINE-PRECISION) supports the GGUF route only");
         {
             GroupedGemmArgs gargs{use_fp8, 1, hidden, I_dense_local,
                 use_gguf ? scratch.activation_output : scratch.quant_act,
-                dw->down, scratch.expert_output,
+                dw->down,
+                dense_fp32_partial ? scratch.ffn_combine_f32
+                                   : scratch.expert_output,
                 scratch.quant_scale, dw->down_scales,
                 static_cast<const float*>(scratch.nvfp4_alpha),
                 static_cast<const int32_t*>(scratch.shared_expert_offsets),
@@ -648,7 +823,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 gargs.gguf_type = to_gguf_compute(dw->down_gguf_type);  // GG-5c: dense's OWN down type
                 gargs.gguf_strategy = gguf_strategy;
                 gargs.gguf_total_tokens = num_tokens;  // dense: 1 expert, B rows
-                gargs.B_ptrs = static_cast<const void**>(scratch.gguf_single_b_ptr);
+                gargs.B_ptrs = dense_down_bptrs;
+                gargs.d_fp32 = dense_fp32_partial;
             }
             launch_grouped_gemm(gargs);
         }
@@ -663,7 +839,30 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
         // V4-5b mHC: the FFN residual update is hc_post (doubly-stochastic
         // stream mix), not an add — ArchDeepseekV4Moe::residual_update; base
         // arch: plain residual add.
-        arch.residual_update(gpu, hidden_input, scratch.expert_output,
+        {
+            static const bool ffn_probe2 = [] {
+                const char* e = std::getenv("LS_TP_FFN_PROBE");
+                return e && e[0] && e[0] != '0';
+            }();
+            if (ffn_probe2 && scratch.expert_output) {
+                auto* pdev = deps_.device_backends[gpu];
+                std::vector<uint16_t> h(static_cast<size_t>(num_tokens) * hidden);
+                pdev->device_sync();
+                pdev->memcpy_d2h_async(h.data(), scratch.expert_output,
+                                          h.size() * 2, nullptr);
+                pdev->device_sync();
+                double asum = 0, sum = 0;
+                for (size_t i2 = 0; i2 < h.size(); ++i2) {
+                    uint32_t u = static_cast<uint32_t>(h[i2]) << 16;
+                    float f; std::memcpy(&f, &u, 4);
+                    asum += std::fabs(f); sum += f;
+                }
+                spdlog::warn("[ffn-probe] dense-out L{} gpu{} sum={:.10e} "
+                             "asum={:.10e}", mp.layer_idx, mp.gpu_idx, sum, asum);
+            }
+        }
+        arch.residual_update(static_cast<int>(mp.layer_idx), gpu,
+                             hidden_input, scratch.expert_output,
                              num_tokens, hidden, pair_idx, stream);
 
         // KD-R2: commit to attention buffer for next layer.
@@ -781,7 +980,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
         // For real MoE layers, valid top-K must already be in scratch; for
         // MTP/out-of-range layers there is no routing and we fall through to the
         // same silent-skip behaviour as the self-gating path.
-        const int num_layers = mc.num_hidden_layers;
+        // P-29 step 11: probe-armed MTP layers ARE real MoE layers (audit #1).
+        const int num_layers = moe_layer_bound(mc);
         const bool is_real_moe_layer = static_cast<int>(mp.layer_idx) >= first_k_dense
                                     && static_cast<int>(mp.layer_idx) < num_layers;
         router_valid = is_real_moe_layer && deps_.cuda_kernels_enabled;
@@ -810,7 +1010,7 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // a configuration or weight upload bug — report error to the orchestrator.
     // For MTP/out-of-range layers, silently skip (expected: no router weights).
     if (!router_valid) {
-        const int num_layers = mc.num_hidden_layers;
+        const int num_layers = moe_layer_bound(mc);  // P-29 step 11: incl. probe MTP
         const bool is_real_moe_layer = static_cast<int>(mp.layer_idx) >= first_k_dense
                                     && static_cast<int>(mp.layer_idx) < num_layers;
         if (is_real_moe_layer) {
@@ -890,7 +1090,10 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
         // Count unique missing experts among top-K selections.
         // TD-89aa: skip counting when D2H failed — host buffer may contain garbage.
         if (d2h_ok) {
-        uint8_t seen_missing[32] = {};
+        // TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION audit: was [32] (256 bits) —
+        // expert ids 256+ read/wrote past the array on the stack. Sized by
+        // the boot-enforced IPC cap (n_experts <= ipc::kMaxExperts).
+        uint8_t seen_missing[ipc::kMaxExperts / 8] = {};
         uint8_t miss_count = 0;
         for (int i = 0; i < num_tokens * topk; ++i) {
             const int e = indices_host[i];
@@ -976,9 +1179,17 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     // kind + the per-GPU wave-first bit are part of the variant key below so
     // each captured graph has fixed control flow. Prefill waves never reach
     // here (num_tokens > 1). kPartial uses the SEPARATE *_w b_ptrs staging.
+    // P-29 step 13 phase B: small-M eligibility — the speculative verify batches
+    // M = gamma+1 rows (<= 8) through this path every round; the emitted op
+    // list is fixed-shape for fixed M (the union/expert set is DATA via the
+    // pinned b_ptrs + routing staging, exactly like M == 1), so each M gets
+    // its own captured variant (num_tokens folded into the key below).
+    // Prefill chunks stay excluded (num_tokens > 8) except sub-8 tails,
+    // which are harmless extra variants under kMaxFfnGraphVariants.
     const bool ffn_graph_eligible =
         moe_ffn_graph_enabled() && deps_.cuda_kernels_enabled && !use_fp8 &&
-        num_tokens == 1 && scratch.quant_act && scratch.nvfp4_alpha &&
+        num_tokens >= 1 && num_tokens <= 8 &&
+        scratch.quant_act && scratch.nvfp4_alpha &&
         scratch.g_b_ptrs[0] && scratch.g_b_ptrs_host[0] &&
         (mp.wave_pass == MoeWavePass::kNone ||
          (scratch.g_b_ptrs_w[0] && scratch.g_b_ptrs_host_w[0] &&
@@ -1016,6 +1227,7 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
     void* const excluded_b = wave_null_skip
         ? nullptr : static_cast<void*>(scratch.zero_weight_buf);
     auto build_routed_b_ptrs = [&](auto proj_offset_fn, int64_t weight_bytes) {
+        int guard_fires = 0;  // 44z: TD-91d fires in THIS fill (warn once, count all)
         for (int e = 0; e < n_experts; ++e) {
             const bool is_resident = (bitset[e / 8] >> (e % 8)) & 1;
             if (is_resident) {
@@ -1024,7 +1236,12 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 const auto* entry = deps_.expert_cache->lookup(key, static_cast<int>(gpu));
                 // TD-91d: guard against concurrent eviction between bitset snapshot
                 // and lookup — fall back to zero buffer (same as non-resident path).
+                // 44z health tripwire: this fallback ZEROES a routed contribution
+                // the routing asked for, silently. Count it and warn — the caller
+                // (progressive finalize) diffs the counter and degrades the layer.
                 if (!entry || !entry->vram_address) {
+                    zone_guard_zero_fill_hit(mp.layer_idx, e,
+                                             static_cast<int>(gpu), guard_fires);
                     b_host[e]  = excluded_b;
                     sb_host[e] = excluded_b;
                     continue;
@@ -1038,6 +1255,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 sb_host[e] = excluded_b;
             }
         }
+        zone_guard_zero_fill_fill_done(mp.layer_idx, static_cast<int>(gpu),
+                                       guard_fires);
         gpu_dev->memcpy_h2d_async(scratch.routed_b_ptrs, b_host.data(),
                                   n_experts * sizeof(void*), stream);
         gpu_dev->memcpy_h2d_async(scratch.routed_sb_ptrs, sb_host.data(),
@@ -1056,13 +1275,18 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                                              : scratch.g_b_ptrs_host[proj];
         const void** sbh = use_wave_bptr_set ? scratch.g_sb_ptrs_host_w[proj]
                                              : scratch.g_sb_ptrs_host[proj];
+        int guard_fires = 0;  // 44z: TD-91d fires in THIS fill (warn once, count all)
         for (int e = 0; e < n_experts; ++e) {
             const bool is_resident = (bitset[e / 8] >> (e % 8)) & 1;
             if (is_resident) {
                 memory::ExpertKey key{static_cast<uint32_t>(mp.layer_idx),
                                       static_cast<uint16_t>(e)};
                 const auto* entry = deps_.expert_cache->lookup(key, static_cast<int>(gpu));
+                // TD-91d guard (graph staging) — same silent zeroing as the eager
+                // fill; 44z counts it so the layer is marked DEGRADED.
                 if (!entry || !entry->vram_address) {
+                    zone_guard_zero_fill_hit(mp.layer_idx, e,
+                                             static_cast<int>(gpu), guard_fires);
                     bh[e] = excluded_b; sbh[e] = excluded_b;
                     continue;
                 }
@@ -1074,6 +1298,81 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 bh[e] = excluded_b; sbh[e] = excluded_b;
             }
         }
+        zone_guard_zero_fill_fill_done(mp.layer_idx, static_cast<int>(gpu),
+                                       guard_fires);
+    };
+
+    // P-29 step 17 (LS_FAR_ISSUE_SLIM): fused variant of the three
+    // fill_graph_b_ptrs walks. ONE residency scan (byte-wise bit scan) and
+    // ONE expert_cache lookup per resident expert fill all three projections'
+    // pinned staging; previously-live indices are reset to the excluded value
+    // from the tracked live list instead of re-walking all n_experts entries
+    // three times. The staged BYTES equal the legacy walks exactly (same
+    // excluded value, same base+offset arithmetic, same TD-91d guard
+    // fallback — an expert evicted between bitset snapshot and lookup is
+    // left excluded in ALL THREE projections, which the legacy per-
+    // projection walks only guaranteed per-walk). A sentinel or a flip of
+    // the excluded value (null-skip decode nullptr vs small-M zero-buf)
+    // forces one full normalization pass first.
+    auto fill_graph_b_ptrs_fused = [&]() {
+        const int set = use_wave_bptr_set ? 1 : 0;
+        const void** bh[3];
+        const void** sbh[3];
+        for (int p = 0; p < 3; ++p) {
+            bh[p]  = use_wave_bptr_set ? scratch.g_b_ptrs_host_w[p]
+                                       : scratch.g_b_ptrs_host[p];
+            sbh[p] = use_wave_bptr_set ? scratch.g_sb_ptrs_host_w[p]
+                                       : scratch.g_sb_ptrs_host[p];
+        }
+        const int64_t wbytes[3] = {deps_.expert_cache->gate_weight_bytes(),
+                                   deps_.expert_cache->up_weight_bytes(),
+                                   deps_.expert_cache->down_weight_bytes()};
+        auto& live = scratch.g_bptr_live[set];
+        if (scratch.g_bptr_excluded[set] != excluded_b) {
+            for (int p = 0; p < 3; ++p)
+                for (int e = 0; e < n_experts; ++e) {
+                    bh[p][e]  = excluded_b;
+                    sbh[p][e] = excluded_b;
+                }
+            scratch.g_bptr_excluded[set] = excluded_b;
+        } else {
+            for (const uint16_t e : live)
+                for (int p = 0; p < 3; ++p) {
+                    bh[p][e]  = excluded_b;
+                    sbh[p][e] = excluded_b;
+                }
+        }
+        live.clear();
+        int guard_fires = 0;  // 44z: TD-91d fires in THIS fill
+        const int n_bytes = (n_experts + 7) / 8;
+        for (int w = 0; w < n_bytes; ++w) {
+            unsigned bits = bitset[w];
+            while (bits) {
+                const int e = w * 8 + __builtin_ctz(bits);
+                bits &= bits - 1;
+                if (e >= n_experts) break;
+                memory::ExpertKey key{static_cast<uint32_t>(mp.layer_idx),
+                                      static_cast<uint16_t>(e)};
+                const auto* entry =
+                    deps_.expert_cache->lookup(key, static_cast<int>(gpu));
+                if (!entry || !entry->vram_address) {
+                    zone_guard_zero_fill_hit(mp.layer_idx, e,
+                                             static_cast<int>(gpu),
+                                             guard_fires);
+                    continue;  // stays excluded in all three projections
+                }
+                auto* base = static_cast<uint8_t*>(entry->vram_address);
+                const int64_t offs[3] = {qr.gate_off(entry), qr.up_off(entry),
+                                         qr.down_off(entry)};
+                for (int p = 0; p < 3; ++p) {
+                    bh[p][e]  = base + offs[p];
+                    sbh[p][e] = base + offs[p] + wbytes[p];
+                }
+                live.push_back(static_cast<uint16_t>(e));
+            }
+        }
+        zone_guard_zero_fill_fill_done(mp.layer_idx, static_cast<int>(gpu),
+                                       guard_fires);
     };
 
     // ── GG-S1: the ONE routed-FFN op sequence (Step 2..6) ───────────────────
@@ -1132,6 +1431,33 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
             // Graph: captured H2D from pinned per-projection host staging into
             // the distinct device arrays (GGUF has no scale-B trailer → b only).
             // INV-MOE-OVERLAP: kPartial uses the *_w set (see fill_graph_b_ptrs).
+            // KCOPY (default): ONE kernel node stages ALL projections' pointer
+            // arrays up front (p==0) — the device kernel dereferences the SAME
+            // pinned staging via UVA at execution time (identical read-window
+            // semantics to the H2D nodes it replaces; all three pinned sets are
+            // filled before capture AND before every replay). Byte-identical;
+            // hoisting the down/up stages earlier in the stream is safe (no
+            // other in-graph writer of g_b_ptrs, first consumer is the GEMM).
+            if (ffn_graph_kcopy_enabled() && deps_.cuda_kernels_enabled) {
+                if (p != 0) return;  // all arrays staged in ONE kernel at p==0
+                compute::PtrArrayCopyDesc d[compute::kMaxPtrCopyArrays];
+                int nd = 0;
+                for (int q = 0; q < 3; ++q, ++nd) {
+                    d[nd].src = use_wave_bptr_set ? scratch.g_b_ptrs_host_w[q]
+                                                  : scratch.g_b_ptrs_host[q];
+                    d[nd].dst = bp(q);
+                }
+                if (!use_gguf) {
+                    for (int q = 0; q < 3; ++q, ++nd) {
+                        d[nd].src = use_wave_bptr_set
+                                        ? scratch.g_sb_ptrs_host_w[q]
+                                        : scratch.g_sb_ptrs_host[q];
+                        d[nd].dst = sbp(q);
+                    }
+                }
+                compute::launch_copy_ptr_arrays(d, nd, n_experts, stream);
+                return;
+            }
             gpu_dev->memcpy_h2d_async(
                 bp(p),
                 use_wave_bptr_set ? scratch.g_b_ptrs_host_w[p]
@@ -1145,16 +1471,25 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                     n_experts * sizeof(void*), stream);
         };
 
+        // KCOPY: zero-fills and the gate/up interleave emit as KERNELS instead
+        // of memset/memcpy2D nodes (byte-identical; see ffn_graph_kcopy_enabled
+        // — each non-kernel node costs ~1.5 us of host time per graph replay).
+        const bool kcopy = ffn_graph_kcopy_enabled() && deps_.cuda_kernels_enabled;
+        auto zero_dev = [&](void* p, size_t bytes) {
+            if (kcopy) compute::launch_zero_fill(p, bytes, stream);
+            else       gpu_dev->memset_async(p, 0, bytes, stream);
+        };
+
         // INV-MOE-OVERLAP null-skip: NULL-skipped experts' CTAs write NOTHING
         // (vs the zero-weight buffer which wrote zeros), so this pass's GEMM
         // output rows are pre-zeroed — the skipped rows then flow as exact
         // zeros through interleave → SwiGLU(0,0)=0 → down(skip) → accumulate
         // (+0), bit-identical to the zero-buffer result. Capture-safe.
         if (wave_null_skip) {
-            gpu_dev->memset_async(scratch.activation_output, 0,
-                static_cast<size_t>(expanded_tokens) * intermediate * 2, stream);
-            gpu_dev->memset_async(scratch.expert_output, 0,
-                static_cast<size_t>(expanded_tokens) * hidden * 2, stream);
+            zero_dev(scratch.activation_output,
+                static_cast<size_t>(expanded_tokens) * intermediate * 2);
+            zero_dev(scratch.expert_output,
+                static_cast<size_t>(expanded_tokens) * hidden * 2);
         }
 
         // §12h sub-seam M1: entry+gating done, routed emit begins.
@@ -1259,14 +1594,22 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
             if (use_gguf) {
                 if (expanded_tokens > 0) {
                     const size_t I_bytes = static_cast<size_t>(intermediate) * 2;
-                    gpu_dev->memcpy_2d_async(
-                        scratch.gate_up_output, I_bytes * 2,
-                        scratch.activation_output, I_bytes,
-                        I_bytes, expanded_tokens, stream);
-                    gpu_dev->memcpy_2d_async(
-                        static_cast<uint8_t*>(scratch.gate_up_output) + I_bytes, I_bytes * 2,
-                        scratch.expert_output, I_bytes,
-                        I_bytes, expanded_tokens, stream);
+                    if (kcopy && (I_bytes % 16) == 0) {
+                        // KCOPY: one kernel node does both strided halves.
+                        compute::launch_interleave_rows(
+                            scratch.gate_up_output, scratch.activation_output,
+                            scratch.expert_output, expanded_tokens, I_bytes,
+                            stream);
+                    } else {
+                        gpu_dev->memcpy_2d_async(
+                            scratch.gate_up_output, I_bytes * 2,
+                            scratch.activation_output, I_bytes,
+                            I_bytes, expanded_tokens, stream);
+                        gpu_dev->memcpy_2d_async(
+                            static_cast<uint8_t*>(scratch.gate_up_output) + I_bytes, I_bytes * 2,
+                            scratch.expert_output, I_bytes,
+                            I_bytes, expanded_tokens, stream);
+                    }
                 }
                 launch_swiglu(dev, scratch.activation_output, scratch.gate_up_output,
                               expanded_tokens, intermediate, stream,
@@ -1280,9 +1623,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 // nothing, so the skipped rows must be zeroed here or they
                 // accumulate stale up data (measured trajectory corruption).
                 if (wave_null_skip) {
-                    gpu_dev->memset_async(scratch.expert_output, 0,
-                        static_cast<size_t>(expanded_tokens) * hidden * 2,
-                        stream);
+                    zero_dev(scratch.expert_output,
+                        static_cast<size_t>(expanded_tokens) * hidden * 2);
                 }
             } else if (!use_fp8) {
                 // V4-4b note: the fused SiLU·mul→NVFP4 kernel has NO
@@ -1298,14 +1640,22 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
             } else {
                 if (expanded_tokens > 0) {
                     const size_t I_bytes = static_cast<size_t>(intermediate) * 2;
-                    gpu_dev->memcpy_2d_async(
-                        scratch.gate_up_output, I_bytes * 2,
-                        scratch.activation_output, I_bytes,
-                        I_bytes, expanded_tokens, stream);
-                    gpu_dev->memcpy_2d_async(
-                        static_cast<uint8_t*>(scratch.gate_up_output) + I_bytes, I_bytes * 2,
-                        scratch.expert_output, I_bytes,
-                        I_bytes, expanded_tokens, stream);
+                    if (kcopy && (I_bytes % 16) == 0) {
+                        // KCOPY: one kernel node does both strided halves.
+                        compute::launch_interleave_rows(
+                            scratch.gate_up_output, scratch.activation_output,
+                            scratch.expert_output, expanded_tokens, I_bytes,
+                            stream);
+                    } else {
+                        gpu_dev->memcpy_2d_async(
+                            scratch.gate_up_output, I_bytes * 2,
+                            scratch.activation_output, I_bytes,
+                            I_bytes, expanded_tokens, stream);
+                        gpu_dev->memcpy_2d_async(
+                            static_cast<uint8_t*>(scratch.gate_up_output) + I_bytes, I_bytes * 2,
+                            scratch.expert_output, I_bytes,
+                            I_bytes, expanded_tokens, stream);
+                    }
                 }
                 launch_swiglu(dev, scratch.activation_output, scratch.gate_up_output,
                               expanded_tokens, intermediate, stream,
@@ -1340,9 +1690,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
         const bool wave_accum = wave_accum_active;
         if (wave_accum) {
             if (wave_first) {
-                gpu_dev->memset_async(scratch.moe_wave_accum, 0,
-                                      static_cast<size_t>(expanded_tokens) * hidden * 2,
-                                      stream);
+                zero_dev(scratch.moe_wave_accum,
+                         static_cast<size_t>(expanded_tokens) * hidden * 2);
             }
             compute::launch_residual_add(scratch.moe_wave_accum,
                                          scratch.expert_output,
@@ -1380,7 +1729,9 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
         : (static_cast<uint32_t>(gguf_gate_type)
            | static_cast<uint32_t>(gguf_up_type) << 3
            | static_cast<uint32_t>(gguf_down_type) << 6
-           | static_cast<uint32_t>(mp.ep_combine_mode) << 9));
+           | static_cast<uint32_t>(mp.ep_combine_mode) << 9))
+        // P-29 step 13: M is baked into every launch shape — one variant per M.
+        | (static_cast<uint32_t>(num_tokens) << 16);
     // ── C-6 Task A (graph-hoist overlap): record the input-ready event ──────
     // norm (RMSNorm) + router (topk) are enqueued on THIS gpu's `stream` above
     // and are the ONLY inputs the host CPU-expert fold consumes. Record here —
@@ -1405,12 +1756,16 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
 
     if (ffn_graph_eligible && ffn_graph_runner) {
         // Fill all three pinned b_ptrs sets (host work, outside capture).
-        fill_graph_b_ptrs(0, gate_off_fn,
-                          deps_.expert_cache->gate_weight_bytes());
-        fill_graph_b_ptrs(1, up_off_fn,
-                          deps_.expert_cache->up_weight_bytes());
-        fill_graph_b_ptrs(2, down_off_fn,
-                          deps_.expert_cache->down_weight_bytes());
+        if (far_issue_slim_enabled()) {
+            fill_graph_b_ptrs_fused();
+        } else {
+            fill_graph_b_ptrs(0, gate_off_fn,
+                              deps_.expert_cache->gate_weight_bytes());
+            fill_graph_b_ptrs(1, up_off_fn,
+                              deps_.expert_cache->up_weight_bytes());
+            fill_graph_b_ptrs(2, down_off_fn,
+                              deps_.expert_cache->down_weight_bytes());
+        }
         // §12h sub-seam M1b: b_ptrs fills done, graph replay next.
         perf_trace::record(perf_trace::kMoeSegRankPre,
                            static_cast<uint16_t>(mp.gpu_idx), 0,
@@ -1516,22 +1871,30 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                     return true;
             } else {
             // Write shared_expert_offsets = {0, num_tokens} for single-expert grouped GEMM.
+            // MPOKE: B-fingerprint cached; GGUF-dead meta skipped (see the
+            // dense site above for the rationale).
             auto* gpu_dev = deps_.device_backends[gpu];
-            const int32_t offsets[2] = {0, num_tokens};
-            gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets, offsets,
-                                      2 * sizeof(int32_t), stream);
+            const bool meta_cache = moe_meta_cache_enabled();
+            if (!meta_cache || scratch.shared_offsets_last_b != num_tokens) {
+                const int32_t offsets[2] = {0, num_tokens};
+                gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets, offsets,
+                                          2 * sizeof(int32_t), stream);
+                scratch.shared_offsets_last_b = num_tokens;
+            }
 
             // KD-3f: populate shared problem_sizes + sf_offsets for gate+up.
-            const int32_t shared_gu_ps[3] = {num_tokens, 2 * intermediate_local, hidden};
-            gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, shared_gu_ps,
-                                      3 * sizeof(int32_t), stream);
-            const int32_t shared_gu_sf[2] = {0, ((num_tokens + 127) / 128) * 128};
-            gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, shared_gu_sf,
-                                      2 * sizeof(int32_t), stream);
+            if (!meta_cache || !use_gguf) {
+                const int32_t shared_gu_ps[3] = {num_tokens, 2 * intermediate_local, hidden};
+                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, shared_gu_ps,
+                                          3 * sizeof(int32_t), stream);
+                const int32_t shared_gu_sf[2] = {0, ((num_tokens + 127) / 128) * 128};
+                gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, shared_gu_sf,
+                                          2 * sizeof(int32_t), stream);
+            }
 
             // Upload NVFP4 alpha (ws2 * input_scale, precomputed at engine
             // load) + the activation input_scale for the quantizer.
-            if (!use_fp8 && scratch.nvfp4_alpha) {
+            if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                 gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                            &se->alpha, sizeof(float), stream);
                 gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -1566,6 +1929,11 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                 gu.strategy = gguf_strategy;
                 gu.gate_up_weight = se->gate_up;
                 gu.single_b_ptr = scratch.gguf_single_b_ptr;
+                if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                    gu.bind_cache = GgufBindCache{scratch.gguf_layer_b_ptrs,
+                                     scratch.gguf_layer_b_host.data(),
+                                     static_cast<int>(mp.layer_idx)};
+                }
                 gu.expert_offsets =
                     static_cast<const int32_t*>(scratch.shared_expert_offsets);
                 gu.dev = dev;
@@ -1595,13 +1963,16 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                           static_cast<float>(mc.swiglu_limit));
 
             // KD-3f: re-populate shared problem_sizes for down GEMM.
-            const int32_t shared_dn_ps[3] = {num_tokens, hidden, intermediate_local};
-            gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, shared_dn_ps,
-                                      3 * sizeof(int32_t), stream);
+            // MPOKE: dead under GGUF — skipped there.
+            if (!meta_cache || !use_gguf) {
+                const int32_t shared_dn_ps[3] = {num_tokens, hidden, intermediate_local};
+                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, shared_dn_ps,
+                                          3 * sizeof(int32_t), stream);
+            }
             // sf_offsets unchanged ({0, aligned_num_tokens}) — reuse from gate+up.
 
             // Upload down_proj alpha + input_scale (may differ from gate+up).
-            if (!use_fp8 && scratch.nvfp4_alpha) {
+            if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                 gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                            &se->alpha_down, sizeof(float), stream);
                 gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -1618,17 +1989,44 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                     use_fp8 ? nullptr : scratch.moe_input_scales});
             }
             // GG-5b: rebind the 1-element B_ptrs array to the shared down weight.
+            // MPOKE: cached per-(layer, slot 2) when the meta cache is on.
+            const void** shared_down_bptrs = nullptr;
             if (use_gguf) {
-                gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr, &se->down,
-                                          sizeof(void*), stream);
+                if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                    shared_down_bptrs = bind_gguf_b_slot(
+                        gpu_dev,
+                        GgufBindCache{scratch.gguf_layer_b_ptrs,
+                         scratch.gguf_layer_b_host.data(), static_cast<int>(mp.layer_idx)},
+                        /*slot=*/2, se->down, stream);
+                } else {
+                    gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr, &se->down,
+                                              sizeof(void*), stream);
+                    shared_down_bptrs =
+                        static_cast<const void**>(scratch.gguf_single_b_ptr);
+                }
             }
 
             // 7c: Down GEMM — shared_activation × W_down → shared_expert_output
             // Row-parallel: each rank computes partial sum, allreduce needed before residual.
+            // TD-GLM5-TP-COMBINE-PRECISION: fp32 partial under the fp32 TP
+            // combine (see the dense site above) — allreduced fp32 and
+            // rounded once into shared_expert_output by the caller.
+            const bool shared_fp32_partial =
+                mp.phase == MoeDispatchPhase::kPreAllreduce
+                && deps_.dcp_executor
+                && deps_.dcp_executor->tp_combine_fp32_active()
+                && scratch.ffn_combine_f32;
+            if (shared_fp32_partial && !use_gguf)
+                throw std::runtime_error(
+                    "shared-expert down GEMM: fp32 TP combine "
+                    "(TD-GLM5-TP-COMBINE-PRECISION) supports the GGUF route "
+                    "only");
             {
                 GroupedGemmArgs gargs{use_fp8, 1, hidden, intermediate_local,
                     use_gguf ? scratch.shared_activation : scratch.quant_act,
-                    se->down, scratch.shared_expert_output,
+                    se->down,
+                    shared_fp32_partial ? scratch.ffn_combine_f32
+                                        : scratch.shared_expert_output,
                     scratch.quant_scale, se->down_scales,
                     static_cast<const float*>(scratch.nvfp4_alpha),
                     static_cast<const int32_t*>(scratch.shared_expert_offsets),
@@ -1640,8 +2038,8 @@ bool CommandDispatcher::dispatch_moe_internal(const InternalMoeParams& mp) {
                     gargs.gguf_type = to_gguf_compute(se->down_gguf_type);  // GG-5c: shared's OWN down type
                     gargs.gguf_strategy = gguf_strategy;
                     gargs.gguf_total_tokens = num_tokens;  // shared: 1 expert, B rows
-                    gargs.B_ptrs =
-                        static_cast<const void**>(scratch.gguf_single_b_ptr);
+                    gargs.B_ptrs = shared_down_bptrs;
+                    gargs.d_fp32 = shared_fp32_partial;
                 }
                 launch_grouped_gemm(gargs);
             }
@@ -1725,7 +2123,8 @@ moe_post_allreduce:
     if (deps_.cuda_kernels_enabled && hidden_input && moe_valid && scratch.moe_output) {
         // V4-5b mHC: Step-8 residual update is hc_post (see dense site above)
         // — ArchDeepseekV4Moe::residual_update; base arch: plain residual add.
-        arch.residual_update(gpu, hidden_input, scratch.moe_output,
+        arch.residual_update(static_cast<int>(mp.layer_idx), gpu,
+                             hidden_input, scratch.moe_output,
                              num_tokens, hidden, pair_idx, stream);
     }
 
@@ -1788,8 +2187,13 @@ bool CommandDispatcher::dispatch_fused_moe(const ipc::Command& cmd) {
 
     // KD-4g: TP>1 — dispatch all ranks with allreduce coordination.
     // TD-72b: abort if called for non-primary TP GPU (double-dispatch bug).
-    if (deps_.dcp_communicator && deps_.dcp_communicator->is_active()) {
-        if (deps_.dcp_executor && !deps_.dcp_executor->gpus().empty()) {
+    // TD-GLM53-EP4-DEGENERATE-GENERATION: expert-only hosts make RUN_MOE
+    // multi-rank even at dcp_size == 1 (their partials fold onto the single TP
+    // rank inside dispatch_moe_all_ranks).
+    if ((deps_.dcp_communicator && deps_.dcp_communicator->is_active())
+        || !ep_xtp_gpus_.empty()) {
+        if (deps_.dcp_communicator && deps_.dcp_communicator->is_active()
+            && deps_.dcp_executor && !deps_.dcp_executor->gpus().empty()) {
             const int primary = deps_.dcp_executor->gpus()[0].position;
             if (static_cast<int>(cmd.gpu_idx) != primary) {
                 spdlog::critical("dispatch_fused_moe: D_B_CMD_RUN_MOE sent for non-primary "

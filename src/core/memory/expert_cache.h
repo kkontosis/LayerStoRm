@@ -6,6 +6,7 @@
 
 #include "config/config_parser.h"
 #include "core/memory/eviction_policy.h"
+#include "core/memory/expert_zone_math.h"
 #include "core/memory/residency_listener.h"
 #include "core/memory/vram_allocator.h"
 #include "model/quantization/quant_interface.h"
@@ -44,6 +45,10 @@ struct CacheEntry {
     void* vram_address = nullptr;        ///< Base address of expert slot in VRAM.
     int slot_idx = -1;                   ///< Index into zone's slot array.
     uint16_t lock_count = 0;             ///< Eviction lock refcount (#90).
+
+    /// 44z: id of the elastic zone backing this slot, or -1 = boot carve.
+    /// slot_idx is zone-local when this is >= 0.
+    int elastic_zone = -1;
 
     /// Per-projection byte offsets within the expert slot.
     /// gate at vram_address+0, up at vram_address+gate_offset, etc.
@@ -88,6 +93,43 @@ struct DuplicationInput {
 ///
 /// Two-phase protocol: reserve() allocates a slot (no DMA), then mark_ready()
 /// is called after transfer completion (INV-4.5.1).
+///
+/// ── Elastic zones (44z: KV <-> expert zone rebalancing) ─────────────────────
+///
+/// Beyond the boot carve, a GPU may hold additional ELASTIC ZONES: stable-
+/// capacity slot regions handed in at runtime by the 44z rebalancer, each
+/// backing onto a contiguous slab run granted from the shared KV pool
+/// (geometry per ExpertZoneGeometry in expert_zone_math.h). Semantics:
+///
+/// - An elastic zone's entries are ORDINARY stable-zone residents: valid and
+///   dispatchable until the moment they are evicted through the ordinary
+///   evict() path (metadata-only, listener fires as today). There is NO
+///   intermediate "resident but invalid" state. The reclaim hazard windows
+///   (in-flight DMA, cached pointer tables, CUDA-graph staging) are closed
+///   OUTSIDE the cache, by the rebalancer's quiesce+barrier protocol and by
+///   the generation counter below.
+/// - A DRAINING zone stops accepting new reserves immediately; its residents
+///   are evicted lazily by the rebalancer's drain loop (ready+unlocked ones at
+///   once, locked or transfer-pending ones as they become evictable).
+/// - elastic_generation() is the ELASTIC TOPOLOGY GENERATION — the one cheap
+///   staleness discriminator for anything that snapshots elastic-affected
+///   state across daemon-loop cycles. It bumps on every add_elastic_zone(),
+///   begin_drain_elastic_zone() and remove_elastic_zone(), so "generation
+///   unchanged" proves BOTH properties its two consumer classes need:
+///     * CAPACITY consumers (the REEF solver caps, TD-KVXP-CAPACITY-REPUBLISH)
+///       — total_slots(kStable) is unchanged since the last read, so a
+///       boot-latched per-GPU cap is still the truth;
+///     * ADDRESS consumers (anything caching slot addresses — moe_big's
+///       per-superchunk pointer tables, moe_driver's CUDA-graph pinned
+///       staging) — no elastic capacity was retired, so every cached address
+///       still points at live capacity. For this class the add_elastic_zone
+///       bump merely OVER-invalidates (added capacity cannot invalidate an
+///       address), which is safe; under-invalidating is not — and the
+///       capacity class strictly needs the add bump, so one counter serves
+///       both.
+///
+/// With no elastic zones registered, every operation takes the same branches
+/// with the same outcomes as before 44z — the boot-carve baseline is unchanged.
 class ExpertCache {
 public:
     /// Construct from VRAM allocator, config, and expert byte size.
@@ -165,6 +207,63 @@ public:
     /// Returns false if the expert is not in the stable zone on that GPU.
     bool demote(ExpertKey key, int gpu_idx);
 
+    // ── Elastic zones (44z) ─────────────────────────────────────────────
+
+    /// Drain progress for one elastic zone.
+    struct ElasticDrainStatus {
+        int residents = 0;    ///< Entries still holding a slot in the zone.
+        bool drained = false; ///< residents == 0 (false for an unknown id).
+    };
+
+    /// Register a new ACTIVE elastic zone over a granted slab run and return
+    /// its per-GPU id. `base`/`bytes` describe the whole granted region;
+    /// `slot_stride` is ExpertZoneGeometry::slot_stride() and `num_slots` the
+    /// slot count the caller derived from the SAME geometry. Slot 0 is placed
+    /// at align_up(base, kExpertZoneSlotAlign) (the 716-misalignment lesson),
+    /// so the aligned slots are guaranteed to fit inside `bytes`.
+    /// `cookie` is an opaque caller value (the rebalancer maps zone -> slab
+    /// run with it); the cache never interprets it.
+    /// Bumps elastic_generation(): total_slots(kStable) grows, and capacity
+    /// consumers latching it must see the change (TD-KVXP-CAPACITY-REPUBLISH).
+    /// For address-caching consumers the bump merely over-invalidates, which
+    /// is safe.
+    int add_elastic_zone(int gpu_idx, void* base, int64_t bytes,
+                         int64_t slot_stride, int num_slots, int64_t cookie);
+
+    /// Move a zone kActive -> kDraining: it stops accepting new reserves
+    /// immediately, but its residents stay ordinary valid stable residents
+    /// until the caller evicts them. Idempotent (true if already draining);
+    /// false for an unknown id. Bumps elastic_generation() on success.
+    bool begin_drain_elastic_zone(int gpu_idx, int zone_id);
+
+    /// Drain progress; {0, false} for an unknown id.
+    ElasticDrainStatus elastic_drain_status(int gpu_idx, int zone_id) const;
+
+    /// Keys of every entry still holding a slot in the zone, ascending — the
+    /// worklist for the rebalancer's drain loop. Empty for an unknown id.
+    std::vector<ExpertKey> elastic_zone_residents(int gpu_idx,
+                                                  int zone_id) const;
+
+    /// Erase a fully drained zone (the caller may then release its slab run).
+    /// Returns false and logs on an unknown id or a zone with residents left.
+    /// Bumps elastic_generation() on success.
+    bool remove_elastic_zone(int gpu_idx, int zone_id);
+
+    /// Number of registered elastic zones on a GPU (active + draining).
+    int elastic_zone_count(int gpu_idx) const;
+
+    /// The cookie handed to add_elastic_zone(); 0 for an unknown id.
+    int64_t elastic_zone_cookie(int gpu_idx, int zone_id) const;
+
+    /// The elastic TOPOLOGY generation: bumps on add_elastic_zone,
+    /// begin_drain_elastic_zone and remove_elastic_zone. Unchanged since a
+    /// previous read proves (a) stable capacity (total_slots(kStable)) has
+    /// not changed — the capacity-republish discriminator
+    /// (TD-KVXP-CAPACITY-REPUBLISH) — and (b) no elastic capacity was
+    /// retired, so every cached slot address still points at a live region
+    /// (the add bump only over-invalidates this class, which is safe).
+    uint64_t elastic_generation() const { return elastic_generation_; }
+
     // ── Eviction support ────────────────────────────────────────────────
 
     /// Build ExpertEvictionInput entries for all residents on a GPU.
@@ -215,6 +314,11 @@ public:
 
     // ── Capacity queries ────────────────────────────────────────────────
 
+    /// kStable counts the boot carve plus every ACTIVE elastic zone. DRAINING
+    /// zones are excluded from BOTH free and total, so their still-resident
+    /// entries deliberately vanish from used_slots = total - free: occupancy
+    /// stats UNDER-report during a drain window rather than over-report, which
+    /// keeps admission decisions from spending capacity that is on its way out.
     int free_slots(int gpu_idx, CacheZone zone) const;
     int total_slots(int gpu_idx, CacheZone zone) const;
     int used_slots(int gpu_idx, CacheZone zone) const;
@@ -255,10 +359,33 @@ private:
         std::vector<int> free_list;
 
         void init(void* base_ptr, int64_t bytes_per_slot, int64_t zone_bytes);
+
+        /// 44z elastic-zone form: the caller already derived the slot count
+        /// from ExpertZoneGeometry, so take base/stride/count directly instead
+        /// of floor-dividing a byte span. Free list uses the SAME convention
+        /// as init() (LIFO descending — slot 0 pops first).
+        void init_with_count(void* base_ptr, int64_t stride, int count);
+
         int allocate();
         void free(int slot_idx);
         void* address(int slot_idx) const;
         int free_count() const;
+    };
+
+    // ── Elastic zone (44z) ──────────────────────────────────────────────
+
+    enum class ElasticZoneState { kActive, kDraining };
+
+    /// One runtime stable-capacity region over a granted slab run.
+    struct ElasticZone {
+        int id = -1;                 ///< Unique per GPU, monotonically assigned.
+        void* base = nullptr;        ///< Region device base (slab-run base).
+        int64_t bytes = 0;           ///< Full region bytes.
+        int64_t slot_stride = 0;     ///< Aligned stride (ExpertZoneGeometry::slot_stride).
+        ElasticZoneState state = ElasticZoneState::kActive;
+        SlotAllocator slots;         ///< Over align_up(base, kExpertZoneSlotAlign).
+        int resident_entries = 0;    ///< Entries (incl. reserved-not-ready) here.
+        int64_t cookie = 0;          ///< Opaque caller cookie (zone -> slab run).
     };
 
     struct GpuState {
@@ -269,7 +396,18 @@ private:
         ScratchRegion scratch;           ///< Valid only during kSpillActive
         std::unordered_map<ExpertKey, CacheEntry> residents;
         int duplicate_count_ = 0;
+
+        /// 44z: extra stable-capacity regions, always kept in ascending id
+        /// order (ids are monotonic and erase preserves order), which is the
+        /// order reserve() offers them in.
+        std::vector<ElasticZone> elastic_zones;
+        int next_elastic_id = 0;
     };
+
+    // Elastic-zone lookup by id (nullptr when unknown).
+    static ElasticZone* find_elastic_zone(GpuState& gs, int zone_id);
+    static const ElasticZone* find_elastic_zone(const GpuState& gs,
+                                                int zone_id);
 
     std::vector<GpuState> gpus_;
 
@@ -279,6 +417,9 @@ private:
 
     int64_t expert_bytes_;
     bool affinity_hints_valid_ = true;
+
+    /// 44z elastic topology generation — see elastic_generation().
+    uint64_t elastic_generation_ = 0;
 
     // Residency-change listener (nullable; default null = no notification, the
     // byte-identical baseline). Fired only at the stable-zone choke-points.

@@ -13,7 +13,10 @@
 
 namespace layerstorm::compute {
 
-class NullAttentionDevice final : public AttentionDevice {
+// Not `final`: tests subclass it to count/observe individual calls
+// (e.g. kv_bv_dequant_pool_test.cpp's per-rank dequant-launch counter,
+// P-29 step 21).
+class NullAttentionDevice : public AttentionDevice {
 public:
     explicit NullAttentionDevice(config::GpuRef gpu) : gpu_(gpu) {}
     ~NullAttentionDevice() override = default;

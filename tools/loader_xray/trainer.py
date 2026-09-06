@@ -338,6 +338,39 @@ def apply_params_to_constants(model: Model, learned: Params, calib: dict) -> dic
     return out
 
 
+def overhead_sanity(overhead_us: float, rmse_us: float,
+                    frac: float = 0.25) -> Optional[str]:
+    """TD-AUTOCONFIG-TRAINER-NEGATIVE-OVERHEAD: judge the fitted global
+    constant against the fit's own residual RMSE.
+
+    A fixed overhead is DECISION-INVARIANT: the C++ solver adds it OUTSIDE
+    max(makespan, bank) to every candidate assignment identically
+    (loader_solver.cpp objective), so its sign can never flip a placement.
+    A small negative value is the unconstrained least-squares intercept
+    wobbling around zero — measured on the glm5_next dataset (4216 rows):
+    clamping the offsets to >= 0 moves the loss 591.10 -> 591.65 (+0.09%),
+    i.e. the constant absorbs nothing; the systematic correction lives in
+    the SCALES (dev_scale 0.62-0.74, bank_scale 0.70 — the raw calibration
+    over-predicting per-transfer time by ~30%).  GLM-5.2 fits -1.47 us the
+    same way.
+
+    A LARGE constant — comparable to the residual RMSE — is the actual
+    alarm: the intercept is then carrying a systematic term the rate/scale
+    coefficients should model, and the artifact's ABSOLUTE predictions
+    (deadlines, budgets) should not be trusted until refit. Returns the
+    warning line, or None when the constant is sub-noise."""
+    if abs(overhead_us) > frac * max(rmse_us, 1e-9):
+        return (f"trainer WARNING: fixed_overhead_us {overhead_us:.4g} us is "
+                f"{abs(overhead_us) / max(rmse_us, 1e-9):.0%} of the residual "
+                f"RMSE {rmse_us:.4g} us — the constant term is absorbing a "
+                "systematic error the scale coefficients should carry; "
+                "distrust the artifact's absolute predictions and refit "
+                "with more data (TD-AUTOCONFIG-TRAINER-NEGATIVE-OVERHEAD; "
+                "placement ORDER is unaffected — the overhead is added to "
+                "every candidate identically)")
+    return None
+
+
 def why(result: TrainResult, baseline: Params) -> str:
     lines = [f"Learned corrections for model='{result.model}':",
              f"  loss {result.loss0:.4g} -> {result.loss:.4g} "

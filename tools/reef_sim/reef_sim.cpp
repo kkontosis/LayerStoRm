@@ -26,6 +26,10 @@
 //                                           <solve>-th solve; kind 'C' =
 //                                           migrator commit flip, 'R'/'E' =
 //                                           reserve/evict.
+//   C <solve> <cap0> ... <capN-1>           live cap refresh after the
+//                                           <solve>-th solve (44z elastic
+//                                           grant/reclaim republish,
+//                                           TD-KVXP-CAPACITY-REPUBLISH).
 // MAP: the boot-time LS_ARENA_MAP_DUMP CSV ("e,layer,expert,paired,raw" +
 // "g,gpu,node" rows) — initial locations + the raw→paired node table.
 //
@@ -78,11 +82,20 @@ struct Solve {
     std::vector<int> rec_bank;
 };
 
+// TD-KVXP-CAPACITY-REPUBLISH: a live cap refresh recorded mid-stream
+// ("C <solve> <cap0> ... <capN-1>" — emitted by reef_orch_refresh_caps when
+// a 44z elastic grant/reclaim republishes the stable-slot capacity).
+struct CapsEvent {
+    uint64_t solve;  // applies AFTER this many solves completed
+    std::vector<int> caps;
+};
+
 struct Trace {
     int tp = 0;
     std::vector<int> caps;
     std::vector<Solve> solves;
-    std::vector<RelocEvent> events;  // in recorded (true) order
+    std::vector<RelocEvent> events;      // in recorded (true) order
+    std::vector<CapsEvent> caps_events;  // in recorded (true) order
 };
 
 bool parse_trace(const std::string& path, Trace& t) {
@@ -137,6 +150,14 @@ bool parse_trace(const std::string& path, Trace& t) {
             ev.layer = layer;
             ev.expert = static_cast<uint16_t>(expert);
             t.events.push_back(ev);
+        } else if (line[0] == 'C') {
+            // Mid-stream cap refresh (TD-KVXP-CAPACITY-REPUBLISH).
+            CapsEvent ce{};
+            std::istringstream is(line.substr(1));
+            is >> ce.solve;
+            int c;
+            while (is >> c) ce.caps.push_back(c);
+            if (!ce.caps.empty()) t.caps_events.push_back(std::move(ce));
         }
         // 'A' lines: recorded victims — recomputed on replay, skip.
     }
@@ -288,7 +309,17 @@ int main(int argc, char** argv) {
     std::vector<gl::ReefEntry> entries;
     std::vector<gl::ReefVictim> evicts;
 
+    size_t caps_i = 0;
     for (size_t si = 0; si < trace.solves.size(); ++si) {
+        // Cap refreshes stamped `solve == k` happened after the k-th solve
+        // (TD-KVXP-CAPACITY-REPUBLISH). Same refresh entry point as the
+        // engine; route_cap is not modeled by the sim (stays empty).
+        while (caps_i < trace.caps_events.size()
+               && trace.caps_events[caps_i].solve <= si) {
+            gl::reef_orch_refresh_caps(*orch,
+                                       trace.caps_events[caps_i].caps, {});
+            ++caps_i;
+        }
         // Events stamped `solve == k` happened after the k-th solve.
         while (ev_i < trace.events.size()
                && trace.events[ev_i].solve <= si) {

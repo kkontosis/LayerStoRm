@@ -41,6 +41,16 @@ class ModelConfig {
     /// index_topk_freq <= 0 ⇒ every layer is full (no sharing; GGUF default,
     /// matches the llama.cpp reference which drops indexer_types).
     bool is_full_index_layer(int layer_idx) const;
+    /// The indexer COMPUTING-layer set: layers that own indexer-K storage
+    /// and compute selection (GF3.5). Legacy DSA (GLM-5.2/V3.2):
+    /// IndexShare full ∪ {layer 0}; MTP layers never compute (shared by
+    /// construction, index_share_for_mtp_iteration). glm5_next: exactly
+    /// the sparse-MLA layers (KDA linear layers carry no indexer) PLUS the
+    /// MTP layer, which is sparse MLA with its OWN indexer tensors
+    /// (iteration 0 computes; iterations 1+ reuse — GF3.11 wires the
+    /// epoch-keyed reuse). Accepts layer_idx in [0, num_hidden_layers +
+    /// num_nextn_predict_layers).
+    bool computes_indexer(int layer_idx) const;
 
     /// Number of full (indexer-recomputing) layers.
     int num_full_index_layers() const { return num_full_index_layers_; }
@@ -53,10 +63,70 @@ class ModelConfig {
     /// MTP enabled when num_nextn_predict_layers > 0.
     bool has_mtp() const;
 
+    /// P-29 step 11 / OQ-3 phase A: LS_MTP_PROBE=1 makes glm5_next MTP/NextN
+    /// layer(s) (indices >= num_hidden_layers) count as MoE layers, so
+    /// their routed experts become arena tenants served through the normal
+    /// FETCH_AND_RUN seam. Env read once (static). Default OFF — layer
+    /// counts and arena slot totals are byte-identical to the historical
+    /// behavior, so the champion's 12,096-slot warm-store identity is
+    /// untouched unless the probe is explicitly armed.
+    /// P-29 step 13 phase B: also armable from config (speculation.method ==
+    /// "mtp" + speculation.mtp.enabled) via arm_mtp_experts() — the
+    /// Config-taking constructor arms it before the first census is
+    /// computed, so every later ModelConfig in the process agrees.
+    static bool mtp_probe_experts_enabled();
+
+    /// P-29 step 13 phase B: process-wide arming of the MTP expert census from
+    /// config (equivalent to LS_MTP_PROBE=1). Must be called before any
+    /// census is consulted; arming that would CHANGE an already-consulted
+    /// census throws (a split census would corrupt every layer table).
+    static void arm_mtp_experts();
+
     // ── DeepSeek-V4 dispatch helpers (spec/DEEPSEEK4_PLAN.md V4-1b) ─────
 
     /// Architecture is deepseek_v4.
     bool is_v4() const;
+
+    // ── glm5_next dispatch helpers (PLAN.md Phase GF3, GF3.2) ───────────
+
+    /// Architecture is glm5_next (GLM-5.3-Flash family: hybrid KDA
+    /// linear attention + NoPE sparse MLA per model.layer_types).
+    bool is_glm5_next() const;
+
+    /// Layer l is a KDA linear-attention layer (glm5_next only:
+    /// layer_types[l] == linear_attention). Linear layers keep NO KV
+    /// cache and NO indexer — per-request recurrent + conv state instead.
+    /// False for all other architectures and out-of-range indices.
+    bool is_linear_attention_layer(int layer_idx) const;
+
+    /// Number of KDA linear-attention layers (GLM-5.3-Flash: 34).
+    int num_linear_attention_layers() const {
+        return num_linear_attention_layers_;
+    }
+
+    /// GF3.9: model-layer → DENSE linear-layer ordinal map — the index
+    /// KdaStateLayout::recurrent_offset / ring_offset take
+    /// (vram_allocator.h: "l is the DENSE linear-layer ordinal
+    /// [0, num_layers), not the model layer index"). Returns -1 for a
+    /// non-linear layer or out-of-range index. GLM-5.3-Flash:
+    /// 0,1,2 → 0,1,2; 4,5,6 → 3,4,5; … ; 44 → 33.
+    int linear_attention_layer_ordinal(int layer_idx) const {
+        if (layer_idx < 0
+            || layer_idx >= static_cast<int>(linear_layer_ordinal_.size()))
+            return -1;
+        return linear_layer_ordinal_[layer_idx];
+    }
+
+    /// Number of KV-bearing attention layers: layers that append per-token
+    /// KV state (page provisioning, KV metadata, tiering, DCP cover ONLY
+    /// these). glm5_next: the sparse-MLA layers (GLM-5.3-Flash: 11);
+    /// every other architecture: all hidden layers.
+    int num_kv_layers() const { return num_kv_layers_; }
+
+    /// IndexPool active (glm5_next: index_kpool > 1) — indexer keys pooled
+    /// index_kpool:1 before scoring; index_topk stays a TOKEN budget
+    /// (spec/GLM-5.3-FLASH-MODELINFO.md §3d).
+    bool has_index_pool() const;
 
     /// MLA attention path (latent decompression, kv_b et al.).
     /// True for all non-V4 architectures; false for V4 (native MQA-over-latent).
@@ -121,9 +191,12 @@ class ModelConfig {
     int num_moe_layers_{};
     int num_dense_layers_{};
     int num_full_index_layers_{};
+    int num_linear_attention_layers_{};
+    int num_kv_layers_{};
     std::vector<int> moe_layer_indices_;
     std::vector<int> dense_layer_indices_;
     std::vector<bool> full_index_layer_mask_;
+    std::vector<int> linear_layer_ordinal_;  ///< GF3.9: -1 = not linear
 
     void compute_layer_counts();
 };

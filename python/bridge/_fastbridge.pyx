@@ -24,7 +24,8 @@ Layout constants (ipc_protocol.h):
   RingHeader: producer_seq @ 0, consumer_seq @ 64 (both u64), size 128
   Completion (128 B): cmp_type @0, cmd_seq @4, gpu_idx @8, status @12 u32;
     compute payload @16: cmd_type @16, layer_idx @20, host_buf_offset @24,
-    data_bytes @28 u32, top1_prob @32, entropy @36 f32
+    data_bytes @28 u32, top1_prob @32, entropy @36 f32,
+    routed_miss_count @40 u8, moe_degraded @41 u8
     error payload @16: error_category @16 u32, message @20 char[80]
   BatchDescriptorEntry (16 B): seq_id u64 @0, token_pos u32 @8
   ExpertPrefetchEntry (8 B): layer u32 @0, expert u16 @4, zone u8 @6, gpu u8 @7
@@ -78,7 +79,9 @@ CMP_ERROR = 0xEE00
 # fused routing-export→dedup→sideband-entries→FETCH-send per MoE layer.
 # bridge.ring_bridge falls back to the v1 functions when this constant is
 # absent (stale .so).
-API_VERSION = 2
+# 3: seq_create reserve_tokens (TD-INDEXER-NO-DENSE-FALLBACK) + the
+# indexer_dense witness byte appended to every completion tuple.
+API_VERSION = 3
 
 cdef uint32_t _CMP_ERROR = 0xEE00
 cdef uint32_t _CMP_CHECKPOINT = 0x0200
@@ -107,7 +110,7 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
     Returns None when empty, else the Cmp tuple
     (cmp_type, cmd_seq, gpu_idx, status, cmd_type, layer_idx,
      host_buf_offset, data_bytes, top1_prob, entropy, err_msg,
-     err_category).
+     err_category, moe_degraded, indexer_dense).
     """
     cdef uint64_t cons = (<volatile uint64_t*> (header_addr + 64))[0]
     cdef uint64_t prod = (<volatile uint64_t*> header_addr)[0]
@@ -120,6 +123,8 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
     cdef uint32_t status = (<uint32_t*> (src + 12))[0]
     cdef uint32_t cmd_type = 0, layer_idx = 0, hbo = 0, dbytes = 0
     cdef uint32_t err_cat = 0
+    cdef uint8_t deg = 0
+    cdef uint8_t idense = 0
     cdef float top1 = 0.0, ent = 0.0
     cdef bytes msg_b
     cdef object err_msg = ""
@@ -135,10 +140,12 @@ def cmp_poll(uintptr_t header_addr, uintptr_t slots_base,
         dbytes = (<uint32_t*> (src + 28))[0]
         top1 = (<float*> (src + 32))[0]
         ent = (<float*> (src + 36))[0]
+        deg = (<uint8_t*> (src + 41))[0]   # moe_degraded (TD-MOE-PROGRESSIVE-DEGRADED-SILENT)
+        idense = (<uint8_t*> (src + 42))[0]  # indexer_dense (TD-INDEXER-NO-DENSE-FALLBACK)
     # Consume AFTER the copy-out (release on TSO).
     (<volatile uint64_t*> (header_addr + 64))[0] = cons + 1
     return (cmp_type, cmd_seq, gpu_idx, status, cmd_type, layer_idx,
-            hbo, dbytes, top1, ent, err_msg, err_cat)
+            hbo, dbytes, top1, ent, err_msg, err_cat, deg, idense)
 
 
 def write_u32(uintptr_t addr, list values):
@@ -346,13 +353,17 @@ def send_sample(uintptr_t hdr, uintptr_t slots, uint64_t mask,
 
 def send_seq_create(uintptr_t hdr, uintptr_t slots, uint64_t mask,
                     uint64_t count, uint32_t ssz, uint32_t seq,
-                    uint64_t seq_id, uint32_t prompt_len):
+                    uint64_t seq_id, uint32_t prompt_len,
+                    uint32_t reserve_tokens=0):
     cdef uintptr_t d = _claim(hdr, slots, mask, count, ssz)
     if d == 0:
         return False
     _hdr4(d, 0x0600, seq, 0, 0)                 # CMD_SEQ_CREATE
     (<uint64_t*> (d + 16))[0] = seq_id
     (<uint32_t*> (d + 24))[0] = prompt_len
+    # pool u8 @28 + pad stay 0 (memset); TD-INDEXER-NO-DENSE-FALLBACK
+    # indexer-K reservation target @32.
+    (<uint32_t*> (d + 32))[0] = reserve_tokens
     _publish(hdr)
     return True
 
@@ -411,7 +422,7 @@ def fetch_moe_from_export(uintptr_t hdr, uintptr_t slots, uint64_t mask,
     E_CMD_FETCH_AND_RUN_MOE (have_evict_map=0).
 
     Returns (count) >= 1, or a negative code: -1 ring full, -2 export
-    row-count mismatch, -3 export layer mismatch, -4 empty union.
+    row-count mismatch, -3 export layer mismatch, -4 empty union, -5 num_experts > 512. -5 num_experts > 512.
     """
     cdef uint32_t rows = (<uint32_t*> routing_hdr)[0]
     cdef uint32_t topk = (<uint32_t*> (routing_hdr + 4))[0]
@@ -423,8 +434,12 @@ def fetch_moe_from_export(uintptr_t hdr, uintptr_t slots, uint64_t mask,
     cdef int32_t* idx = <int32_t*> routing_idx
     cdef uint8_t* pfe = <uint8_t*> prefetch_addr
     cdef uint8_t* eve = <uint8_t*> evict_addr
-    cdef uint8_t seen[256]
-    memset(seen, 0, 256)
+    # GF3.15: 512-expert bound (glm5_next has 288 routed experts; the old
+    # seen[256] was an out-of-bounds stack write for expert ids >= 256).
+    if num_experts > 512:
+        return -5
+    cdef uint8_t seen[512]
+    memset(seen, 0, 512)
     cdef uint32_t rn = rows * topk
     cdef uint32_t k, n = 0
     cdef int32_t e
@@ -465,10 +480,11 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
     Spins (sched_yield between polls, GIL dropped) until a completion of
     interest arrives; CMP_CHECKPOINT completions are consumed + skipped
     inside the loop. Returns one of:
-      ('ok', cmd_seq, status, cmd_type, layer, hbo, dbytes, top1, entropy)
+      ('ok', cmd_seq, status, cmd_type, layer, hbo, dbytes, top1, entropy,
+             moe_degraded, indexer_dense)
       ('err', cmd_seq, msg, error_category)       CMP_ERROR (any seq)
-      ('dspark', <cmp_poll 11-tuple>)             cmd_seq == dspark_seq != 0
-      ('other', <cmp_poll 11-tuple>)              unexpected type/seq
+      ('dspark', <cmp_poll 14-tuple>)             cmd_seq == dspark_seq != 0
+      ('other', <cmp_poll 14-tuple>)              unexpected type/seq
       ('timeout',)
     """
     cdef timespec t0, now
@@ -479,6 +495,8 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
     cdef uint32_t cmp_type, cmd_seq, gpu_idx, status
     cdef uint32_t cmd_type, layer_idx, hbo, dbytes
     cdef uint32_t err_cat
+    cdef uint8_t deg
+    cdef uint8_t idense
     cdef float top1, ent
     cdef bytes msg_b
     cdef int timed_out
@@ -532,15 +550,19 @@ def wait_cmp(uintptr_t hdr, uintptr_t slots, uint64_t mask, uint32_t ssz,
         dbytes = (<uint32_t*> (src + 28))[0]
         top1 = (<float*> (src + 32))[0]
         ent = (<float*> (src + 36))[0]
+        deg = (<uint8_t*> (src + 41))[0]   # moe_degraded
+        idense = (<uint8_t*> (src + 42))[0]  # indexer_dense
         (<volatile uint64_t*> (hdr + 64))[0] = cons + 1
         if dspark_seq != 0 and cmd_seq == dspark_seq:
             return ("dspark", (cmp_type, cmd_seq, gpu_idx, status, cmd_type,
-                               layer_idx, hbo, dbytes, top1, ent, ""))
+                               layer_idx, hbo, dbytes, top1, ent, "", 0, deg,
+                               idense))
         if cmp_type == expected:
             return ("ok", cmd_seq, status, cmd_type, layer_idx, hbo,
-                    dbytes, top1, ent)
+                    dbytes, top1, ent, deg, idense)
         return ("other", (cmp_type, cmd_seq, gpu_idx, status, cmd_type,
-                          layer_idx, hbo, dbytes, top1, ent, ""))
+                          layer_idx, hbo, dbytes, top1, ent, "", 0, deg,
+                          idense))
 
 
 def reef_route_fetch_from_export(uintptr_t hdr, uintptr_t slots,
@@ -562,7 +584,7 @@ def reef_route_fetch_from_export(uintptr_t hdr, uintptr_t slots,
     for BOTH CMP_COMPUTE_DONEs.
 
     Returns count >= 1, or negative: -1 ring full, -2 export row-count
-    mismatch, -3 export layer mismatch, -4 empty union.
+    mismatch, -3 export layer mismatch, -4 empty union, -5 num_experts > 512.
     """
     cdef uint32_t rows = (<uint32_t*> routing_hdr)[0]
     cdef uint32_t topk = (<uint32_t*> (routing_hdr + 4))[0]
@@ -573,8 +595,12 @@ def reef_route_fetch_from_export(uintptr_t hdr, uintptr_t slots,
         return -3
     cdef int32_t* idx = <int32_t*> routing_idx
     cdef uint8_t* pfe = <uint8_t*> prefetch_addr
-    cdef uint8_t seen[256]
-    memset(seen, 0, 256)
+    # GF3.15: 512-expert bound (glm5_next has 288 routed experts; the old
+    # seen[256] was an out-of-bounds stack write for expert ids >= 256).
+    if num_experts > 512:
+        return -5
+    cdef uint8_t seen[512]
+    memset(seen, 0, 512)
     cdef uint32_t rn = rows * topk
     cdef uint32_t k, n = 0
     cdef int32_t e

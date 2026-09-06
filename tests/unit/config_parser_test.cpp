@@ -449,6 +449,75 @@ TEST(ConfigParser, ThrowsOnUnknownArchitecture) {
     EXPECT_THROW(parse_config(j), std::runtime_error);
 }
 
+// ── glm5_next fields (GF3.2; ground truth: test-data/GLM-5.3-Flash/config.json,
+// spec/GLM-5.3-FLASH-MODELINFO.md) ───────────────────────────────────────────
+
+TEST(ConfigParser, Glm5NextFieldsParse) {
+    auto j = minimal_json();
+    j["model"]["architecture"] = "glm5_next";
+    // GLM-5.3-Flash geometry (abridged layer_types: (lin x3, sparse) x1 + lin)
+    j["model"]["num_hidden_layers"] = 5;
+    j["model"]["layer_types"] = {
+        "linear_attention", "linear_attention", "linear_attention",
+        "deepseek_sparse_attention", "linear_attention"};
+    j["model"]["linear_attn_config"] = {
+        {"num_heads", 64}, {"head_dim", 128},
+        {"short_conv_kernel_size", 4}, {"gate_lower_bound", -5.0}};
+    j["model"]["mla_use_nope"] = true;
+    j["model"]["qk_rope_head_dim"] = 0;  // NoPE (schema minimum 0)
+    j["model"]["index_kpool"] = 4;
+    j["model"]["index_kpool_compress"] = true;
+    j["model"]["index_kpool_always_select_tail"] = true;
+
+    Config cfg = parse_config(j);
+    EXPECT_EQ(cfg.model.architecture, Architecture::glm5_next);
+    ASSERT_EQ(cfg.model.layer_types.size(), 5u);
+    EXPECT_EQ(cfg.model.layer_types[0], LayerAttentionType::linear_attention);
+    EXPECT_EQ(cfg.model.layer_types[3],
+              LayerAttentionType::deepseek_sparse_attention);
+    ASSERT_TRUE(cfg.model.linear_attn_config.has_value());
+    EXPECT_EQ(cfg.model.linear_attn_config->num_heads, 64);
+    EXPECT_EQ(cfg.model.linear_attn_config->head_dim, 128);
+    EXPECT_EQ(cfg.model.linear_attn_config->short_conv_kernel_size, 4);
+    EXPECT_DOUBLE_EQ(cfg.model.linear_attn_config->gate_lower_bound, -5.0);
+    EXPECT_TRUE(cfg.model.mla_use_nope);
+    EXPECT_EQ(cfg.model.qk_rope_head_dim, 0);
+    EXPECT_EQ(cfg.model.index_kpool, 4);
+    EXPECT_TRUE(cfg.model.index_kpool_compress);
+    EXPECT_TRUE(cfg.model.index_kpool_always_select_tail);
+}
+
+TEST(ConfigParser, Glm5NextFieldDefaultsInertOnOtherArchs) {
+    // The new fields must not perturb existing parses (V4/GLM byte-identity
+    // at the config level): absent => empty/false/1/nullopt.
+    Config cfg = parse_config(minimal_json());
+    EXPECT_TRUE(cfg.model.layer_types.empty());
+    EXPECT_FALSE(cfg.model.linear_attn_config.has_value());
+    EXPECT_FALSE(cfg.model.mla_use_nope);
+    EXPECT_EQ(cfg.model.index_kpool, 1);
+    EXPECT_FALSE(cfg.model.index_kpool_compress);
+    EXPECT_FALSE(cfg.model.index_kpool_always_select_tail);
+}
+
+TEST(ConfigParser, Glm5NextLinearAttnDefaults) {
+    // linear_attn_config present but empty: field defaults are the
+    // GLM-5.3-Flash constants (the only shipped KDA geometry).
+    auto j = minimal_json();
+    j["model"]["linear_attn_config"] = nlohmann::json::object();
+    Config cfg = parse_config(j);
+    ASSERT_TRUE(cfg.model.linear_attn_config.has_value());
+    EXPECT_EQ(cfg.model.linear_attn_config->num_heads, 64);
+    EXPECT_EQ(cfg.model.linear_attn_config->head_dim, 128);
+    EXPECT_EQ(cfg.model.linear_attn_config->short_conv_kernel_size, 4);
+    EXPECT_DOUBLE_EQ(cfg.model.linear_attn_config->gate_lower_bound, -5.0);
+}
+
+TEST(ConfigParser, ThrowsOnUnknownLayerType) {
+    auto j = minimal_json();
+    j["model"]["layer_types"] = {"linear_attention", "sliding_window"};
+    EXPECT_THROW(parse_config(j), std::runtime_error);
+}
+
 TEST(ConfigParser, ThrowsOnUnknownWeightQuant) {
     auto j = minimal_json();
     j["quantization"]["weights"] = "fp3";
@@ -977,4 +1046,69 @@ TEST(ConfigParser, V4FieldsRoundTrip) {
     EXPECT_EQ(cfg2.model.hc_sinkhorn_iters, cfg.model.hc_sinkhorn_iters);
     EXPECT_DOUBLE_EQ(cfg2.model.hc_eps, cfg.model.hc_eps);
     EXPECT_EQ(cfg2.model.gating_score_fn, GatingScoreFn::sqrtsoftplus);
+}
+
+// ── TD-KVXP-SCHEMA-KNOBS: _internal-kv_expert_rebalance + promoted levers ───
+
+TEST(ConfigParser, KvExpertRebalanceDefaultsOn) {
+    // 44z master switch: DEFAULT ON since 2026-09-03 (user decision on the
+    // glm5_next EP4 decisive A/B — ON was the tightest of six arms and
+    // recovered 99.1% of a withheld carve at matched fetch volume). A recipe
+    // that does not name the section ARMS the rebalancer; set it false, or
+    // LS_KV_EXPERT_REBALANCE=0, to opt out.
+    auto cfg = parse_config(minimal_json());
+    EXPECT_TRUE(cfg._internal_kv_expert_rebalance.enabled);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.max_waste, 0.1);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.low_water_frac, 0.02);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.high_water_frac, 0.0);
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.max_slots_per_grant, 8);
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.tick_ms, 200);
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.grant_cooldown_ms, 30000);
+}
+
+TEST(ConfigParser, KvExpertRebalanceInlineSectionParses) {
+    auto j = minimal_json();
+    j["_internal-kv_expert_rebalance"] = {
+        {"enabled", true},          {"max_waste", 0.25},
+        {"low_water_frac", 0.05},   {"high_water_frac", 0.2},
+        {"max_slots_per_grant", 4}, {"tick_ms", 0},
+        {"grant_cooldown_ms", 0},
+    };
+    auto cfg = parse_config(j);
+    EXPECT_TRUE(cfg._internal_kv_expert_rebalance.enabled);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.max_waste, 0.25);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.low_water_frac, 0.05);
+    EXPECT_DOUBLE_EQ(cfg._internal_kv_expert_rebalance.high_water_frac, 0.2);
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.max_slots_per_grant, 4);
+    // 0 is a LIVE tick value (tick every daemon cycle) and 0 disables the
+    // cooldown — both must round-trip, not clamp away.
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.tick_ms, 0);
+    EXPECT_EQ(cfg._internal_kv_expert_rebalance.grant_cooldown_ms, 0);
+    auto cfg2 = parse_config(config_to_json(cfg));
+    EXPECT_TRUE(cfg2._internal_kv_expert_rebalance.enabled);
+    EXPECT_EQ(cfg2._internal_kv_expert_rebalance.tick_ms, 0);
+}
+
+TEST(ConfigParser, DsparkCtxRotateDefaultsOnAndParses) {
+    // TD-DSPARK-CTX-ROTATE-SCHEMA: default ON (matches the env-first
+    // default), false = the legacy fail-closed cap.
+    auto cfg = parse_config(minimal_json());
+    EXPECT_TRUE(cfg.speculation.dspark.ctx_rotate);
+    auto j = minimal_json();
+    j["speculation"]["dspark"]["ctx_rotate"] = false;
+    auto cfg2 = parse_config(j);
+    EXPECT_FALSE(cfg2.speculation.dspark.ctx_rotate);
+}
+
+TEST(ConfigParser, AutoconfigLeverFieldsParse) {
+    // prefer/accuracy schema promotion (the CLI-first precedent's owed
+    // fields): defaults are the no-op levers; declared values parse.
+    auto cfg = parse_config(minimal_json());
+    EXPECT_EQ(cfg.autoconfig.prefer, Prefer::balanced);
+    EXPECT_EQ(cfg.autoconfig.accuracy, Accuracy::standard);
+    auto j = minimal_json();
+    j["autoconfig"] = {{"prefer", "capacity"}, {"accuracy", "compact"}};
+    auto cfg2 = parse_config(j);
+    EXPECT_EQ(cfg2.autoconfig.prefer, Prefer::capacity);
+    EXPECT_EQ(cfg2.autoconfig.accuracy, Accuracy::compact);
 }

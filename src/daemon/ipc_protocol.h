@@ -23,7 +23,12 @@ namespace layerstorm::ipc {
 static constexpr uint32_t kProtocolVersion    = 1;
 static constexpr int      kMaxGpus            = 8;
 static constexpr int      kMaxMoeLayers       = 128;  // TD-IPC-MOE-LAYER-CAP: ≥ GLM-5.2's 75 MoE + MTP (was 64 → last 11 planning-blind)
-static constexpr int      kMaxExperts         = 256;
+// TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: must be >= the largest
+// n_routed_experts any model ships (glm5_next = 288). 320 matches
+// gpu_loader::kMaxExpertsLarge. At 256, far_forward_layer's routed union
+// silently dropped experts 256-287 on every token (~11% routing mass).
+// Engine::init_modules refuses boot when n_routed_experts exceeds this.
+static constexpr int      kMaxExperts         = 320;
 static constexpr int      kMaxTrackedRequests = 64;
 static constexpr int      kMaxNuma            = 8;
 
@@ -34,8 +39,12 @@ static constexpr uint32_t kCmpSlotBytes        = 128;
 
 // Sideband sub-region max entry counts (IPC-8b).
 static constexpr uint32_t kMaxBatchDescriptors = 512;
-static constexpr uint32_t kMaxExpertPrefetch   = 256;
-static constexpr uint32_t kMaxExpertEviction   = 256;
+// GF3.15: 512 (was 256) — a glm5_next prefill-superchunk routed union can
+// reach n_routed_experts = 288 distinct experts per layer (512 rows x 8),
+// which overflowed the 256-entry sideband arrays (live refusal on serving;
+// the cap must be >= the largest n_routed_experts any model ships).
+static constexpr uint32_t kMaxExpertPrefetch   = 512;
+static constexpr uint32_t kMaxExpertEviction   = 512;
 static constexpr uint32_t kMaxTransferBatch    = 256;
 static constexpr uint32_t kMaxReserveBatch     = 256;
 static constexpr uint32_t kMaxNvmeReadBatch    = 256;
@@ -159,6 +168,16 @@ enum CmdType : uint32_t {
     // feature — no versioned stability guarantees beyond the build.
     CMD_SEQ_SNAPSHOT           = 0x0603,
     CMD_SEQ_RESTORE            = 0x0604,
+    // Prefix-holder lifecycle (R3, TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE):
+    // FORK_FROZEN is CMD_SEQ_FORK for a dst that is FROZEN (a prefix holder
+    // that never appends) — it skips BOTH CoW frontier splits (kMain logical
+    // group + indexer-K group), sharing every page by refcount; the NEXT
+    // fork FROM the holder performs the CoW instead.  HIBERNATE demotes a
+    // frozen sequence's hot kMain pages (all but the append-frontier
+    // logical group) to the tiering cold pool; no-op success when no
+    // tiering manager is live (V4 / untired arms).
+    CMD_SEQ_FORK_FROZEN        = 0x0605,
+    CMD_SEQ_HIBERNATE          = 0x0606,
 
     // NVMe tier (host RAM <-> NVMe) + transfer cancellation
     CMD_NVME_READ              = 0x0700,
@@ -192,6 +211,9 @@ enum CmdType : uint32_t {
     D_CMD_RUN_SELF_SPEC_FORWARD = 0x0A07, // fused self-spec forward pass (#62e)
     D_CMD_MTP_PROJECT          = 0x0A08,  // MTP projection: enorm(Emb)‖hnorm(h) → eh_proj (#16)
     D_CMD_RUN_DSPARK_STEP      = 0x0A09,  // fused DSpark DFlash-backbone draft step (DSP-3)
+    D_CMD_KDA_SNAPSHOT         = 0x0A0A,  // P-29 step 13: KDA anchor snapshot (INV-KDA-REWIND)
+    D_CMD_KDA_RESTORE          = 0x0A0B,  // P-29 step 13: KDA anchor restore + frontier rollback
+    D_CMD_KDA_CKPT             = 0x0A0C,  // P-29 step 24: host-RAM KDA prefix checkpoint (GF3.12)
 
     // Config update (9.8-1b)
     CMD_CONFIG_UPDATE          = 0x0B00,  // live config parameter update
@@ -330,7 +352,7 @@ struct Command {
             uint32_t workspace_buf_id;     // KD-2: GEMM workspace
             uint32_t k_dim;                // GG-5: input dim K (gate/up: H; down: I); GGUF path
             uint8_t  quant_mode;           // KD-2: 0=NVFP4, 1=FP8, 2=GGUF
-            uint8_t  gguf_type;            // GG-5: model::GgufKQuantType (Q2_K=0..Q8_0=5); quant_mode==2 only
+            uint8_t  gguf_type;            // GG-5: model::GgufKQuantType (Q2_K=0..MXFP4=6); quant_mode==2 only
             uint8_t  _pad_eff[2];
         } expert_ffn;
 
@@ -382,6 +404,15 @@ struct Command {
                                            //   the historical guided-decoding single row; the
                                            //   speculative sampled/logprobs verify chunk reads
                                            //   all R rows.  Host-side masking/sampling (B=1).
+            uint8_t  norm_only;            // P-29 step 13 (MTP prompt prefill): nonzero = run ONLY
+                                           //   the mHC collapse + final RMSNorm over num_tokens
+                                           //   rows into output_norm_scratch (no head GEMM, no
+                                           //   readback, no sampling) — feeds MTP_PROJECT's
+                                           //   prev_src=1 rows for a prefill chunk.
+            uint8_t  _pad_oh;
+            uint16_t input_row;            // P-29 step 13: input ROW offset (trunk stride) — a sliced
+                                           //   norm_only pass reads hidden rows [input_row,
+                                           //   input_row+num_tokens). 0 = historical.
         } output_head;
 
         // D_B_CMD_RUN_ATTENTION — full attention block (sideband batch descriptor)
@@ -403,7 +434,19 @@ struct Command {
                                      //      replay of K sub-chunks). Relaxes the
                                      //      indexer coverage `repeat` guard to the
                                      //      superchunk window (end <= next_pos).
-            uint8_t  _pad_ra;
+            uint8_t  spec_flags;     // P-29 step 13 phase B (speculative verify rows):
+                                     //   bit0 = spec-verify row — force eager
+                                     //     (no decode-span capture/replay; span
+                                     //     variant caps must not be spent on
+                                     //     verify row shapes) and publish the
+                                     //     routing export at sideband dst row ==
+                                     //     row_offset (cumulative header) so a
+                                     //     per-row loop accumulates R rows.
+                                     //   bit1 = KDA anchor snapshot after this
+                                     //     row's state update (pool-boundary
+                                     //     crossing rows; anchor slot chosen by
+                                     //     the per-seq alternator engine-side).
+                                     //   0 = legacy.
             uint32_t row_offset;     // TD-PREFILL-SUPERCHUNK: hidden-state ROW
                                      //      offset for this sub-chunk — attention
                                      //      reads/writes attn_buf/moe_buf rows
@@ -510,6 +553,34 @@ struct Command {
             uint8_t  _pad1[3];
         } run_mtp_step;  // 24B
 
+        // D_CMD_KDA_SNAPSHOT / D_CMD_KDA_RESTORE — P-29 step 13 phase B KDA
+        // anchor-and-replay (INV-KDA-REWIND): the ONLY legal KDA rewind is
+        // restore-from-anchor + forward replay.  SNAPSHOT copies the
+        // sequence's whole KDA state slot (recurrent + conv rings, all
+        // linear layers, every rank) into one of two per-seq anchor slots
+        // (engine-side alternator) and records anchor_pos = the current
+        // uniform frontier — refused if the per-layer frontiers disagree
+        // (mid-sweep).  RESTORE copies the anchor whose recorded position
+        // == pos back into the live slot and rolls every linear layer's
+        // kda_next_pos to pos; refused loudly when no anchor matches.
+        //
+        // D_CMD_KDA_CKPT (P-29 step 24, GF3.12 realized) SHARES this
+        // payload: capture a position-keyed HOST-RAM prefix checkpoint —
+        // D2H-gather the whole KDA state slot (uncompressed, bit-exact
+        // fp32 round-trip, the same unit as the hibernate spill) into
+        // SequenceState::kda_ckpts[pos].  pos must be the current uniform
+        // frontier AND a positive multiple of 64 (INV-KDA-CARRY bitwise
+        // grid); violations are refused loudly (CMP_ERROR — the capture
+        // tripwire), while host-allocation failure completes with
+        // status 1 (capacity, never correctness).  Completion status 0
+        // rides data_bytes = host bytes consumed by the checkpoint.
+        struct {
+            uint32_t _pad0;            // alignment (ctypes mirror)
+            uint64_t seq_id;
+            uint32_t pos;              // SNAPSHOT: expected current frontier
+                                       // RESTORE: anchor position to restore
+        } kda_anchor;  // 16B
+
         // D_CMD_MTP_PROJECT — MTP projection only (#16 / GLM-25g).
         // eh_proj(concat(enorm(Emb(input_token)), hnorm(prev_hidden))) →
         // hidden-state pair attn_buf on every TP rank.  prev_hidden is the
@@ -532,7 +603,20 @@ struct Command {
                                        //  steps write only row 0, so higher
                                        //  rows survive a sequential chain).
                                        // 0 = historical single-row behavior.
-            uint8_t  _pad[2];
+            uint8_t  prev_src;         // 0 = attn_buf row (historical);
+                                       // 1 = post-final-norm collapsed
+                                       //     hidden of the head that just
+                                       //     ran (P-29 step 11 glm5_next probe;
+                                       //     P-29 step 13: row-selectable via
+                                       //     hidden_row + valid at tp>1 —
+                                       //     every TP rank computes the
+                                       //     norm scratch rows itself)
+            uint8_t  dest_row;         // P-29 step 13: attn_buf ROW the projected
+                                       //   hidden lands in (H-stride rows;
+                                       //   MTP layers are single-stream).
+                                       //   Batched MTP catch-up chains write
+                                       //   rows 0..K-1 with K sequential
+                                       //   PROJECT commands. 0 = historical.
         } mtp_project;  // 12B
 
         // D_CMD_RUN_DSPARK_STEP — fused DSpark draft step (DSP-3).
@@ -662,7 +746,19 @@ struct Command {
             uint32_t timeout_us;     // FETCH deadline passthrough (0 = none)
             uint8_t  is_prefill;     // 0=decode, 1=prefill/chunk shape
             uint8_t  route_mode;     // 0=static e%num_gpus, 1=reef service
-            uint8_t  _pad[2];
+            uint8_t  spec_verify;    // P-29 step 13: 1 = speculative-verify shape —
+                                     //   the daemon runs a PER-ROW attention
+                                     //   loop (B=1, row_offset=j, decode-shaped,
+                                     //   descriptor j) instead of one batched
+                                     //   attention, then ONE cross-row routed
+                                     //   union + ONE MoE at num_tokens=num_seqs.
+                                     //   KDA legs stay on the exact per-token
+                                     //   decode kernels (INV-KDA-CARRY: a
+                                     //   non-64 chunk cut is not bit-exact).
+            uint8_t  kda_snap_mask;  // P-29 step 13: with spec_verify, bit j = take a
+                                     //   KDA anchor snapshot after row j's state
+                                     //   update (pool-boundary crossing rows;
+                                     //   slot alternates engine-side). 0 = none.
         } far_forward_layer;  // 24B
 
         // E_FORWARD_ONE_LAYER — autonomous one-layer forward (F-5)
@@ -796,6 +892,18 @@ struct Command {
             uint32_t prompt_len;       // Number of prompt tokens to pre-allocate
             uint8_t  pool;             // 0=kMain, 1=kSpeculation
             uint8_t  _pad[3];
+            // TD-INDEXER-NO-DENSE-FALLBACK (Route 1, reserve-at-admission):
+            // total context (tokens) this sequence may EVER reach — prompt +
+            // generation budget + speculative-overshoot margin. On DSA
+            // paged-indexer models the engine commits the sequence's
+            // indexer-K pages for min(reserve_tokens,
+            // serving.max_sequence_length) at create, so mid-request
+            // provisioning can never fail (the silent 10x dense downgrade
+            // this field exists to end). Failure to reserve is a RETRYABLE
+            // kKvPoolExhausted admission error. The GRANTED total rides back
+            // in Completion.seq_op.reserved_tokens. 0 = legacy lazy
+            // provisioning (every pre-existing producer zeroes the slot).
+            uint32_t reserve_tokens;
         } seq_create;
 
         // CMD_SEQ_FREE
@@ -810,11 +918,69 @@ struct Command {
             uint32_t token_count;   // positions [0, token_count) are cached
         } seq_ckpt;
 
-        // CMD_SEQ_FORK
+        // CMD_SEQ_FORK / CMD_SEQ_FORK_FROZEN
         struct {
             uint64_t src_seq_id;       // Source sequence to fork from
             uint64_t dst_seq_id;       // New forked sequence ID (CoW)
+            // R4a (RADIX_SLAB_DESIGN Â§5 R4): TRUNCATING fork. 0 = full
+            // fork (legacy semantics, byte-identical; every pre-R4 producer
+            // writes a zeroed slot -- the fastbridge memsets its claim and
+            // the ctypes/C++ writers zero-init the Command). N > 0 = the
+            // child takes only the parent's first N TOKENS: KV logical
+            // pages [0, ceil(N/page_size)) refcount-shared with the
+            // straddling logical group CoW'd for a LIVE child (a frozen
+            // holder shares it -- it never writes, and rows >= N in that
+            // page are parent-owned bytes the child never reads because
+            // every consumer is bounded by the declared kv_len); indexer-K
+            // page groups [0, ceil(N/PT)); indexer coverage clamped to
+            // min(parent.next_pos, N); fresh rewind epoch (INV-DSA-EPOCH).
+            // CALLER CONTRACT (the engine tracks pages, not token counts,
+            // so it cannot verify): N <= the parent's committed token
+            // length and not above any position the parent may still
+            // rewind below (INV-DSA-REWIND depth) -- the shared prefix
+            // must be immutable for both lifetimes. Rejected on V4
+            // side-tier architectures: the SWA ring / compressor state
+            // rings mutate in place at slot pos % capacity, so the ring
+            // state a truncated child needs ([N - window, N)) was already
+            // overwritten unless N == the parent frontier -- no correct
+            // truncation exists from live state (per-arch gate).
+            uint32_t prefix_len;
+            // TD-INDEXER-NO-DENSE-FALLBACK (Route 1): reservation target
+            // for the CHILD, same semantics as seq_create.reserve_tokens —
+            // after the fork the child's indexer-K pages are grown to cover
+            // min(reserve_tokens, serving.max_sequence_length) so its delta
+            // prefill + decode can never fail provisioning. 0 = legacy (no
+            // reservation; every pre-existing producer zeroes the slot).
+            // Ignored on FROZEN forks (a holder never appends) and when the
+            // child's inherited coverage is already dead/arena-pinned.
+            // Growth failure rolls the whole fork back with a RETRYABLE
+            // kKvPoolExhausted error. Granted total rides back in
+            // Completion.seq_op.reserved_tokens.
+            uint32_t reserve_tokens;
         } seq_fork;
+
+        // CMD_SEQ_HIBERNATE — demote a FROZEN sequence's hot kMain pages
+        // to the tiering cold pool (R3 holder hibernation).  kv_len is the
+        // holder's KV coverage in tokens (fed positions [0, kv_len)):
+        // only pages STRICTLY below logical kv_len/page_size demote — the
+        // page containing the write frontier and every allocated page
+        // beyond it stay hot (a mid-prefill holder's parent over-allocates
+        // under windowed admission, and a hit-child's first chunk write
+        // lands at kv_len; demoting that page fail-closes the write).
+        struct {
+            uint64_t seq_id;
+            uint32_t kv_len;
+            /// TD-PREFIX-TIDY-COLD-SPILL: 1 = also take the SECOND tiering
+            /// hop — spill the (already or just) hibernated holder's
+            /// settled COLD pages to one file under the configured spill
+            /// directory and return their pinned cold-pool slots.  0 =
+            /// legacy hibernate (every pre-spill producer zeroes the
+            /// slot — wire-compatible).  Completion: status 2 = refused
+            /// by the spill byte cap (evict spilled holders and retry);
+            /// spilled page count rides reserved_tokens.
+            uint8_t spill;
+            uint8_t _pad_spill[3];
+        } seq_hibernate;
 
         // CMD_NVME_READ — read expert from NVMe into host RAM warm cache
         struct {
@@ -1002,7 +1168,25 @@ struct Completion {
             float    top1_prob;       // IPC-8g: max softmax probability (0.0 if not requested)
             float    entropy;         // IPC-8g: normalized Shannon entropy [0,1] (0.0 if not requested)
             uint8_t  routed_miss_count; // TD-89n: top-K experts not resident (0 = all hit)
-            uint8_t  _pad_rmc[3];
+            uint8_t  moe_degraded;    // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: 1 = this
+                                      //   layer's progressive MoE finalized DEGRADED
+                                      //   (no-capacity wave stall or fetch-deadline
+                                      //   timeout with fetches still in flight) — the
+                                      //   FFN output was computed WITHOUT experts the
+                                      //   router selected. Callers must be able to see
+                                      //   this (retry / discard from identity gates).
+            uint8_t  indexer_dense;   // TD-INDEXER-NO-DENSE-FALLBACK witness:
+                                      //   1 = the attention step this completion
+                                      //   covers ran (at least one row) with
+                                      //   DSA DENSE attention because of a dead
+                                      //   indexer coverage (IndexerSeqMode::
+                                      //   kDead). With reserve-at-admission
+                                      //   live this MUST stay 0 — any nonzero
+                                      //   is a BUG witness, surfaced per
+                                      //   request on [orch-stats]
+                                      //   (indexer_dense_steps), never a mere
+                                      //   log line.
+            uint8_t  _pad_rmc[1];
         } compute;
 
         // CMP_CHECKPOINT — mid-execution data available
@@ -1021,7 +1205,15 @@ struct Completion {
         struct {
             uint64_t seq_id;        // Sequence that was operated on
             uint32_t page_count;    // Pages allocated/freed/forked
-            uint32_t _pad;
+            // TD-INDEXER-NO-DENSE-FALLBACK: GRANTED indexer-K reservation
+            // in tokens (seq_create/seq_fork with reserve_tokens > 0 on a
+            // DSA paged-indexer model; the request clamped to
+            // serving.max_sequence_length). 0 = no reservation (legacy
+            // producer, non-DSA model, or frozen fork). NOTE: this field
+            // deliberately ALIASES compute.data_bytes (same union offset),
+            // which is how the Python bridge's generic completion view
+            // reads it without a seq_op-specific parse arm.
+            uint32_t reserved_tokens;
         } seq_op;
 
         // CMP_NVME_DONE — NVMe read/write/evict completed
@@ -1182,7 +1374,7 @@ struct StateSnapshot {
     uint64_t expert_last_change_ns[kMaxMoeLayers * kMaxExperts];
 };
 
-static_assert(sizeof(StateSnapshot) == 1676928);  // TD-IPC-MOE-LAYER-CAP: kMaxMoeLayers 64→128 doubles the per-(layer,expert) arrays
+static_assert(sizeof(StateSnapshot) == 2095744);  // kMaxExperts 256→320 (TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION); earlier kMaxMoeLayers 64→128 (TD-IPC-MOE-LAYER-CAP)
 
 // ── Seqlock helpers ─────────────────────────────────────────────────────────
 // Used by daemon (writer) and state publisher. Python has its own protocol.
@@ -1348,36 +1540,36 @@ struct IpcLayout {
     static constexpr uint64_t kExpertPrefetchOff   =
         kBatchDescriptorOff + kBatchDescriptorSize;                         // 8192
     static constexpr uint64_t kExpertPrefetchSize  =
-        kMaxExpertPrefetch * sizeof(ExpertPrefetchEntry);                   // 2048
+        kMaxExpertPrefetch * sizeof(ExpertPrefetchEntry);                   // 4096
 
     static constexpr uint64_t kExpertEvictionOff   =
-        kExpertPrefetchOff + kExpertPrefetchSize;                           // 10240
+        kExpertPrefetchOff + kExpertPrefetchSize;                           // 12288
     static constexpr uint64_t kExpertEvictionSize  =
-        kMaxExpertEviction * sizeof(ExpertEvictionEntry);                   // 2048
+        kMaxExpertEviction * sizeof(ExpertEvictionEntry);                   // 4096
 
     static constexpr uint64_t kTransferBatchOff    =
-        kExpertEvictionOff + kExpertEvictionSize;                           // 12288
+        kExpertEvictionOff + kExpertEvictionSize;                           // 16384
     static constexpr uint64_t kTransferBatchSize   =
         kMaxTransferBatch * sizeof(TransferBatchEntry);                     // 4096
 
     static constexpr uint64_t kReserveBatchOff     =
-        kTransferBatchOff + kTransferBatchSize;                             // 16384
+        kTransferBatchOff + kTransferBatchSize;                             // 20480
     static constexpr uint64_t kReserveBatchSize    =
         kMaxReserveBatch * sizeof(ReserveBatchEntry);                       // 2048
 
     static constexpr uint64_t kNvmeReadOff         =
-        kReserveBatchOff + kReserveBatchSize;                               // 18432
+        kReserveBatchOff + kReserveBatchSize;                               // 22528
     static constexpr uint64_t kNvmeReadSize        =
         kMaxNvmeReadBatch * sizeof(NvmeReadEntry);                          // 2048
 
     static constexpr uint64_t kTokenIdsOff         =
-        kNvmeReadOff + kNvmeReadSize;                                       // 20480
+        kNvmeReadOff + kNvmeReadSize;                                       // 24576
     static constexpr uint64_t kTokenIdsSize        =
         kMaxSidebandTokenIds * sizeof(uint32_t);                            // 2048
 
     // KD-3c: speculation checkpoint data sub-region
     static constexpr uint64_t kSpecCheckpointOff   =
-        kTokenIdsOff + kTokenIdsSize;                                       // 22528
+        kTokenIdsOff + kTokenIdsSize;                                       // 26624
     static constexpr uint64_t kSpecCheckpointSize  = 4096;                  // 4KB
     // Layout within kSpecCheckpointOff:
     //   [0..511]:    per-layer cos_sim floats (128 layers * 4 bytes)
@@ -1393,7 +1585,7 @@ struct IpcLayout {
     // by RUN_ATTENTION [emit_gating] (or, today, MoE gating with
     // store_gating_output=1). See RoutingExportHeader above for the layout.
     static constexpr uint64_t kRoutingExportOff        =
-        kSpecCheckpointOff + kSpecCheckpointSize;                           // 26624
+        kSpecCheckpointOff + kSpecCheckpointSize;                           // 30720
     static constexpr uint64_t kRoutingExportWeightsOff =
         kRoutingExportOff + sizeof(RoutingExportHeader);                    // 26640
     static constexpr uint64_t kRoutingExportIndicesOff =
@@ -1484,15 +1676,80 @@ struct EngineInfo {
                                        // vocab width (weights-derived when the config
                                        // field was 0/absent; cross-checked otherwise).
                                        // Preferred over any config/tokenizer read.
+    int32_t   moe_chunk_capacity;      // P-30 step 1 (TD-PREFILL-MOE-BIG): the
+                                       // REALIZED single-shot MoE token bound after
+                                       // the elastic chunk fail-safe — batches at or
+                                       // below it run the byte-identical single-shot
+                                       // pipeline; above it, the chunked grouped-GEMM
+                                       // path (REJECTED with expert-only ranks
+                                       // resident, TD-MOE-EP-XTP-WAVES). EP-beyond-TP
+                                       // orchestrators MUST clamp the superchunk
+                                       // stride to this, never to the raw
+                                       // compute.moe_big_chunk_tokens request.
 
     // ── DeepSeek-V4 metadata (V4-7a) — all zero for non-V4 models ─────────
-    static constexpr int kV4MaxLayers = 96;  // covers Flash (43) and Pro (61)
+    static constexpr int kMaxAttentionTypeLayers = 96;  // covers V4-Flash (43),
+                                                        // V4-Pro (61), GLM-5.3-
+                                                        // Flash (45)
     int32_t   v4_hc_mult;              // mHC stream count (0 = non-V4)
     int32_t   v4_num_hash_layers;      // hash-gated MoE layers (tid2eid routing)
-    // Per hidden layer attention type from compress_ratios:
-    // 0 = SWA-only, 1 = CSA (ratio 4), 2 = HCA (ratio 128). Valid for the
-    // first num_layers entries when v4_hc_mult > 0.
-    uint8_t   v4_attention_types[kV4MaxLayers];
+    // Per hidden layer attention type (TD-ATTN-TYPES-V4-NAMING: renamed from
+    // v4_attention_types in GF3.2 — same offset/size, neutral name, third
+    // arch added). Codes:
+    //   V4 (from compress_ratios; valid when v4_hc_mult > 0):
+    //     0 = SWA-only, 1 = CSA (ratio 4), 2 = HCA (ratio 128)
+    //   glm5_next (from model.layer_types; entries are always nonzero, which
+    //   is what marks the array populated for a non-V4 arch):
+    //     3 = linear (KDA — no KV, per-request recurrent state),
+    //     4 = sparse MLA (NoPE DSA — KV-bearing)
+    // All-zero (with v4_hc_mult == 0) = homogeneous-attention arch
+    // (GLM-5.2 / V3.2): the array is not populated.
+    uint8_t   attention_types[kMaxAttentionTypeLayers];
+
+    // R4b arch capability (INV-SEQ-FORK-TRUNC): 1 iff CMD_SEQ_FORK honours
+    // prefix_len truncation on this boot's architecture — i.e. the active
+    // AttentionArch has NO lossy position-indexed per-sequence state
+    // (in-place pos%capacity rings; see
+    // AttentionArch::lossy_position_indexed_state).  0 => the engine
+    // REJECTS truncating forks (kSeqFork) and the orchestrator must not
+    // offer mid-edge prefix reuse.  Property-derived, never a model-name
+    // check.
+    int32_t   seq_fork_truncatable;
+
+    // ── TD-GLM5-KDA-SLOTS-EXPORT: KDA state-pool geometry ─────────────────
+    // All zero for models without linear-attention per-request state.  The
+    // orchestrator's admission must SEE state-pool pressure at boot — with
+    // mapped state (the default) the capacity is shared-pool geometry, not
+    // a slot count, so we export the geometry and let Python subtract:
+    //   kda_state_mapped        1 = state units are whole-slab runs claimed
+    //                           from the SHARED kMain slab pool
+    //                           (TD-KDA-STATE-MAPPED-SLABS); 0 = dedicated
+    //                           carve (the GF3.8 A/B off-path).
+    //   kda_state_slots         carve mode: dedicated whole-request slots —
+    //                           the hard concurrency cap (min across
+    //                           attention-host GPUs); 0 in mapped mode.
+    //   kda_state_slot_bytes    per-request per-rank state bytes (one whole
+    //                           slot: all linear layers, recurrent + rings).
+    //   kda_state_pages_per_seq mapped mode: ONE request's state demand in
+    //                           kMain pages (whole-slab runs incl. padding)
+    //                           — what an admission claims from the shared
+    //                           pool BESIDE its KV + indexer demand; 0 in
+    //                           carve mode (state does not draw on kMain).
+    //   kda_state_pool_pages    mapped mode: the shared kMain pool (pages,
+    //                           min across attention-host GPUs) the state
+    //                           competes in with KV/indexer; 0 in carve
+    //                           mode (the pool is kda_state_slots slots).
+    // Live pressure = StateSnapshot.kv_main_free_pages vs pages_per_seq
+    // (per tick); this block is the BOOT-time sizing surface
+    // (metadata_from_engine_info / Orchestrator.boot).  Hibernated prefix
+    // holders spill their state to host and return their claim
+    // (INV-KDA-STATE (g)), so steady-state demand ≈ in-flight requests
+    // + transient registrations.
+    int32_t   kda_state_mapped;
+    int32_t   kda_state_slots;
+    int64_t   kda_state_slot_bytes;
+    int64_t   kda_state_pages_per_seq;
+    int64_t   kda_state_pool_pages;
 };
 
 }  // namespace layerstorm::ipc

@@ -42,6 +42,47 @@ class TestMetadataFromEngineInfo:
         assert md.expert_bytes == engine.expert_bytes
         assert len(md.gpus) == engine.num_gpus
 
+    def test_kda_state_pool_zero_for_non_kda_arch(self, engine):
+        """TD-GLM5-KDA-SLOTS-EXPORT: the V3.2 null engine has no
+        linear-attention state — every geometry field must export zero
+        (and the pybind attributes must exist)."""
+        assert engine.kda_state_mapped == 0
+        assert engine.kda_state_slots == 0
+        assert engine.kda_state_slot_bytes == 0
+        assert engine.kda_state_pages_per_seq == 0
+        assert engine.kda_state_pool_pages == 0
+        md = metadata_from_engine_info(engine)
+        assert md.kda_state_mapped is False
+        assert md.kda_state_slots == 0
+        assert md.kda_state_slot_bytes == 0
+
+    def test_kda_state_pool_geometry_translated(self):
+        """TD-GLM5-KDA-SLOTS-EXPORT: the glue forwards the state-pool
+        geometry (a fake info stands in for a glm5_next boot — the live
+        values come from VramAllocator's layout)."""
+
+        class FakeInfo:
+            num_gpus = 1
+            num_moe_layers = 2
+            num_experts = 4
+            num_layers = 3
+            expert_bytes = 10
+            kv_bytes_per_page = 100
+            num_expert_devices = 1
+            moe_batch_capacity = 64
+            kda_state_mapped = 1
+            kda_state_slots = 0
+            kda_state_slot_bytes = 76_546_048
+            kda_state_pages_per_seq = 1_462
+            kda_state_pool_pages = 118_000
+
+        md = metadata_from_engine_info(FakeInfo())
+        assert md.kda_state_mapped is True
+        assert md.kda_state_slots == 0
+        assert md.kda_state_slot_bytes == 76_546_048
+        assert md.kda_state_pages_per_seq == 1_462
+        assert md.kda_state_pool_pages == 118_000
+
     def test_buffer_id_prefix_match(self, engine):
         # Null backends may not register the hidden/logits buffers — the
         # translation must then default to 0 (unit-safe) without raising.

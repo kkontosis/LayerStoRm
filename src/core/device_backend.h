@@ -22,6 +22,7 @@
 #include "smxx/quant/bf16_to_nvfp4_grouped.h"
 
 #include <cstddef>
+#include <stdexcept>
 
 namespace layerstorm::compute {
 
@@ -175,6 +176,18 @@ public:
 
     /// Synchronous host-to-device memcpy.
     virtual void memcpy_h2d(void* dst, const void* src, size_t bytes) = 0;
+
+    /// TD-GLM5-TP-COMBINE-PRECISION: elementwise dst[i] = bf16_rn(src[i]) —
+    /// the single post-allreduce rounding of the fp32 TP partial combine.
+    /// Default THROWS: only the CUDA backend has the kernel, and the combine
+    /// path is unreachable off-GPU — a silent no-op here would corrupt the
+    /// residual stream.
+    virtual void cast_f32_to_bf16(void* dst_bf16, const void* src_f32,
+                                  int64_t count, void* stream) {
+        (void)dst_bf16; (void)src_f32; (void)count; (void)stream;
+        throw std::runtime_error(
+            "cast_f32_to_bf16: not implemented on this DeviceBackend");
+    }
 
     /// Synchronous device-to-device memcpy.
     virtual void memcpy_d2d(void* dst, const void* src, size_t bytes) = 0;

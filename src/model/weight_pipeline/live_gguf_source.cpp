@@ -106,11 +106,21 @@ LiveGgufExpertSource::LiveGgufExpertSource(const std::vector<GgufReader>& shards
     n_experts_ = n_routed_experts;
     slot_size_bytes_raw_ = quant.bytes_per_expert(shape_);
     slot_stride_bytes_ = prepacked::aligned_slot_stride(slot_size_bytes_raw_);
-    layers_.resize(static_cast<size_t>(raw.num_hidden_layers));
+    // P-29 step 11 (LS_MTP_PROBE): when the glm5_next MTP/NextN block counts as a
+    // MoE layer, extend the layer table so its stacked expert tensors
+    // (blk.45.ffn_{gate,up,down}_exps) are indexed like any other layer's —
+    // the nextn skip below then never triggers for them. is_moe_layer(NH)
+    // encapsulates arch + flag; OFF keeps the historical size.
+    const int nextn_expert_layers =
+        model_cfg.is_moe_layer(raw.num_hidden_layers)
+            ? raw.num_nextn_predict_layers : 0;
+    layers_.resize(static_cast<size_t>(raw.num_hidden_layers
+                                       + nextn_expert_layers));
 
     // 1. Scan every shard's tensor directory for the stacked routed-expert
     // projections (the SAME name mapping + de-stack geometry the GGUF weight
     // loader uses — destack_expert_tensor).
+    int n_nextn_skipped = 0;
     for (size_t si = 0; si < shards.size(); ++si) {
         const GgufReader& r = shards[si];
         shard_paths_.push_back(r.path());
@@ -155,6 +165,20 @@ LiveGgufExpertSource::LiveGgufExpertSource(const std::vector<GgufReader>& shards
                     "live prepack: '" + e.name + "' size " +
                     std::to_string(e.data_size_bytes) + " != per_expert " +
                     std::to_string(per_expert) + " x " + std::to_string(n_exp));
+            }
+            if (id->layer_idx >= static_cast<int>(layers_.size()) &&
+                id->layer_idx < static_cast<int>(layers_.size())
+                                    + raw.num_nextn_predict_layers) {
+                // GF3.15 first live-prepack boot: the GGUF carries stacked
+                // routed-expert tensors for the MTP/NextN block(s) beyond
+                // num_hidden_layers (glm5_next blk.45). The engine never
+                // walks those layers (MTP off; nextn blobs are never
+                // fetched through the arena), and the GGUF weight loader
+                // likewise skips them here — refusing them aborted the
+                // whole boot. Skip them; anything ELSE out of range is
+                // still a hard refusal below.
+                ++n_nextn_skipped;
+                continue;
             }
             if (id->layer_idx < 0 ||
                 id->layer_idx >= static_cast<int>(layers_.size())) {
@@ -236,6 +260,12 @@ LiveGgufExpertSource::LiveGgufExpertSource(const std::vector<GgufReader>& shards
         fds_[si] = ShardFd{fd, direct, static_cast<int64_t>(sz)};
         if (direct) ++n_direct;
     }
+    if (n_nextn_skipped > 0)
+        spdlog::info("LiveGgufExpertSource: skipped {} stacked expert "
+                     "tensor(s) of the {} MTP/NextN block(s) beyond layer "
+                     "{} (never walked; MTP experts are not arena tenants)",
+                     n_nextn_skipped, raw.num_nextn_predict_layers,
+                     raw.num_hidden_layers - 1);
     spdlog::info("LiveGgufExpertSource: {} shard(s), {} MoE layer(s), {} "
                  "experts, slot {} B (stride {} B), O_DIRECT on {}/{} shard(s)",
                  shard_paths_.size(), model_cfg.moe_layer_indices().size(),

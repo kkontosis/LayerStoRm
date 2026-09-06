@@ -32,6 +32,7 @@
 #include "core/device_backend.h"
 #include "core/expert_device.h"
 #include "compute/kernels/elementwise/residual_add.h"
+#include "model/quantization/gguf_compute_cast.h"
 #include "model/quantization/gguf_kquant.h"
 #include "model/quantization/quant_interface.h"
 
@@ -361,7 +362,7 @@ bool CommandDispatcher::cpu_forced_produce(
 
     // ── Per-projection GGUF quant types + in-slot offsets (this layer) ──────
     auto to_compute = [](model::GgufKQuantType t) -> compute::GgufQuantType {
-        return static_cast<compute::GgufQuantType>(static_cast<int>(t));
+        return model::gguf::to_compute_gguf(t);  // static_assert-guarded bridge
     };
     model::GgufKQuantType gate_mt = model::GgufKQuantType::Q4_K;
     model::GgufKQuantType up_mt   = model::GgufKQuantType::Q4_K;

@@ -254,6 +254,74 @@ class TestBuildStackFailurePath:
 # FULL-STACK smoke: real pybind engine (null backends) + HTTP + loop thread
 # ---------------------------------------------------------------------------
 
+class TestAutoconfigSubstitutionGuard:
+    """TD-AUTOCONFIG-SERVE-SUBSTITUTES-THE-CONFIG: `--config X` boots X.
+    A config whose autoconfig block points at a DIFFERENT file refuses
+    unless --autoconfig explicitly asks for the substitution (then it is
+    logged at WARNING with both paths); a derived recipe pointing at
+    itself keeps re-deriving/serving in place."""
+
+    def _write(self, tmp_path, name, cfg):
+        p = tmp_path / name
+        p.write_text(json.dumps(cfg))
+        return str(p)
+
+    def test_enabled_config_with_differing_output_path_refuses(
+            self, tmp_path, caplog, monkeypatch):
+        from cli.serve import main
+        import autoconfig.cli as ac
+        monkeypatch.setattr(
+            ac, "run",
+            lambda *a, **k: pytest.fail("must refuse BEFORE deriving"))
+        derived = self._write(tmp_path, "derived.json", {})
+        cfg = self._write(tmp_path, "edited.json", {
+            "autoconfig": {"enabled": True, "output_path": derived}})
+        rc = main(["--config", cfg])
+        assert rc == 2
+        assert "refusing to boot a different file than --config" \
+            in caplog.text
+        assert derived in caplog.text and cfg in caplog.text
+
+    def test_derived_recipe_pointing_at_itself_refreshes_in_place(
+            self, tmp_path, monkeypatch):
+        from cli import serve
+        import autoconfig.cli as ac
+        cfg = str(tmp_path / "m.autoconfig.json")
+        self._write(tmp_path, "m.autoconfig.json", {
+            "autoconfig": {"enabled": True, "output_path": cfg}})
+        calls = []
+        monkeypatch.setattr(ac, "run",
+                            lambda base, out, **k: calls.append((base, out))
+                            or 0)
+
+        def stop_build(*a, **k):
+            raise RuntimeError("stop before boot")
+        monkeypatch.setattr(serve, "build_stack", stop_build)
+        rc = serve.main(["--config", cfg])
+        assert rc == 1                       # stopped at boot, PAST the guard
+        assert calls == [(cfg, cfg)]
+
+    def test_explicit_flag_substitutes_out_loud(self, tmp_path, caplog,
+                                                monkeypatch):
+        from cli import serve
+        import autoconfig.cli as ac
+        derived = self._write(tmp_path, "derived.json", {})
+        cfg = self._write(tmp_path, "base.json", {
+            "autoconfig": {"enabled": True, "output_path": derived}})
+        monkeypatch.setattr(ac, "run", lambda *a, **k: 0)
+        seen = {}
+
+        def stop_build(opts, **k):
+            seen["config_path"] = opts.config_path
+            raise RuntimeError("stop before boot")
+        monkeypatch.setattr(serve, "build_stack", stop_build)
+        rc = serve.main(["--config", cfg, "--autoconfig"])
+        assert rc == 1
+        assert seen["config_path"] == derived     # the substitution happened
+        assert "derivation SOURCE" in caplog.text # ...and was said out loud
+        assert "--autoconfig" in caplog.text
+
+
 class TestServeStackNullEngine:
     """The serve stack against the REAL daemon with null backends.
 
@@ -432,3 +500,56 @@ class TestDeepSeekV4ServingArgs:
     def test_invalid_tokenizer_mode_rejected(self):
         with pytest.raises(SystemExit):
             self._args(["--tokenizer-mode", "bogus"])
+
+
+class TestGlm5NextServingArgs:
+    """glm5_next tokenizer mode resolution + sampling defaults (GF3.13)."""
+
+    @staticmethod
+    def _args(extra=()):
+        return build_arg_parser().parse_args(
+            ["--config", "c.json", *extra])
+
+    def test_tokenizer_mode_auto_resolves_glm5_next_from_arch(self):
+        cfg = {"model": {"architecture": "glm5_next"}}
+        opts = resolve_options(cfg, self._args())
+        assert opts.tokenizer_mode == "glm5_next"
+
+    def test_tokenizer_mode_explicit_choice_accepted(self):
+        opts = resolve_options({}, self._args(
+            ["--tokenizer-mode", "glm5_next"]))
+        assert opts.tokenizer_mode == "glm5_next"
+
+    def test_glm52_arch_stays_legacy(self):
+        # GLM-5.2 (glm_moe_dsa) keeps the legacy hf mode — its serving
+        # path is byte-identical to before glm5_next existed.
+        cfg = {"model": {"architecture": "glm_moe_dsa"}}
+        opts = resolve_options(cfg, self._args())
+        assert opts.tokenizer_mode == "hf"
+
+    def test_read_sampling_defaults_glm5_next(self, tmp_path):
+        from cli.serve import read_sampling_defaults
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"temperature": 1.0, "top_p": 0.95}))
+        assert read_sampling_defaults(tmp_path, "glm5_next") == {
+            "top_p": 0.95}
+
+    def test_read_sampling_defaults_other_modes_empty(self, tmp_path):
+        from cli.serve import read_sampling_defaults
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"top_p": 0.95}))
+        for mode in ("hf", "deepseek_v4", ""):
+            assert read_sampling_defaults(tmp_path, mode) == {}
+
+    def test_read_sampling_defaults_missing_file(self, tmp_path):
+        from cli.serve import read_sampling_defaults
+        assert read_sampling_defaults(tmp_path, "glm5_next") == {}
+
+    def test_read_sampling_defaults_real_glm53_dir(self):
+        from cli.serve import read_sampling_defaults
+        import pathlib
+        d = (pathlib.Path(__file__).resolve().parent.parent.parent
+             / "test-data" / "GLM-5.3-Flash")
+        if not d.is_dir():
+            pytest.skip("GLM-5.3-Flash test data absent")
+        assert read_sampling_defaults(d, "glm5_next") == {"top_p": 0.95}

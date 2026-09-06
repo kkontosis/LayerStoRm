@@ -13,6 +13,7 @@ from tokenizer.tokenizer_wrapper import (
     TokenizerWrapper,
     _detect_eos_from_config,
     _scan_added_tokens_for_think,
+    _scan_tokenizer_json_for_think,
     _search_vocab_for_think,
     detect_special_tokens,
 )
@@ -21,6 +22,7 @@ _TEST_DATA = pathlib.Path(__file__).resolve().parent.parent.parent / "test-data"
 _DEEPSEEK = _TEST_DATA / "DeepSeek-V3.2"
 _GLM5 = _TEST_DATA / "GLM-5"
 _KIMI = _TEST_DATA / "Kimi-K2.5"
+_GLM53 = _TEST_DATA / "GLM-5.3-Flash"
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,81 @@ class TestDetectSpecialTokens:
         assert s.eos_token_ids == (163585,)
         assert s.think_start_token_id == 163606
         assert s.think_end_token_id == 163607
+
+    @pytest.mark.skipif(not _GLM53.is_dir(),
+                        reason="GLM-5.3-Flash test data absent")
+    def test_glm53_flash(self):
+        # GF3.13: eos lives under config.json text_config (multimodal
+        # wrapper config — includes <|user|> 154827 and <|observation|>
+        # 154829, the template's turn stops), and the think markers only
+        # exist in tokenizer.json's added_tokens (transformers v5 layout,
+        # no added_tokens_decoder in tokenizer_config.json).
+        s = detect_special_tokens(_GLM53)
+        assert s.eos_token_ids == (154820, 154827, 154829)
+        assert s.think_start_token_id == 154841
+        assert s.think_end_token_id == 154842
+
+
+class TestScanTokenizerJsonForThink:
+
+    def test_found(self, tmp_path):
+        (tmp_path / "tokenizer.json").write_text(json.dumps({
+            "added_tokens": [
+                {"id": 7, "content": "<think>"},
+                {"id": 8, "content": "</think>"},
+            ],
+        }))
+        assert _scan_tokenizer_json_for_think(tmp_path) == (7, 8)
+
+    def test_absent_file(self, tmp_path):
+        assert _scan_tokenizer_json_for_think(tmp_path) == (-1, -2)
+
+    def test_no_added_tokens(self, tmp_path):
+        (tmp_path / "tokenizer.json").write_text(json.dumps({}))
+        assert _scan_tokenizer_json_for_think(tmp_path) == (-1, -2)
+
+    def test_malformed_entries_skipped(self, tmp_path):
+        (tmp_path / "tokenizer.json").write_text(json.dumps({
+            "added_tokens": [
+                "junk",
+                {"content": "<think>"},          # no id
+                {"id": "9", "content": "</think>"},  # non-int id
+                {"id": 11, "content": "</think>"},
+            ],
+        }))
+        assert _scan_tokenizer_json_for_think(tmp_path) == (-1, 11)
+
+
+class TestEosNestedAndGenerationConfig:
+
+    def test_text_config_nesting(self):
+        assert _detect_eos_from_config(
+            {"text_config": {"eos_token_id": [5, 6]}}) == (5, 6)
+
+    def test_top_level_wins_over_text_config(self):
+        assert _detect_eos_from_config(
+            {"eos_token_id": 3,
+             "text_config": {"eos_token_id": [5, 6]}}) == (3,)
+
+    def test_generation_config_fallback(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps({
+            "model_type": "whatever",
+        }))
+        (tmp_path / "generation_config.json").write_text(json.dumps({
+            "eos_token_id": [21, 22],
+        }))
+        s = detect_special_tokens(tmp_path)
+        assert s.eos_token_ids == (21, 22)
+
+    def test_config_json_wins_over_generation_config(self, tmp_path):
+        (tmp_path / "config.json").write_text(json.dumps({
+            "eos_token_id": 1,
+        }))
+        (tmp_path / "generation_config.json").write_text(json.dumps({
+            "eos_token_id": [21, 22],
+        }))
+        s = detect_special_tokens(tmp_path)
+        assert s.eos_token_ids == (1,)
 
 
 class TestDetectEdgeCases:

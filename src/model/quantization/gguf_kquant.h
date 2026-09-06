@@ -24,8 +24,12 @@
 namespace layerstorm::model {
 
 // ── GGUF weight quantization types ──────────────────────────────────────────
-// Enum values match layerstorm::compute::GgufType (Q2_K=0 .. Q8_0=5) so the
-// two can be cast across the engine/kernel boundary by GG-4/GG-5/GG-6.
+// Enum values match layerstorm::compute::GgufQuantType (engine) and the kernel
+// layerstorm::compute::GgufType (Q2_K=0 .. Q8_0=5, MXFP4=6) so the three can
+// be cast across the engine/kernel boundary by GG-4/GG-5/GG-6. The ordinal
+// contract is pinned by static_asserts: model->engine in gguf_compute_cast.h
+// (the ONLY sanctioned model->engine conversion), engine/model->kernel inside
+// the CUDA device TUs (TD-GGUF-ENUM-MXFP4-DIVERGENCE).
 
 enum class GgufKQuantType {
     Q2_K = 0,
@@ -91,7 +95,7 @@ GgufKQuantType type_from_name(std::string_view name);
 GgufKQuantType type_from_weight_quant(config::WeightQuant wq);
 
 /// True for any GGUF-family weight quant (the generic `gguf` sentinel or one of
-/// the six uniform `gguf_qX_k`/`gguf_q8_0` variants). Single home for the
+/// the seven uniform `gguf_qX_k`/`gguf_q8_0`/`gguf_mxfp4` variants). Single home for the
 /// "is this a GGUF quant" predicate so call sites don't open-code the enum list.
 bool is_gguf_weight_quant(config::WeightQuant wq);
 

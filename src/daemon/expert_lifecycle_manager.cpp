@@ -347,6 +347,29 @@ LifecycleToken ExpertLifecycleManager::ensure_resident(
         case GpuTier::kHot:
         case GpuTier::kPartial1:
         case GpuTier::kPartial1_2: {
+            // INV-ELM-EVICT self-heal (TD-KVXP-RECLAIM-REGRANT-WEDGE): trust
+            // but verify. If the cache no longer holds this (key,gpu), an
+            // eviction bypassed the lifecycle manager and this entry is a
+            // STALE kHot. Completing the interest as "already resident"
+            // would promise an arrival that can never happen — the consumer
+            // polls the CACHE for readiness, so it waits its full fetch
+            // deadline in silence, once per layer that routes the key (the
+            // observed GPU-0% crawl). Heal to ABSENT, fail LOUD, and fall
+            // through to restart the fetch chain for this very interest.
+            if (deps_.expert_cache && !deps_.expert_cache->lookup(key, gpu)) {
+                spdlog::error(
+                    "ELM: L{}E{} gpu={} tracked at tier {} but the cache "
+                    "holds no entry — an eviction bypassed the lifecycle "
+                    "manager (INV-ELM-EVICT violation). Healing to ABSENT "
+                    "and restarting the fetch chain",
+                    key.layer_idx, key.expert_idx, gpu,
+                    static_cast<int>(ge.tier));
+                ge.tier = GpuTier::kAbsent;
+                ge.transfer_token = 0;
+                ge.host_buf_ref.reset();
+                publish_gpu_state(gk, ge.tier, 0);
+                break;  // -> the ABSENT start chain below
+            }
             // Already resident (or partially) — immediate completion.
             pending_completions_.push_back({token, cmd_seq, key, gpu, true});
             return token;

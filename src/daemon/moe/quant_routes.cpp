@@ -52,11 +52,11 @@ MoeQuantRoutes build_moe_quant_routes(const CommandDispatcher::Deps& deps,
             ? compute::GgufGemmStrategy::dequant
             : compute::GgufGemmStrategy::int_strategy;
     // GG-5b: per-projection GGUF type. projection_type() returns a
-    // model::GgufKQuantType whose ordinal matches compute::GgufQuantType
-    // (Q2_K=0..Q8_0=5), so the cast is by value (same cast the atomic path uses).
+    // model::GgufKQuantType; convert through the static_assert-guarded bridge
+    // (canonical order Q2_K=0..MXFP4=6; TD-GGUF-ENUM-MXFP4-DIVERGENCE).
     auto gguf_proj_type = [&](model::Projection proj) -> compute::GgufQuantType {
-        return static_cast<compute::GgufQuantType>(
-            static_cast<int>(deps.gguf_quant->projection_type(proj)));
+        return model::gguf::to_compute_gguf(
+            deps.gguf_quant->projection_type(proj));
     };
     // GG-9: prefer THIS layer's own routed k-quant types (a mixed "XL" GGUF uses
     // different routed k-quants per layer); fall back to the uniform `gguf_quant`

@@ -91,6 +91,9 @@ public:
         if (tq_dec_qrot_) device_.device_free(tq_dec_qrot_);
         if (tq_dec_orot_) device_.device_free(tq_dec_orot_);
         if (tq_dec_indices_) device_.device_free(tq_dec_indices_);
+        if (tq_dec_oaccum_) device_.device_free(tq_dec_oaccum_);
+        if (tq_dec_lseaccum_) device_.device_free(tq_dec_lseaccum_);
+        if (tq_dec_num_splits_) device_.device_free(tq_dec_num_splits_);
         for (auto& v : tq_dec_graphs_)
             for (auto& g : v)
                 if (g.exec) cudaGraphExecDestroy(g.exec);
@@ -247,6 +250,10 @@ public:
                    void* q8_1_workspace, void* stream) override {
         device_.gguf_mmvq(params, q8_1_workspace, stream);
     }
+    void gguf_mmvq_multi(const GgufGemmMultiParams& params,
+                         void* q8_1_workspace, void* stream) override {
+        device_.gguf_mmvq_multi(params, q8_1_workspace, stream);
+    }
     void gguf_mmq(const GgufGemmParams& params,
                   void* q8_1_workspace, void* stream) override {
         device_.gguf_mmq(params, q8_1_workspace, stream);
@@ -294,6 +301,10 @@ public:
                             void* stream) override {
         device_.batched_gemm_bf16(params, stream);
     }
+    void cast_f32_to_bf16(void* dst_bf16, const void* src_f32,
+                          int64_t count, void* stream) override {
+        device_.cast_f32_to_bf16(dst_bf16, src_f32, count, stream);
+    }
     void absorb_q(const QAbsorbParams& params, void* stream) override {
         device_.absorb_q(params, stream);
     }
@@ -333,6 +344,45 @@ public:
     }
     void indexer_topk_merge(const IndexerTopkMergeArgs& a, void* s) override {
         device_.indexer_topk_merge(a, s);
+    }
+    void indexer_kpool_append(const IndexerKpoolAppendArgs& a,
+                              void* s) override {
+        device_.indexer_kpool_append(a, s);
+    }
+    void indexer_kpool_chunk_append(const IndexerKpoolChunkAppendArgs& a,
+                                    void* s) override {
+        device_.indexer_kpool_chunk_append(a, s);
+    }
+    void indexer_kpool_expand(const IndexerKpoolExpandArgs& a,
+                              void* s) override {
+        device_.indexer_kpool_expand(a, s);
+    }
+    void indexer_kpool_merge(const IndexerKpoolMergeArgs& a,
+                             void* s) override {
+        device_.indexer_kpool_merge(a, s);
+    }
+
+    // GF3.9 KDA linear attention (glm5_next) — forwarded verbatim, like the
+    // kpool ops: the backend translates the CUDA-free PODs and launches the
+    // GF3.7 wrappers on the caller's (kAttention) stream.
+    void kda_conv_prefill(const KdaConvPrefillArgs& a, void* s) override {
+        device_.kda_conv_prefill(a, s);
+    }
+    void kda_conv_decode(const KdaConvDecodeArgs& a, void* s) override {
+        device_.kda_conv_decode(a, s);
+    }
+    void kda_chunked_scan(const KdaChunkedScanArgs& a, void* s) override {
+        device_.kda_chunked_scan(a, s);
+    }
+    void kda_gated_rmsnorm(const KdaGatedRmsNormArgs& a, void* s) override {
+        device_.kda_gated_rmsnorm(a, s);
+    }
+    void kda_decode_step(const KdaDecodeStepArgs& a, void* s) override {
+        device_.kda_decode_step(a, s);
+    }
+    size_t kda_prefill_workspace_bytes(int t_len,
+                                       int num_heads) const override {
+        return device_.kda_prefill_workspace_bytes(t_len, num_heads);
     }
 
     // ── Device memory (delegated) ───────────────────────────────────────────
@@ -454,6 +504,45 @@ public:
                     "allocation failed (INV-SCRATCH-LOUD — a silent fallback "
                     "to the dequant chain would switch decode numerics "
                     "mid-run)");
+            // ── Split-KV workspace (P-29 step 9, OQ-2) ──────────────────
+            // Effective part count is a pure function of (topk, request) —
+            // tq_sparse_split_parts, the SAME helper the launcher recomputes
+            // through, so the {0, parts} content written here can never
+            // disagree with the launched grid. Auto request = one partition
+            // per 64-token KV block, capped at 64. Allocated pre-capture;
+            // realloc (topk change — never live on one model) clears the
+            // graph cache since old captures bake the old pointers/content.
+            int split_parts = 1;
+            if (tq_splitkv_req_ != 0 && d_c_ == 512) {
+                const int req = tq_splitkv_req_ < 0
+                    ? std::min((topk + 63) / 64, 64) : tq_splitkv_req_;
+                split_parts = sm120::decode::tq_sparse::tq_sparse_split_parts(
+                    topk, req);
+            }
+            if (split_parts > 1 && split_parts != tq_dec_split_parts_) {
+                if (tq_dec_oaccum_) device_.device_free(tq_dec_oaccum_);
+                if (tq_dec_lseaccum_) device_.device_free(tq_dec_lseaccum_);
+                if (tq_dec_num_splits_) device_.device_free(tq_dec_num_splits_);
+                tq_dec_oaccum_ = static_cast<float*>(device_.device_alloc(
+                    static_cast<size_t>(split_parts) * h_q_ * d_c_
+                    * sizeof(float)));
+                tq_dec_lseaccum_ = static_cast<float*>(device_.device_alloc(
+                    static_cast<size_t>(split_parts) * h_q_ * sizeof(float)));
+                tq_dec_num_splits_ = static_cast<int*>(device_.device_alloc(
+                    2 * sizeof(int)));
+                if (!tq_dec_oaccum_ || !tq_dec_lseaccum_ || !tq_dec_num_splits_)
+                    throw std::runtime_error(
+                        "TqSm120AttentionDevice: split-KV workspace "
+                        "allocation failed (INV-SCRATCH-LOUD)");
+                const int ns[2] = {0, split_parts};
+                device_.memcpy_h2d(tq_dec_num_splits_, ns, sizeof(ns));
+                for (auto& v : tq_dec_graphs_)
+                    for (auto& g : v)
+                        if (g.exec) { cudaGraphExecDestroy(g.exec); g.exec = nullptr; }
+                for (auto& v : tq_dec_graphs_) v.clear();
+                tq_dec_split_parts_ = split_parts;
+            }
+            const int sm_parts_now = split_parts > 1 ? split_parts : 0;
             // Device-read causal bound ONLY under graph mode: the toggle-OFF
             // path keeps the host-scalar bound bit-identical to the
             // established route.
@@ -492,6 +581,23 @@ public:
                 sp.topk = topk;
                 sp.stride_indices_b = 0;
                 sp.stride_indices_s_q = 0;
+                // Slim kernel (P-29 step 6): device-read populated extent bounds
+                // the serial block walk (same topk_length the translate
+                // kernel consumed — its contract pads indices[i >= limit]
+                // with -1); execution-time read, graph-replay safe, pointer
+                // already in the graph fingerprint (g.tkl). use_slim selects
+                // the bit-identical slim kernel; LS_TQ_SPARSE_SLIM=0 forces
+                // the reference for A/B control.
+                sp.topk_length = topk_lengths;
+                sp.use_slim = tq_sparse_slim_on_ ? 1 : 0;
+                // Split-KV (P-29 step 9): fixed deterministic partition of the
+                // topk extent + mla_combine merge. 0 → the established
+                // unsplit slim/reference route, byte-for-byte. Token-identity
+                // bar, LS_TQ_SPLITKV gates (see tq_splitkv_req_).
+                sp.num_sm_parts = sm_parts_now;
+                sp.o_accum = tq_dec_oaccum_;
+                sp.lse_accum = tq_dec_lseaccum_;
+                sp.num_splits_ptr = tq_dec_num_splits_;
                 sp.centroids = tq_resources_->device_centroids();
                 sp.out = tq_dec_orot_;
                 sp.lse = lse;
@@ -530,6 +636,7 @@ public:
                     && g.kv == kv_cache && g.seqlens == seq_len_dev
                     && g.lin == prefill_indices_scratch_
                     && g.dec_idx == tq_dec_indices_ && g.topk == topk
+                    && g.parts == sm_parts_now
                     && g.csb == cache_stride_block
                     && g.csr == cache_stride_row && g.ps == page_size;
             };
@@ -566,7 +673,8 @@ public:
                 g.sidx = sparse_indices; g.tkl = topk_lengths;
                 g.kv = kv_cache; g.seqlens = seq_len_dev;
                 g.lin = prefill_indices_scratch_; g.dec_idx = tq_dec_indices_;
-                g.topk = topk; g.csb = cache_stride_block;
+                g.topk = topk; g.parts = sm_parts_now;
+                g.csb = cache_stride_block;
                 g.csr = cache_stride_row; g.ps = page_size;
                 cache.push_back(g);
                 hit = &cache.back();
@@ -716,6 +824,15 @@ private:
     int*   tq_dec_indices_ = nullptr;
     int    tq_dec_topk_cap_ = 0;
 
+    // Split-KV workspace (P-29 step 9, OQ-2): normalized FP32 partials +
+    // log2-domain partial LSEs + the {0, parts} cumulative-splits pair the
+    // shared mla_combine consumes. Sized/rewritten pre-capture whenever the
+    // effective part count changes (clears the graph cache).
+    float* tq_dec_oaccum_     = nullptr;
+    float* tq_dec_lseaccum_   = nullptr;
+    int*   tq_dec_num_splits_ = nullptr;
+    int    tq_dec_split_parts_ = 0;
+
     // ── LS_TQ_DECODE_GRAPH (§12n): per-layer CUDA graph of the 4-kernel
     // sparse-decode chain (translate → q_rotate → decode → v_rotate_back).
     // All shapes are fixed at B=1 and every per-token variation is device
@@ -729,7 +846,8 @@ private:
         const int* sidx = nullptr; const int* tkl = nullptr;
         const void* kv = nullptr;  const int* seqlens = nullptr;
         const int* lin = nullptr;  const int* dec_idx = nullptr;
-        int topk = 0; int64_t csb = 0; int csr = 0; int ps = 0;
+        int topk = 0; int parts = 0;
+        int64_t csb = 0; int csr = 0; int ps = 0;
     };
     // Per-layer graph CACHE (not a single slot): B>1 sparse decode is
     // row-sliced upstream into B batch-of-1 calls with per-row pointer sets
@@ -745,6 +863,43 @@ private:
     bool tq_dec_graph_on_ = [] {
         const char* v = std::getenv("LS_TQ_DECODE_GRAPH");
         return !(v && *v && v[0] == '0');
+    }();
+    // DEFAULT ON (P-29 step 6): slim B=1 sparse-decode kernel —
+    // bit-identical to the reference by construction and by on-GPU proof
+    // (tq_sparse_decode_slim_test); ~3.7x faster at the live 8k shape.
+    // LS_TQ_SPARSE_SLIM=0 opts out (reference kernel, byte-for-byte the
+    // pre-step-6 launch).
+    bool tq_sparse_slim_on_ = [] {
+        const char* v = std::getenv("LS_TQ_SPARSE_SLIM");
+        return !(v && *v && v[0] == '0');
+    }();
+    // Split-KV over the topk extent (P-29 step 9, OQ-2; DEFAULT OFF — the
+    // P-29 step-9 bar FAILED on token identity: the split combine's FP32
+    // reassociation (unit-bounded at ~1.3e-5/layer, mathematically exact
+    // merge) integrates DISCRETELY through the re-quantized TQ cache rows +
+    // DSA top-k selection, so free-running generation forks (champion legs
+    // token-differ; TF-at-depth: 327/6999 argmax flips, mean dNLL
+    // -1.1e-4 +- 3.7e-3 = statistically zero — quality preserved, identity
+    // not; rerun noise measured exactly 0). Speed on the table at the 8k
+    // anchor: +5.4% (24.58 -> 25.9 tok/s, conversion ~1.03x). Turning this
+    // ON is an accuracy-rule decision (Rule 2), not a perf decision —
+    // P-29 step-9 LOG + OPEN QUESTIONS carry the full evidence.
+    // LS_TQ_SPLITKV: unset/"1" → auto (one partition per 64-token KV block,
+    // capped 64); "0" → OFF (established unsplit route, byte-for-byte —
+    // restores the pre-flip reference trajectory exactly); N>1 → N requested
+    // partitions. DEFAULT ON since P-29 step 14 (OQ-6, user-granted
+    // 2026-09-04: +4.4–5.6% @8k accepted at the token-identity price;
+    // quality statistically unchanged). LS_REFERENCE_TRAJECTORY_IDENTITY=1
+    // forces this OFF (the canonical numerics route stays unsplit — see
+    // src/core/determinism.cpp). The effective count is always
+    // tq_sparse_split_parts(topk, request) — a pure function of
+    // shape/config (INV-TOPK-TIE-DET spirit: never scheduling-dependent).
+    int tq_splitkv_req_ = [] {
+        const char* v = std::getenv("LS_TQ_SPLITKV");
+        if (!v || !*v) return -1;           // default: ON, auto (OQ-6 grant)
+        const int n = std::atoi(v);
+        if (n == 0) return 0;               // "0" (or junk) → OFF
+        return n == 1 ? -1 : n;             // "1" → auto; N>1 → explicit
     }();
 
     // Prefill dequant scratch buffers (allocated by set_prefill_scratch)

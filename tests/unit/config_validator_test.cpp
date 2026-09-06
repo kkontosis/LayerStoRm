@@ -1,5 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
 #include "config/config_validator.h"
 #include "model/layer_registry.h"
 #include "model/model_config.h"
@@ -662,11 +670,86 @@ TEST(ConfigValidator, AcceptTqWithKvLoraRankPositive) {
     EXPECT_FALSE(has_error(result, "attention_backend"));
 }
 
+
+// ── Hermetic DSpark checkpoint fixture ──────────────────────────────────────
+// validate_config()'s VRAM-budget path constructs a LayerRegistry, which for
+// speculation.method=dspark parses the checkpoint at
+// speculation.dspark.checkpoint_path: config.json (full parse) and the
+// model.safetensors HEADER (dspark_draft_bytes). The DEFAULT checkpoint_path
+// is a repo-root-relative machine-data path, so any test selecting the dspark
+// method must point at a checkpoint that exists regardless of cwd — this
+// synthesizes one (real speculator config.json shape, tiny fabricated
+// safetensors header) in a per-process temp dir.
+static std::string dspark_checkpoint_dir() {
+    static const std::string dir = [] {
+        namespace fs = std::filesystem;
+        auto d = fs::temp_directory_path() /
+                 ("ls_dspark_ckpt_" + std::to_string(::getpid()));
+        fs::create_directories(d);
+
+        // config.json: the shipped RedHatAI GLM-5.2 speculator shape
+        // (matches the DsparkConfig field defaults the validator
+        // cross-checks against).
+        std::ofstream cfg(d / "config.json", std::ios::trunc);
+        cfg << R"JSON({
+  "speculators_model_type": "dspark",
+  "block_size": 16,
+  "markov_rank": 256,
+  "markov_head_type": "vanilla",
+  "enable_confidence_head": true,
+  "confidence_head_with_markov": true,
+  "draft_vocab_size": 154880,
+  "mask_token_id": 154856,
+  "max_anchors": 1024,
+  "tie_word_embeddings": false,
+  "aux_hidden_state_layer_ids": [8, 23, 39, 55, 70],
+  "speculators_config": {
+    "algorithm": "dspark",
+    "proposal_methods": [
+      { "proposal_type": "greedy", "speculative_tokens": 15 }
+    ]
+  },
+  "transformer_layer_config": {
+    "model_type": "qwen3",
+    "num_hidden_layers": 5,
+    "hidden_size": 6144,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 64,
+    "head_dim": 64,
+    "intermediate_size": 12288,
+    "rms_norm_eps": 1e-05,
+    "vocab_size": 154880,
+    "rope_parameters": { "rope_theta": 8000000, "rope_type": "default" }
+  }
+})JSON";
+        cfg.close();
+
+        // model.safetensors: 8-byte LE header length + JSON header + data.
+        // Only the header is read (dspark_draft_bytes); keep tensors tiny.
+        const std::string header =
+            R"({"lm_head.weight":{"dtype":"BF16","shape":[8,8],"data_offsets":[0,128]},)"
+            R"("layers.0.self_attn.q_proj.weight":{"dtype":"BF16","shape":[8,8],"data_offsets":[128,256]},)"
+            R"("embed_tokens.weight":{"dtype":"BF16","shape":[8,8],"data_offsets":[256,384]}})";
+        std::ofstream st(d / "model.safetensors",
+                         std::ios::trunc | std::ios::binary);
+        uint64_t hlen = header.size();
+        char lenbuf[8];
+        std::memcpy(lenbuf, &hlen, 8);  // little-endian host
+        st.write(lenbuf, 8);
+        st.write(header.data(), static_cast<std::streamsize>(header.size()));
+        const std::string zeros(384, '\0');
+        st.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+        return d.string();
+    }();
+    return dir;
+}
+
 // ── DSpark config contract (DSP-1) ──────────────────────────────────────────
 
 TEST(ConfigValidator, DsparkStsTemperaturesLengthMustMatchBlockSize) {
     auto cfg = valid_config();
     cfg.speculation.method = SpeculationMethodType::dspark;
+    cfg.speculation.dspark.checkpoint_path = dspark_checkpoint_dir();
     cfg.speculation.dspark.block_size = 5;
     cfg.speculation.dspark.sts_temperatures = {1.0, 1.1, 0.9};  // 3 != 5
 
@@ -687,6 +770,7 @@ TEST(ConfigValidator, DsparkStsTemperaturesLengthMustMatchBlockSize) {
 TEST(ConfigValidator, DsparkSchedulerRequiresConfidenceHead) {
     auto cfg = valid_config();
     cfg.speculation.method = SpeculationMethodType::dspark;
+    cfg.speculation.dspark.checkpoint_path = dspark_checkpoint_dir();
     cfg.speculation.dspark.scheduler_mode = DsparkSchedulerMode::throughput;
     cfg.speculation.dspark.confidence_enabled = false;
 
@@ -1060,9 +1144,16 @@ TEST(V4ConfigCpu, V4FlashServeConfigCarriesResidentArenaContract) {
     ASSERT_NO_THROW(cfg = parse_config(j));
     EXPECT_EQ(cfg.model.architecture, Architecture::deepseek_v4);
 
-    // Residency: prepacked source + pinned arena + eager preload (the arena is
-    // the warm tier; nothing must depend on page-cache warmth).
-    EXPECT_FALSE(cfg.preprocessing.prepacked_dir.empty());
+    // Residency: an expert SOURCE that fills the arena at boot — prepacked
+    // set OR live prepack (slots built straight from the source GGUF,
+    // 2026-08-25) — plus pinned arena + eager preload (the arena is the warm
+    // tier; nothing must depend on page-cache warmth).
+    // TD-V4-SERVE-CONFIG-PREPACK-CONTRACT: both routes are supported; the
+    // shipped config currently uses live_prepack.
+    EXPECT_TRUE(!cfg.preprocessing.prepacked_dir.empty() ||
+                cfg.preprocessing.live_prepack)
+        << "V4 serve config must provision the resident arena via "
+           "preprocessing.prepacked_dir or preprocessing.live_prepack";
     EXPECT_TRUE(cfg.memory.preload_expert_buffers);
     EXPECT_TRUE(cfg.memory.pin_host_expert_pool);
     EXPECT_TRUE(cfg.memory.pin_host_expert_pool_preload);
@@ -1141,4 +1232,152 @@ TEST(ConfigValidatorGating, SwigluLimitRules) {
     cfg = valid_config();
     cfg.model.swiglu_limit = 0.0;
     EXPECT_FALSE(has_error_on(validate_config(cfg), "model.swiglu_limit"));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// glm5_next rules (PLAN.md Phase GF3, GF3.2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Valid GLM-5.3-Flash-shaped Config (mirrors
+/// test-data/GLM-5.3-Flash/config.json — spec/GLM-5.3-FLASH-MODELINFO.md).
+static Config valid_glm5_next_config() {
+    Config cfg = valid_config();
+    auto& m = cfg.model;
+    m.architecture = Architecture::glm5_next;
+    m.weights_path = "/data/models/glm-5.3-flash/";
+    m.num_hidden_layers = 45;
+    m.hidden_size = 4096;
+    m.num_attention_heads = 64;
+    m.num_key_value_heads = 64;
+    m.kv_lora_rank = 512;
+    m.qk_rope_head_dim = 0;
+    m.qk_nope_head_dim = 256;
+    m.v_head_dim = 256;
+    m.q_lora_rank = 1536;
+    m.intermediate_size = 12288;
+    m.n_routed_experts = 288;
+    m.num_experts_per_tok = 8;
+    m.n_group = 1;
+    m.topk_group = 1;
+    m.first_k_dense_replace = 3;
+    m.mla_use_nope = true;
+    m.index_topk = 2048;
+    m.index_n_heads = 32;
+    m.index_head_dim = 128;
+    m.index_kpool = 4;
+    m.index_kpool_compress = true;
+    m.index_kpool_always_select_tail = true;
+    m.hc_mult = 4;
+    m.hc_sinkhorn_iters = 20;
+    m.hc_eps = 1e-6;
+    m.swiglu_limit = 10.0;
+    // swiglu_limit > 0 + nvfp4 is rejected (V4-4b) — native checkpoint is FP8.
+    cfg.quantization.weights = WeightQuant::fp8_e4m3;
+    m.layer_types.clear();
+    for (int l = 0; l < 45; ++l)
+        m.layer_types.push_back((l % 4 == 3) || l == 43
+            ? LayerAttentionType::deepseek_sparse_attention
+            : LayerAttentionType::linear_attention);
+    LinearAttnConfig la;
+    la.num_heads = 64;
+    la.head_dim = 128;
+    la.short_conv_kernel_size = 4;
+    la.gate_lower_bound = -5.0;
+    m.linear_attn_config = la;
+    return cfg;
+}
+
+TEST(ConfigValidatorGlm5Next, ValidConfigPasses) {
+    auto r = validate_config(valid_glm5_next_config());
+    for (const auto& e : r.errors)
+        ADD_FAILURE() << "unexpected error on " << e.field << ": " << e.message;
+    EXPECT_TRUE(r.valid());
+}
+
+TEST(ConfigValidatorGlm5Next, LayerTypesLengthMustMatch) {
+    auto cfg = valid_glm5_next_config();
+    cfg.model.layer_types.pop_back();  // 44 != 45
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.layer_types"));
+
+    cfg = valid_glm5_next_config();
+    cfg.model.layer_types.clear();  // required non-empty for glm5_next
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.layer_types"));
+}
+
+TEST(ConfigValidatorGlm5Next, LinearAttnConfigRequiredWithLinearLayers) {
+    auto cfg = valid_glm5_next_config();
+    cfg.model.linear_attn_config.reset();
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.linear_attn_config"));
+}
+
+TEST(ConfigValidatorGlm5Next, KdaHeadsMustDivideByTp) {
+    // valid_config() already ships 2x5090 tp_array {0,1}.
+    auto cfg = valid_glm5_next_config();
+    cfg.parallelism.tensor_parallelism = 2;
+    EXPECT_TRUE(validate_config(cfg).valid());
+    cfg.model.linear_attn_config->num_heads = 63;
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "parallelism.tensor_parallelism"));
+}
+
+TEST(ConfigValidatorGlm5Next, NopeRopeDimConsistency) {
+    auto cfg = valid_glm5_next_config();
+    cfg.model.qk_rope_head_dim = 64;  // rope dim under NoPE — mis-sized pages
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.qk_rope_head_dim"));
+
+    cfg = valid_glm5_next_config();
+    cfg.model.mla_use_nope = false;  // rope MLA with a zero rope dim
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.mla_use_nope"));
+}
+
+TEST(ConfigValidatorGlm5Next, IndexPoolRules) {
+    auto cfg = valid_glm5_next_config();
+    cfg.model.index_topk = 2050;  // not divisible by kpool 4
+    EXPECT_TRUE(has_error_on(validate_config(cfg), "model.index_kpool"));
+
+    cfg = valid_glm5_next_config();
+    cfg.model.index_kpool_compress = false;  // unlearned pooling: fail closed
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "model.index_kpool_compress"));
+}
+
+TEST(ConfigValidatorGlm5Next, PoolAlignmentInvariant) {
+    // MODELINFO §10.8: every engine-produced prefill boundary must be a
+    // multiple of index_kpool (pages 16 / grid 64 / superchunk 512 all are).
+    auto cfg = valid_glm5_next_config();
+    cfg.memory.kv_cache.page_size_tokens = 18;  // not a multiple of 4
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "memory.kv_cache.page_size_tokens"));
+
+    cfg = valid_glm5_next_config();
+    cfg.orchestrator.prefill_chunk_tokens = 66;
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "orchestrator.prefill_chunk_tokens"));
+
+    cfg = valid_glm5_next_config();
+    cfg.compute.prefill_superchunk_tokens = 514;
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "compute.prefill_superchunk_tokens"));
+}
+
+TEST(ConfigValidatorGlm5Next, InertKnobsWarnOnOtherArchs) {
+    // Byte-identity guard: on existing archs the new fields produce
+    // WARNINGS only, never errors — an existing valid config stays valid.
+    auto cfg = valid_config();
+    cfg.model.layer_types.push_back(LayerAttentionType::linear_attention);
+    cfg.model.index_kpool = 4;
+    cfg.model.mla_use_nope = true;
+    auto r = validate_config(cfg);
+    EXPECT_TRUE(r.valid());
+    EXPECT_TRUE(has_warning(r, "model.layer_types"));
+    EXPECT_TRUE(has_warning(r, "model.index_kpool"));
+    EXPECT_TRUE(has_warning(r, "model.mla_use_nope"));
+}
+
+TEST(ConfigValidatorGlm5Next, V4BackendRejected) {
+    auto cfg = valid_glm5_next_config();
+    cfg.compute.attention_backend = AttentionBackendType::csa_hca;
+    EXPECT_TRUE(has_error_on(validate_config(cfg),
+                             "compute.attention_backend"));
 }

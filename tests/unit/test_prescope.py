@@ -72,6 +72,19 @@ class TestTargetLayer:
         ps = PreScope(_meta())
         assert ps.first_moe_layer == 3
 
+    def test_first_moe_layer_reads_metadata_field(self):
+        # P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS: the MTP-armed census
+        # (45 layers, 43 MoE) must not move the dense/MoE boundary down —
+        # the config's first_k_dense_replace is carried on the metadata.
+        from orchestrator.types import EngineMetadata
+        md = EngineMetadata(
+            num_gpus=1, num_moe_layers=43, num_experts=8, num_layers=45,
+            expert_bytes=1, kv_bytes_per_page=1, first_moe_layer=3,
+        )
+        ps = PreScope(md)
+        assert ps.first_moe_layer == 3
+        assert not ps.is_moe_layer(2) and ps.is_moe_layer(3)
+
 
 class TestGatingProcessing:
     def test_top_k_selection(self):

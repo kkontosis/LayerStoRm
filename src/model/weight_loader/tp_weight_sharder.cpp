@@ -36,6 +36,47 @@ ShardMode shard_mode_for(TensorComponent component) {
             return ShardMode::kColumnParallel;
         case TensorComponent::o_proj_b:
             return ShardMode::kRowParallel;
+
+        // ── glm5_next KDA linear attention (GF3.3; spec/GLM-5.3-FLASH-
+        // MODELINFO.md §3a) ────────────────────────────────────────────
+        //
+        // SHARDING INVARIANT: every column-parallel KDA tensor splits on the
+        // HEAD axis, and that axis is axis 0 of the row-major checkpoint
+        // layout for ALL of them — q/k/v/f_b/g_b are [heads*head_dim, ...]
+        // head-major, the depthwise convs are [heads*head_dim, 1, K] (one row
+        // per channel), b_proj and A_log are per-head [heads, ...], dt_bias is
+        // per-channel [heads*head_dim].  Therefore tp MUST divide the KDA head
+        // count (GF3.2 validates linear_attn_config.num_heads % tp at config
+        // level); rank r owns heads [r*H/tp, (r+1)*H/tp) in every one of them,
+        // so its recurrent state, conv ring, gates and decay all describe the
+        // SAME head slice.
+        //
+        // The two low-rank bottlenecks f_a_proj / g_a_proj [head_dim, hidden]
+        // project into the rank-128 space that is SHARED across heads (it is
+        // the contraction input of f_b/g_b, not a head axis), so splitting
+        // them would break the rank-local f_b/g_b GEMM — they are REPLICATED
+        // (vLLM likewise replicates the f_a/g_a shards of its fused in_proj,
+        // vllm/models/glm5next/nvidia/kda.py).  o_norm [head_dim] is a
+        // per-head-dim RMSNorm gain shared by all heads — replicated.
+        // o_proj [hidden, heads*head_dim] reuses TensorComponent::o_proj and
+        // is already row-parallel above (its K axis IS the head axis).
+        case TensorComponent::kda_q_proj:
+        case TensorComponent::kda_k_proj:
+        case TensorComponent::kda_v_proj:
+        case TensorComponent::kda_b_proj:
+        case TensorComponent::kda_f_b_proj:
+        case TensorComponent::kda_g_b_proj:
+        case TensorComponent::kda_q_conv1d:
+        case TensorComponent::kda_k_conv1d:
+        case TensorComponent::kda_v_conv1d:
+        case TensorComponent::kda_a_log:
+        case TensorComponent::kda_dt_bias:
+            return ShardMode::kColumnParallel;
+        case TensorComponent::kda_f_a_proj:
+        case TensorComponent::kda_g_a_proj:
+        case TensorComponent::kda_o_norm:
+            return ShardMode::kReplicated;
+
         default:
             return ShardMode::kReplicated;
     }
@@ -123,16 +164,30 @@ ShardedTensor TpWeightSharder::wrap_replicated(const RawTensor& tensor) {
 // ── shard_column_parallel ───────────────────────────────────────────────────
 // Split axis 0 (output dim).  In row-major layout, this gives contiguous
 // sub-tensors → zero-copy subspan.
+//
+// RANK-GENERIC (GF3.3): the split is defined for ANY tensor rank, not just
+// rank-2 matrices.  A "row" is one index along axis 0 and occupies
+// product(shape[1:]) * dtype_size bytes contiguously, so:
+//   rank 1  ([heads] A_log, [heads*head_dim] dt_bias)      → row_bytes = elem
+//   rank 2  ([out, in] projections)                        → row_bytes = in*elem
+//   rank 3  ([channels, 1, K] KDA depthwise convs)         → row_bytes = K*elem
+// All three are exact zero-copy subspans.  Scalars (shape []) have no axis to
+// split and are replicated.
 
 ShardedTensor TpWeightSharder::shard_column_parallel(const RawTensor& tensor,
                                                       int rank) const {
-    if (tensor.shape.size() < 2) {
-        // 1D tensor: replicate (shouldn't happen for projections, but safe)
+    if (tensor.shape.empty()) {
+        // Scalar: no axis to split — replicate.
+        return wrap_replicated(tensor);
+    }
+    if (tensor.gguf_type.has_value() && tensor.shape.size() < 2) {
+        // A packed k-quant stream needs the [out, in] pair to compute its
+        // packed row stride; a 1-D k-quant tensor is not a projection.
         return wrap_replicated(tensor);
     }
 
     int64_t rows = tensor.shape[0];
-    int64_t cols = tensor.shape[1];
+    int64_t cols = tensor.shape.size() >= 2 ? tensor.shape[1] : 1;
 
     if (rows % tp_degree_ != 0) {
         throw std::invalid_argument(std::format(
@@ -171,10 +226,15 @@ ShardedTensor TpWeightSharder::shard_column_parallel(const RawTensor& tensor,
         };
     }
 
-    size_t elem_size = dtype_size(tensor.dtype);
+    const size_t elem_size = dtype_size(tensor.dtype);
 
-    size_t byte_offset = static_cast<size_t>(rank * rows_per_rank * cols) * elem_size;
-    size_t byte_count = static_cast<size_t>(rows_per_rank * cols) * elem_size;
+    // Bytes occupied by ONE index along axis 0 = product(shape[1:]) * elem.
+    int64_t row_elems = 1;
+    for (size_t i = 1; i < tensor.shape.size(); ++i) row_elems *= tensor.shape[i];
+    const size_t row_bytes = static_cast<size_t>(row_elems) * elem_size;
+
+    size_t byte_offset = static_cast<size_t>(rank * rows_per_rank) * row_bytes;
+    size_t byte_count = static_cast<size_t>(rows_per_rank) * row_bytes;
 
     std::vector<int64_t> sharded_shape = tensor.shape;
     sharded_shape[0] = rows_per_rank;
@@ -183,6 +243,7 @@ ShardedTensor TpWeightSharder::shard_column_parallel(const RawTensor& tensor,
         .data = tensor.data.subspan(byte_offset, byte_count),
         .dtype = tensor.dtype,
         .shape = std::move(sharded_shape),
+        .gguf_type = tensor.gguf_type,
         .owned_buf = nullptr,
     };
 }

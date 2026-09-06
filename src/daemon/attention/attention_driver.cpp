@@ -8,6 +8,7 @@
 #include "daemon/attention/arch_base.h"          // attention refactor V2 P1
 #include "daemon/attention/arch_mla.h"           // MLA phase hooks
 #include "daemon/attention/arch_deepseek_v4.h"   // V4 phase hooks
+#include "daemon/attention/arch_glm5_next.h"     // glm5_next phase hooks (GF3.2)
 #include "daemon/v4_kv_tiering.h"
 #include "daemon/dispatch_detail.h"
 #include "daemon/kv_shard_math.h"  // KVS-2: sharded-KV token→rank math
@@ -231,6 +232,11 @@ void CommandDispatcher::handle_fused_compute_command(const ipc::Command& cmd) {
     pc.cmd_type   = cmd.cmd_type;
     pc.layer_idx  = layer_idx;
     pc.cuda_event = event;
+    // TD-INDEXER-NO-DENSE-FALLBACK witness byte (attention commands only).
+    if (type == ipc::D_B_CMD_RUN_ATTENTION) {
+        pc.indexer_dense = step_indexer_dense_;
+        step_indexer_dense_ = 0;
+    }
 
     // TD-40e: is_draft checkpoint carries correct data_bytes
     // TODO:DEBT TD-51d: is_draft D2H copy not enacted — data_bytes set but no async memcpy enqueued
@@ -297,6 +303,10 @@ void CommandDispatcher::handle_fused_compute_command(const ipc::Command& cmd) {
 
 bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParams& p) {
     last_internal_error_msg_ = nullptr;  // TD-GOLDEN-KV-EXHAUST: reset per dispatch
+    // TD-INDEXER-NO-DENSE-FALLBACK witness: scope the dense-step flag to
+    // THIS dispatch; the owning command's completion writer reads-and-clears
+    // it into Completion.compute.indexer_dense.
+    step_indexer_dense_ = 0;
 
     // LS_ATTN_CHUNK_PROF: stamp the host-side dispatch phases for chunk-shaped
     // attention (is_prefill / chunked-prefill). Zero work when the flag is off.
@@ -381,18 +391,12 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
 
     // V4-7b (ticket H, resolves TD-V4-ATTN-ROUTING): deepseek_v4 routes to
     // DcpExecutor::execute_attention_v4 (via ArchDeepseekV4).
-    const bool is_v4 = deps_.live_config &&
-        deps_.live_config->model.architecture ==
-            config::Architecture::deepseek_v4;
     // Attention refactor V2 P1 (arch_base.h): the model-special driver
     // phases run through the AttentionArch hooks. Selection is the SAME
     // is_v4 condition as the legacy inline branches; the arch objects are
-    // stateless facades over this dispatcher (friends), constructed once.
-    if (!arch_mla_) {
-        arch_mla_ = std::make_unique<ArchMla>(*this);
-        arch_v4_  = std::make_unique<ArchDeepseekV4>(*this);
-    }
-    AttentionArch& arch = is_v4 ? *arch_v4_ : *arch_mla_;
+    // stateless facades over this dispatcher (friends), constructed once
+    // (active_attention_arch — shared with the arch-capability queries).
+    AttentionArch& arch = active_attention_arch();
 
     // Phase A: arch shape legality gate + batch cap. V4: fail-closed shapes
     // + the verify-chunk descriptor bound (TD-V4-CHUNK-PREFILL); MLA:
@@ -410,6 +414,12 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
 
     // TD-40b/c: use per-layer weights from Deps (resolves nullptr weights + RMSNorm)
     const int layer = static_cast<int>(p.layer_idx);
+    // P-29 step 11: per-layer mHC stream count — glm5_next MTP layers (>= NH)
+    // are non-mHC and run single-stream; production layers unchanged.
+    const int hc_layer = deps_.live_config
+        ? hc_streams_for_layer(deps_.hc_streams,
+                               deps_.live_config->model, layer)
+        : deps_.hc_streams;
     std::vector<const parallelism::AttentionLayerWeights*> weight_ptrs(dcp_size);
     if (layer < static_cast<int>(deps_.per_layer_attn_weights.size()) &&
         static_cast<int>(deps_.per_layer_attn_weights[layer].size()) == dcp_size) {
@@ -525,8 +535,8 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
     // rows + IndexShare reuse keys.
     const size_t sc_row_bytes = static_cast<size_t>(p.row_offset)
         * (deps_.live_config ? deps_.live_config->model.hidden_size : 0)
-        * deps_.hc_streams * 2;
-    if (deps_.hc_streams > 1) {
+        * hc_layer * 2;
+    if (hc_layer > 1) {
         // V4-5b mHC: collapse the hc-stream residual to the attention module
         // input. hc_pre reads attn_buf rows [row_offset, row_offset+B) and
         // writes hc_attn_x rows [0, B) (+ the post/comb coefficients the
@@ -553,11 +563,40 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
                 pair.gpu_position, compute::StreamId::kAttention);
             const void* residual_src =
                 static_cast<const uint8_t*>(pair.attn_buf) + sc_row_bytes;
-            compute::launch_mhc_pre(
-                deps_.hc_attn_x[r], deps_.hc_attn_post[r], deps_.hc_attn_comb[r],
-                residual_src, lw->hc_attn_fn, lw->hc_attn_scale, lw->hc_attn_base,
-                mcfg.rms_norm_eps, mcfg.hc_eps, 2.0f, mcfg.hc_sinkhorn_iters,
-                batch_size, deps_.hc_streams, mcfg.hidden_size, stream_r);
+            // P-29 step 7 (INV-0.6(b) span graph): attention-stage mHC
+            // collapse pair — fixed-shape, single-stream, B==1 decode only.
+            auto emit_mhc_pre = [&] {
+                compute::launch_mhc_pre(
+                    deps_.hc_attn_x[r], deps_.hc_attn_post[r],
+                    deps_.hc_attn_comb[r], residual_src, lw->hc_attn_fn,
+                    lw->hc_attn_scale, lw->hc_attn_base, mcfg.rms_norm_eps,
+                    mcfg.hc_eps, 2.0f, mcfg.hc_sinkhorn_iters, batch_size,
+                    hc_layer, mcfg.hidden_size, stream_r);
+            };
+            auto* dcpx = deps_.dcp_executor;
+            if (dcpx && dcpx->span_graphs().enabled() && batch_size == 1
+                && p.is_prefill == 0) {
+                compute::DecodeSpanGraphs::Fp fp;
+                fp.add(deps_.hc_attn_x[r]);
+                fp.add(deps_.hc_attn_post[r]);
+                fp.add(deps_.hc_attn_comb[r]);
+                fp.add(residual_src);
+                fp.add(lw->hc_attn_fn);
+                fp.add(lw->hc_attn_scale);
+                fp.add(lw->hc_attn_base);
+                fp.add_s(batch_size);
+                fp.add_s(hc_layer);
+                dcpx->span_graphs().run(
+                    stream_r,
+                    compute::DecodeSpanGraphs::make_key(
+                        compute::DecodeSpanGraphs::kMhcPreAttn, layer,
+                        // P-29 step 13: row axis — spec-verify rows key their
+                        // own variants instead of spending row-0's cap.
+                        r + 16 * (static_cast<int>(p.row_offset) & 7)),
+                    fp, emit_mhc_pre);
+            } else {
+                emit_mhc_pre();
+            }
         }
         params.hidden_states = deps_.hc_attn_x.data();
     } else if (p.row_offset > 0 && sc_row_bytes > 0) {
@@ -658,7 +697,7 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
         // V4-5b mHC: rows are hc_streams*hidden wide and the residual update
         // is hc_post (R' = post·y + combᵀ·R) instead of memcpy+add.
         const size_t row_bytes = static_cast<size_t>(p.row_offset)
-                               * hidden_size * deps_.hc_streams * 2;
+                               * hidden_size * hc_layer * 2;
         for (int r = 0; r < dcp_size; ++r) {
             const auto& pair = deps_.hidden_state_pairs[r];
             if (!pair.moe_buf || !attn_out[r] || !pair.attn_buf
@@ -671,11 +710,11 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
             const void* attn_src =
                 static_cast<const uint8_t*>(pair.attn_buf) + row_bytes;
 
-            if (deps_.hc_streams > 1) {
+            if (hc_layer > 1) {
                 compute::launch_mhc_post(
                     moe_dst, attn_out[r], attn_src,
                     deps_.hc_attn_post[r], deps_.hc_attn_comb[r],
-                    batch_size, deps_.hc_streams, hidden_size, stream_r);
+                    batch_size, hc_layer, hidden_size, stream_r);
                 continue;
             }
 
@@ -757,29 +796,22 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
                     // FETCH_AND_RUN consumes the full K×chunk topk via
                     // use_precomputed_gating, TD-FAR-GATING). normalized_
                     // hidden/router_logits stay launch-local rows [0, B).
-                    const void* gate_in = static_cast<const uint8_t*>(
+                    const void* gate_in0 = static_cast<const uint8_t*>(
                         pair.moe_buf) + static_cast<size_t>(p.row_offset)
-                        * hidden_size * deps_.hc_streams * 2;
+                        * hidden_size * hc_layer * 2;
                     // V4-5b mHC: the gate input is the FFN-stage collapsed x
                     // — recompute hc_pre(ffn) launch-locally into scratch.hc_x
                     // rows [0, B) (the MoE command recomputes the full batch
                     // bit-identically before consuming hc_post/hc_comb).
-                    if (deps_.hc_streams > 1) {
-                        const auto& lwg =
-                            deps_.per_layer_attn_weights[layer][pair.rank];
-                        if (!lwg.hc_ffn_fn || !scratch.hc_x) {
+                    const parallelism::AttentionLayerWeights* lwg = nullptr;
+                    if (hc_layer > 1) {
+                        lwg = &deps_.per_layer_attn_weights[layer][pair.rank];
+                        if (!lwg->hc_ffn_fn || !scratch.hc_x) {
                             spdlog::error("fused gate: mHC active but hc_ffn "
                                           "weights/scratch missing (layer {})",
                                           layer);
                             continue;
                         }
-                        compute::launch_mhc_pre(
-                            scratch.hc_x, scratch.hc_post, scratch.hc_comb,
-                            gate_in, lwg.hc_ffn_fn, lwg.hc_ffn_scale,
-                            lwg.hc_ffn_base, mc.rms_norm_eps, mc.hc_eps, 2.0f,
-                            mc.hc_sinkhorn_iters, batch_size,
-                            deps_.hc_streams, hidden_size, stream_g);
-                        gate_in = scratch.hc_x;
                     }
                     float* topk_w_dst =
                         static_cast<float*>(scratch.topk_weights)
@@ -788,23 +820,41 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
                         static_cast<int32_t*>(scratch.topk_indices)
                         + static_cast<size_t>(p.row_offset) * topk;
 
-                    // Post-attn RMSNorm of the residual-added hidden.
-                    compute::launch_rmsnorm(
-                        scratch.normalized_hidden, gate_in, norm_w,
-                        mc.rms_norm_eps, batch_size, hidden_size,
-                        compute::NormDtype::kBFloat16, stream_g);
-
-                    // Router projection: normalized hidden → router_logits.
-                    compute::launch_router_projection(
-                        static_cast<float*>(scratch.router_logits),
-                        scratch.normalized_hidden, router_w,
-                        batch_size, n_experts, hidden_size, stream_g);
+                    // P-29 step 7 (INV-0.6(b) span graph): the common gate
+                    // head — mHC FFN-stage collapse, post-attn norm, router
+                    // projection — shared verbatim by the learned-topk span
+                    // and the eager hash arm.
+                    auto emit_gate_common = [&] {
+                        const void* gate_in = gate_in0;
+                        if (hc_layer > 1) {
+                            compute::launch_mhc_pre(
+                                scratch.hc_x, scratch.hc_post,
+                                scratch.hc_comb, gate_in0, lwg->hc_ffn_fn,
+                                lwg->hc_ffn_scale, lwg->hc_ffn_base,
+                                mc.rms_norm_eps, mc.hc_eps, 2.0f,
+                                mc.hc_sinkhorn_iters, batch_size,
+                                hc_layer, hidden_size, stream_g);
+                            gate_in = scratch.hc_x;
+                        }
+                        // Post-attn RMSNorm of the residual-added hidden.
+                        compute::launch_rmsnorm(
+                            scratch.normalized_hidden, gate_in, norm_w,
+                            mc.rms_norm_eps, batch_size, hidden_size,
+                            compute::NormDtype::kBFloat16, stream_g);
+                        // Router projection: normalized hidden →
+                        // router_logits.
+                        compute::launch_router_projection(
+                            static_cast<float*>(scratch.router_logits),
+                            scratch.normalized_hidden, router_w,
+                            batch_size, n_experts, hidden_size, stream_g);
+                    };
 
                     // V4-4 hash layers (layer < num_hash_layers): expert ids
                     // come from tid2eid[token_id], weights from the router
                     // logits restricted to those experts; exp_probs_b never
                     // applies. Otherwise: learned TopK gating.
                     if (layer < deps_.moe_hash_layers) {
+                        emit_gate_common();
                         const int32_t* table = nullptr;
                         if (layer < static_cast<int>(
                                 deps_.hash_gating_table_ptrs.size())
@@ -837,30 +887,70 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
                             static_cast<const float*>(scratch.router_logits),
                             table, tok_ids, hp, stream_g);
                     } else {
-                    // TopK gating: router_logits → topk_weights, topk_indices.
-                    compute::TopkGatingParams gp{};
-                    gp.num_tokens            = batch_size;
-                    gp.num_experts           = n_experts;
-                    gp.topk                  = topk;
-                    gp.n_group               = mc.n_group;
-                    gp.topk_group            = mc.topk_group;
-                    gp.routed_scaling_factor =
-                        static_cast<float>(mc.routed_scaling_factor);
-                    gp.renormalize           = mc.norm_topk_prob;
-                    // V4-4a: sigmoid (V3.2/GLM) vs sqrtsoftplus (V4).
-                    gp.scoring_func          =
-                        to_scoring_func(mc.gating_score_fn);
-
                     const float* bias = nullptr;
                     if (layer < static_cast<int>(deps_.gating_bias_ptrs.size())
                         && gpu < deps_.gating_bias_ptrs[layer].size())
                         bias = deps_.gating_bias_ptrs[layer][gpu];
 
-                    compute::launch_topk_gating(
-                        topk_w_dst,
-                        topk_i_dst,
-                        static_cast<const float*>(scratch.router_logits),
-                        bias, gp, stream_g);
+                    // Learned gate span: common head + TopK gating —
+                    // fixed-shape at B == 1, captured per (layer, rank).
+                    auto emit_gate = [&] {
+                        emit_gate_common();
+                        // TopK gating: router_logits → topk_weights/indices.
+                        compute::TopkGatingParams gp{};
+                        gp.num_tokens            = batch_size;
+                        gp.num_experts           = n_experts;
+                        gp.topk                  = topk;
+                        gp.n_group               = mc.n_group;
+                        gp.topk_group            = mc.topk_group;
+                        gp.routed_scaling_factor =
+                            static_cast<float>(mc.routed_scaling_factor);
+                        gp.renormalize           = mc.norm_topk_prob;
+                        // V4-4a: sigmoid (V3.2/GLM) vs sqrtsoftplus (V4).
+                        gp.scoring_func          =
+                            to_scoring_func(mc.gating_score_fn);
+                        compute::launch_topk_gating(
+                            topk_w_dst,
+                            topk_i_dst,
+                            static_cast<const float*>(scratch.router_logits),
+                            bias, gp, stream_g);
+                    };
+
+                    auto* dcpx = deps_.dcp_executor;
+                    if (dcpx && dcpx->span_graphs().enabled()
+                        && batch_size == 1) {
+                        compute::DecodeSpanGraphs::Fp fp;
+                        fp.add(gate_in0);
+                        fp.add(scratch.hc_x);
+                        fp.add(scratch.hc_post);
+                        fp.add(scratch.hc_comb);
+                        fp.add(scratch.normalized_hidden);
+                        fp.add(scratch.router_logits);
+                        fp.add(topk_w_dst);
+                        fp.add(topk_i_dst);
+                        fp.add(norm_w);
+                        fp.add(router_w);
+                        fp.add(bias);
+                        if (lwg) {
+                            fp.add(lwg->hc_ffn_fn);
+                            fp.add(lwg->hc_ffn_scale);
+                            fp.add(lwg->hc_ffn_base);
+                        }
+                        fp.add_s(batch_size);
+                        fp.add_s(hc_layer);
+                        fp.add_s(n_experts);
+                        fp.add_s(topk);
+                        dcpx->span_graphs().run(
+                            stream_g,
+                            compute::DecodeSpanGraphs::make_key(
+                                compute::DecodeSpanGraphs::kGate, layer,
+                                static_cast<int>(r)
+                                    + 16 * (static_cast<int>(p.row_offset)
+                                            & 7)),  // P-29 step 13 row axis
+                            fp, emit_gate);
+                    } else {
+                        emit_gate();
+                    }
                     }  // V4-4 hash/learned gating branch
 
                     // TD-DRIFT-ROOTCAUSE: gated logit-level routing dump (off by
@@ -897,10 +987,17 @@ bool CommandDispatcher::dispatch_attention_internal(const InternalAttentionParam
                             pair0.gpu_position, compute::StreamId::kAttention);
                         // TD-PREFILL-SUPERCHUNK: export THIS sub-chunk's rows
                         // (stored at row_offset) to sideband rows [0, B).
+                        // P-29 step 13 (spec-verify, spec_flags bit0): land them at
+                        // sideband rows [row_offset, row_offset+B) instead —
+                        // the per-row verify loop accumulates R rows for one
+                        // cross-row union (cumulative header).
+                        const int dst_row = (p.spec_flags & 1)
+                            ? static_cast<int>(p.row_offset) : 0;
                         publish_routing_export(gpu0, batch_size, topk,
                                                static_cast<uint32_t>(layer),
                                                stream0,
-                                               static_cast<int>(p.row_offset));
+                                               static_cast<int>(p.row_offset),
+                                               dst_row);
                     }
                 }
             }
@@ -1049,6 +1146,37 @@ CommandDispatcher::indexer_coverage(uint64_t seq_id) const {
     return {static_cast<int>(st->indexer_cov.mode), st->indexer_cov.next_pos};
 }
 
+AttentionArch& CommandDispatcher::active_attention_arch() {
+    // Lazy construction (first attention dispatch OR first capability
+    // query — e.g. a truncating CMD_SEQ_FORK arriving before any step);
+    // selection per call by the live config's architecture, matching the
+    // legacy inline is_v4 branches.  Single daemon thread — no races.
+    if (!arch_mla_) {
+        arch_mla_ = std::make_unique<ArchMla>(*this);
+        arch_v4_  = std::make_unique<ArchDeepseekV4>(*this);
+        arch_glm5_next_ = std::make_unique<ArchGlm5Next>(*this);
+    }
+    // GF3.2: glm5_next selects its own arch (capability answers are live —
+    // seq_fork_truncatable = 0; execution hooks refuse loudly until
+    // GF3.4-GF3.9). Every other non-V4 architecture stays on ArchMla.
+    if (deps_.live_config &&
+        deps_.live_config->model.architecture ==
+            config::Architecture::glm5_next) {
+        return *arch_glm5_next_;
+    }
+    const bool is_v4 = deps_.live_config &&
+        deps_.live_config->model.architecture ==
+            config::Architecture::deepseek_v4;
+    return is_v4 ? *arch_v4_ : *arch_mla_;
+}
+
+bool CommandDispatcher::seq_fork_truncatable() {
+    // R4b capability gate (INV-SEQ-FORK-TRUNC clause (d)): truncating
+    // forks exist exactly where the arch has NO lossy position-indexed
+    // state — the property, not the model name, is the discriminator.
+    return !active_attention_arch().lossy_position_indexed_state();
+}
+
 bool CommandDispatcher::dispatch_fused_attention(const ipc::Command& cmd) {
     InternalAttentionParams p{};
     p.layer_idx   = cmd.run_attention.layer_idx;
@@ -1063,6 +1191,7 @@ bool CommandDispatcher::dispatch_fused_attention(const ipc::Command& cmd) {
     p.store_gating = cmd.run_attention.store_gating != 0;  // F-3
     p.row_offset  = cmd.run_attention.row_offset;         // TD-PREFILL-SUPERCHUNK
     p.superchunk  = cmd.run_attention.superchunk != 0;    // TD-PREFILL-SUPERCHUNK
+    p.spec_flags  = cmd.run_attention.spec_flags;         // P-29 step 13 phase B
     return dispatch_attention_internal(p);
 }
 

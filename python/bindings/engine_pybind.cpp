@@ -37,20 +37,44 @@ PYBIND11_MODULE(layerstorm_engine, m) {
         .def_readonly("num_expert_devices", &ipc::EngineInfo::num_expert_devices)
         .def_readonly("kv_bytes_per_page", &ipc::EngineInfo::kv_bytes_per_page)
         .def_readonly("vocab_size",      &ipc::EngineInfo::vocab_size)
+        // P-30 step 1: realized single-shot MoE chunk bound (EP-beyond-TP
+        // superchunk stride clamp — TD-MOE-EP-XTP-WAVES).
+        .def_readonly("moe_chunk_capacity", &ipc::EngineInfo::moe_chunk_capacity)
         .def_readonly("sideband_offset", &ipc::EngineInfo::sideband_offset)
         .def_readonly("sideband_bytes",  &ipc::EngineInfo::sideband_bytes)
         // V4-7a: DeepSeek-V4 metadata (zeros / empty for non-V4 models).
+        .def_readonly("seq_fork_truncatable",
+                      &ipc::EngineInfo::seq_fork_truncatable)
         .def_readonly("v4_hc_mult",      &ipc::EngineInfo::v4_hc_mult)
         .def_readonly("v4_num_hash_layers",
                       &ipc::EngineInfo::v4_num_hash_layers)
-        .def_property_readonly("v4_attention_types",
+        // TD-GLM5-KDA-SLOTS-EXPORT: state-pool geometry (zeros for models
+        // without linear-attention per-request state).
+        .def_readonly("kda_state_mapped",
+                      &ipc::EngineInfo::kda_state_mapped)
+        .def_readonly("kda_state_slots",
+                      &ipc::EngineInfo::kda_state_slots)
+        .def_readonly("kda_state_slot_bytes",
+                      &ipc::EngineInfo::kda_state_slot_bytes)
+        .def_readonly("kda_state_pages_per_seq",
+                      &ipc::EngineInfo::kda_state_pages_per_seq)
+        .def_readonly("kda_state_pool_pages",
+                      &ipc::EngineInfo::kda_state_pool_pages)
+        .def_property_readonly("attention_types",
             [](const ipc::EngineInfo& i) {
+                // Populated for per-layer-heterogeneous archs only: V4
+                // (v4_hc_mult > 0; codes 0/1/2) and glm5_next (nonzero
+                // entries; codes 3/4). Empty for homogeneous archs —
+                // GF3.2 / TD-ATTN-TYPES-V4-NAMING.
                 py::list out;
                 const int n = std::min<int>(
-                    i.num_layers, ipc::EngineInfo::kV4MaxLayers);
-                if (i.v4_hc_mult > 0)
+                    i.num_layers, ipc::EngineInfo::kMaxAttentionTypeLayers);
+                bool populated = i.v4_hc_mult > 0;
+                for (int l = 0; !populated && l < n; ++l)
+                    populated = i.attention_types[l] != 0;
+                if (populated)
                     for (int l = 0; l < n; ++l)
-                        out.append(static_cast<int>(i.v4_attention_types[l]));
+                        out.append(static_cast<int>(i.attention_types[l]));
                 return out;
             });
 
@@ -247,9 +271,16 @@ PYBIND11_MODULE(layerstorm_engine, m) {
             {"num_expert_devices", offsetof(ipc::EngineInfo, num_expert_devices), sizeof(ipc::EngineInfo::num_expert_devices)},
             {"kv_bytes_per_page",  offsetof(ipc::EngineInfo, kv_bytes_per_page),  sizeof(ipc::EngineInfo::kv_bytes_per_page)},
             {"vocab_size",         offsetof(ipc::EngineInfo, vocab_size),         sizeof(ipc::EngineInfo::vocab_size)},
+            {"moe_chunk_capacity", offsetof(ipc::EngineInfo, moe_chunk_capacity), sizeof(ipc::EngineInfo::moe_chunk_capacity)},
             {"v4_hc_mult",         offsetof(ipc::EngineInfo, v4_hc_mult),         sizeof(ipc::EngineInfo::v4_hc_mult)},
             {"v4_num_hash_layers", offsetof(ipc::EngineInfo, v4_num_hash_layers), sizeof(ipc::EngineInfo::v4_num_hash_layers)},
-            {"v4_attention_types", offsetof(ipc::EngineInfo, v4_attention_types), sizeof(ipc::EngineInfo::v4_attention_types)},
+            {"attention_types", offsetof(ipc::EngineInfo, attention_types), sizeof(ipc::EngineInfo::attention_types)},
+            {"seq_fork_truncatable", offsetof(ipc::EngineInfo, seq_fork_truncatable), sizeof(ipc::EngineInfo::seq_fork_truncatable)},
+            {"kda_state_mapped",     offsetof(ipc::EngineInfo, kda_state_mapped),     sizeof(ipc::EngineInfo::kda_state_mapped)},
+            {"kda_state_slots",      offsetof(ipc::EngineInfo, kda_state_slots),      sizeof(ipc::EngineInfo::kda_state_slots)},
+            {"kda_state_slot_bytes", offsetof(ipc::EngineInfo, kda_state_slot_bytes), sizeof(ipc::EngineInfo::kda_state_slot_bytes)},
+            {"kda_state_pages_per_seq", offsetof(ipc::EngineInfo, kda_state_pages_per_seq), sizeof(ipc::EngineInfo::kda_state_pages_per_seq)},
+            {"kda_state_pool_pages", offsetof(ipc::EngineInfo, kda_state_pool_pages), sizeof(ipc::EngineInfo::kda_state_pool_pages)},
         }, sizeof(ipc::EngineInfo));
 
         return result;
@@ -530,6 +561,12 @@ PYBIND11_MODULE(layerstorm_engine, m) {
             {"dst_seq_id", offsetof(ipc::Command, seq_fork.dst_seq_id) - CMD_PAY, sizeof(ipc::Command::seq_fork.dst_seq_id)},
         }, sizeof(ipc::Command::seq_fork));
 
+        result["SeqHibernatePayload"] = make({
+            {"seq_id", offsetof(ipc::Command, seq_hibernate.seq_id) - CMD_PAY, sizeof(ipc::Command::seq_hibernate.seq_id)},
+            {"kv_len", offsetof(ipc::Command, seq_hibernate.kv_len) - CMD_PAY, sizeof(ipc::Command::seq_hibernate.kv_len)},
+            {"spill",  offsetof(ipc::Command, seq_hibernate.spill) - CMD_PAY, sizeof(ipc::Command::seq_hibernate.spill)},
+        }, sizeof(ipc::Command::seq_hibernate));
+
         result["MtpStepPayload"] = make({
             {"mtp_layer_idx",  offsetof(ipc::Command, run_mtp_step.mtp_layer_idx) - CMD_PAY, sizeof(ipc::Command::run_mtp_step.mtp_layer_idx)},
             {"seq_id",         offsetof(ipc::Command, run_mtp_step.seq_id) - CMD_PAY, sizeof(ipc::Command::run_mtp_step.seq_id)},
@@ -587,6 +624,8 @@ PYBIND11_MODULE(layerstorm_engine, m) {
             {"data_bytes",      offsetof(ipc::Completion, compute.data_bytes) - CMP_PAY, sizeof(ipc::Completion::compute.data_bytes)},
             {"top1_prob",       offsetof(ipc::Completion, compute.top1_prob) - CMP_PAY, sizeof(ipc::Completion::compute.top1_prob)},
             {"entropy",         offsetof(ipc::Completion, compute.entropy) - CMP_PAY, sizeof(ipc::Completion::compute.entropy)},
+            {"routed_miss_count", offsetof(ipc::Completion, compute.routed_miss_count) - CMP_PAY, sizeof(ipc::Completion::compute.routed_miss_count)},
+            {"moe_degraded",    offsetof(ipc::Completion, compute.moe_degraded) - CMP_PAY, sizeof(ipc::Completion::compute.moe_degraded)},
         }, sizeof(ipc::Completion::compute));
 
         result["SeqOpCompletionPayload"] = make({

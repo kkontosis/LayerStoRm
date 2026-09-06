@@ -310,6 +310,25 @@ class TestConstruction:
         assert 1 in loop.resident_keys
         assert len(loop.resident_keys[0]) == 0
 
+    def test_first_moe_layer_from_metadata_not_census_subtraction(self):
+        # P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS: an MTP-armed glm5_next
+        # engine reports 43 MoE layers on a 45-layer model (the NextN block
+        # is an expert-census tenant).  The dormant `num_layers -
+        # num_moe_layers` derivation would yield 2 and make dense layer 2
+        # look like an MoE layer on every gating/prefetch seam.
+        md = EngineMetadata(
+            num_gpus=2, num_moe_layers=43, num_experts=8, num_layers=45,
+            expert_bytes=2_359_296, kv_bytes_per_page=4096,
+            first_moe_layer=3, gpus=_gpu_configs(),
+        )
+        assert md.num_layers - md.num_moe_layers == 2   # the old derivation
+        loop, _ = _build_loop(metadata=md)
+        assert loop._first_moe_layer == 3
+
+    def test_first_moe_layer_legacy_metadata_unchanged(self):
+        loop, _ = _build_loop()          # 6 layers, 4 MoE, field unset
+        assert loop._first_moe_layer == 2
+
 
 # ---------------------------------------------------------------------------
 # Phase 1: COLLECT

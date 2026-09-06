@@ -117,7 +117,7 @@ def test_v4_serve_stack_openai_api():
         assert orch.metadata.num_layers == 43
         assert orch.metadata.num_moe_layers == 43    # all-MoE
         # V4-8 metadata: 21 CSA / 20 HCA / 2 SWA-only Flash census.
-        att = orch.metadata.v4_attention_types[:43]
+        att = orch.metadata.attention_types[:43]
         assert (att.count(1), att.count(2), att.count(0)) == (21, 20, 2)
 
         # Minted tokenizer reproduces the llama.cpp golden ids.

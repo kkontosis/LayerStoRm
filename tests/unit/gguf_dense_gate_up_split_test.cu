@@ -428,3 +428,146 @@ TEST(GgufDenseGateUpSplitGpu, FusedQ4K_Dequant) {
     run_fused_case(kQ4_K, lc::GgufGemmStrategy::dequant,
                    /*M=*/8, /*I=*/256, /*H=*/512, 0.9999, 0x5C06);
 }
+
+// ── MPOKE (P-29 step 3): bind-cache parity + skip semantics ────────────────────
+// The per-(layer,slot) bind cache must (a) produce BIT-IDENTICAL output to the
+// legacy single_b_ptr rebind path, (b) skip the 8-byte H2D entirely when the
+// mirrored pointer is unchanged (proven by poisoning the device slot and
+// observing the poison survive a warm re-bind), and (c) re-upload on change.
+TEST(GgufDenseGateUpSplitGpu, BindCacheBitIdenticalAndSkipsReupload) {
+    REQUIRES_GPU();
+    const TypeTags gate = kQ8_0, up = kQ4_K;
+    if (!ik::gguf_supported(gate.ik_t) || !ik::gguf_supported(up.ik_t))
+        GTEST_SKIP() << "ik type unsupported in this build";
+    const int M = 8, I = 256, H = 512;
+    std::mt19937 rng(0x5C07);
+
+    PackedWeight gp = pack_weight(gate.ik_t, I, H, rng);
+    PackedWeight upk = pack_weight(up.ik_t, I, H, rng);
+    const int64_t up_off = lm::gguf::gguf_packed_bytes(I, H, gate.mod_t);
+    ASSERT_EQ(up_off, static_cast<int64_t>(gp.bytes.size()));
+    Activations act = make_acts(M, H, rng);
+
+    auto edev = lc::make_cuda_sm120_expert_device(make_gpu());
+    auto bdev = lc::make_cuda_sm120_device_backend(make_gpu());
+    edev->set_device();
+
+    __nv_bfloat16* dA = upload(act.bf);
+    std::byte* dW = nullptr;
+    cudaMalloc(&dW, gp.bytes.size() + upk.bytes.size());
+    cudaMemcpy(dW, gp.bytes.data(), gp.bytes.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dW + gp.bytes.size(), upk.bytes.data(), upk.bytes.size(),
+               cudaMemcpyHostToDevice);
+
+    std::vector<__nv_bfloat16> zero_gu(static_cast<size_t>(M) * 2 * I, f2bf(0.0f));
+    std::vector<__nv_bfloat16> zero_half(static_cast<size_t>(M) * I, f2bf(0.0f));
+    __nv_bfloat16* dGU = upload(zero_gu);
+    __nv_bfloat16* dGate = upload(zero_half);
+    __nv_bfloat16* dUp = upload(zero_half);
+
+    std::vector<int32_t> offsets = {0, M};
+    int32_t* dOff = upload(offsets);
+    void** dBptr = nullptr;
+    cudaMalloc(&dBptr, sizeof(void*));
+
+    void* ws = nullptr;
+    size_t ws_bytes =
+        lc::gguf_grouped_gemm_workspace_bytes(M, H, /*num_experts=*/1);
+    cudaMalloc(&ws, ws_bytes);
+
+    ld::GgufDenseGateUpArgs a{};
+    a.num_tokens = M;
+    a.intermediate_local = I;
+    a.hidden = H;
+    a.a_base = dA;
+    a.gate_up_output = dGU;
+    a.gate_scratch = dGate;
+    a.up_scratch = dUp;
+    a.gate_type = gate.eng_t;
+    a.up_type = up.eng_t;      // SPLIT: exercises cache slots 0 AND 1
+    a.up_block_offset = up_off;
+    a.strategy = lc::GgufGemmStrategy::int_strategy;
+    a.gate_up_weight = dW;
+    a.single_b_ptr = dBptr;
+    a.expert_offsets = dOff;
+    a.dev = edev.get();
+    a.gpu_dev = bdev.get();
+    a.gemm_workspace = ws;
+    a.gemm_workspace_bytes = ws_bytes;
+    a.stream = nullptr;
+
+    auto read_gu = [&](std::vector<__nv_bfloat16>& out) {
+        out.resize(zero_gu.size());
+        cudaMemcpy(out.data(), dGU, out.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyDeviceToHost);
+    };
+    auto zero_outputs = [&] {
+        cudaMemcpy(dGU, zero_gu.data(), zero_gu.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(dGate, zero_half.data(),
+                   zero_half.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(dUp, zero_half.data(),
+                   zero_half.size() * sizeof(__nv_bfloat16),
+                   cudaMemcpyHostToDevice);
+    };
+
+    // 1) Legacy reference (no bind cache).
+    ASSERT_EQ(ld::launch_gguf_dense_gate_up(a), 2);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::vector<__nv_bfloat16> ref;
+    read_gu(ref);
+
+    // 2) Cold bind cache: 1 layer x 3 slots, mirror all-null.
+    void** dArena = nullptr;
+    cudaMalloc(&dArena, 3 * sizeof(void*));
+    std::vector<const void*> mirror(3, nullptr);
+    a.bind_cache = ld::GgufBindCache{dArena, mirror.data(), /*layer_idx=*/0};
+
+    zero_outputs();
+    ASSERT_EQ(ld::launch_gguf_dense_gate_up(a), 2);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    std::vector<__nv_bfloat16> got;
+    read_gu(got);
+    ASSERT_EQ(0, std::memcmp(ref.data(), got.data(),
+                             ref.size() * sizeof(__nv_bfloat16)))
+        << "cold bind-cache output differs from legacy path";
+    EXPECT_EQ(mirror[0], dW);                       // gate slot bound
+    EXPECT_EQ(mirror[1], static_cast<const void*>(dW + up_off));  // up slot
+    EXPECT_EQ(mirror[2], nullptr);                  // down slot untouched
+
+    // 3) Warm mirror: poison the LEGACY slot; the cached pass must not read it,
+    //    must not re-upload (mirror unchanged), and must stay bit-identical.
+    void* poison = reinterpret_cast<void*>(0xDEADBEEFDEADBEEFull);
+    cudaMemcpy(dBptr, &poison, sizeof(void*), cudaMemcpyHostToDevice);
+    zero_outputs();
+    ASSERT_EQ(ld::launch_gguf_dense_gate_up(a), 2);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    read_gu(got);
+    ASSERT_EQ(0, std::memcmp(ref.data(), got.data(),
+                             ref.size() * sizeof(__nv_bfloat16)))
+        << "warm bind-cache output differs (single_b_ptr was poisoned — the "
+           "cached path must not touch it)";
+    EXPECT_EQ(mirror[0], dW);
+    EXPECT_EQ(mirror[1], static_cast<const void*>(dW + up_off));
+
+    // 4) Skip semantics, observed directly: poison a device arena slot; a
+    //    same-value bind must SKIP the upload (poison survives), a changed
+    //    value must re-upload.
+    cudaMemcpy(dArena + 2, &poison, sizeof(void*), cudaMemcpyHostToDevice);
+    mirror[2] = dW;  // pretend dW already uploaded
+    const void** slot = ld::bind_gguf_b_slot(
+        a.gpu_dev, a.bind_cache, /*slot=*/2, dW, nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    void* readback = nullptr;
+    cudaMemcpy(&readback, slot, sizeof(void*), cudaMemcpyDeviceToHost);
+    EXPECT_EQ(readback, poison) << "same-value bind must skip the H2D";
+    ld::bind_gguf_b_slot(a.gpu_dev, a.bind_cache, /*slot=*/2,
+                         dW + up_off, nullptr);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    cudaMemcpy(&readback, slot, sizeof(void*), cudaMemcpyDeviceToHost);
+    EXPECT_EQ(readback, dW + up_off) << "changed value must re-upload";
+
+    cudaFree(dA); cudaFree(dW); cudaFree(dGU); cudaFree(dGate); cudaFree(dUp);
+    cudaFree(dOff); cudaFree(dBptr); cudaFree(dArena); cudaFree(ws);
+}

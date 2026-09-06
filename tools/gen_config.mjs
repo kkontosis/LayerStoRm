@@ -107,6 +107,7 @@ const DEFS_TO_CPP = {
   'gpu_object': 'GpuConfig',
   'rope_scaling_object': 'RopeScalingConfig',
   'cpu_expert_object': 'CpuExpertConfig',
+  'linear_attn_object': 'LinearAttnConfig',
 };
 
 // ── Collected types ────────────────────────────────────────────────────────
@@ -464,6 +465,8 @@ function handleObjectField(jsonName, prop, parentStructName, isRequired, hasNull
     structName = parentStructName.replace(/Config$/, '') + 'AdvancedConfig';
   } else if (jsonName === 'vram_allocation_gb') {
     structName = 'VramAllocationConfig';
+  } else if (jsonName === 'linear_attn_config') {
+    structName = 'LinearAttnConfig';  // $defs/linear_attn_object (DEFS_TO_CPP)
   } else if (jsonName.startsWith('_internal-')) {
     structName = snakeToPascal(jsonName.replace(/^_internal-/, '')) + 'InternalConfig';
   } else {
@@ -496,6 +499,7 @@ function handleObjectField(jsonName, prop, parentStructName, isRequired, hasNull
 const SEMANTIC_OPTIONAL = new Set([
   'ModelConfig.rope_scaling',
   'ModelConfig.vision',
+  'ModelConfig.linear_attn_config',
   'GpuConfig.vram_allocation_gb',
 ]);
 

@@ -14,8 +14,13 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "compute/graphs/decode_span_graph.h"  // P-29 step 13 spec-verify bypass
+#include "model/model_config.h"                // P-29 step 13 linear-layer census
+#include "parallelism/dcp_executor.h"          // P-29 step 13 span_graphs()
 
 #include "core/gpu_loader/reef_orch.h"
 #include "core/memory/expert_cache.h"
@@ -24,6 +29,7 @@
 #include "compute/stream_manager.h"
 #include "config/config_parser.h"
 #include "daemon/command_dispatcher.h"
+#include "daemon/far_union.h"
 
 #include <spdlog/spdlog.h>
 
@@ -49,7 +55,44 @@ static_assert(offsetof(gl::ReefVictim, gpu_idx) ==
               offsetof(ipc::ExpertEvictionEntry, gpu_idx));
 
 gl::ReefOrch* CommandDispatcher::ensure_reef_service(std::string& errmsg) {
-    if (reef_service_) return reef_service_.get();
+    if (reef_service_) {
+        // TD-KVXP-CAPACITY-REPUBLISH: the per-GPU caps are total_slots
+        // snapshots, and 44z elastic grants/reclaims change that total at
+        // RUNTIME. Every REEF command funnels through here, so a one-u64
+        // generation compare per command keeps the placement model's
+        // capacity live: refresh the caps (and re-arm the XTP route caps
+        // from them) whenever the cache's elastic topology generation
+        // moved. Ordering: begin_drain bumps the generation AND removes the
+        // draining zone from total_slots at ratchet step (1), while slabs
+        // return to KV only at step (5) — and the daemon is single-threaded
+        // (the rebalancer ticks between commands) — so the model shrinks
+        // strictly before capacity is gone and can never change mid-solve.
+        // With the rebalancer OFF the generation never changes and this
+        // branch is byte-identical to the boot-frozen behavior.
+        if (deps_.expert_cache) {
+            const uint64_t gen = deps_.expert_cache->elastic_generation();
+            if (gen != reef_caps_generation_) {
+                const int tp = static_cast<int>(reef_service_->cap.size());
+                std::vector<int> caps(static_cast<size_t>(tp));
+                for (int g = 0; g < tp; ++g)
+                    caps[static_cast<size_t>(g)] =
+                        deps_.expert_cache->total_slots(
+                            g, memory::CacheZone::kStable);
+                gl::reef_orch_refresh_caps(*reef_service_, caps,
+                                           ep_xtp_gpus_);
+                reef_caps_generation_ = gen;
+                std::string capdesc;
+                for (int g = 0; g < tp; ++g)
+                    capdesc += (capdesc.empty() ? "" : " ")
+                               + std::to_string(g) + ":"
+                               + std::to_string(caps[static_cast<size_t>(g)]);
+                spdlog::info("[reef-service] capacity republished (elastic "
+                             "generation {}): stable slots {} "
+                             "(TD-KVXP-CAPACITY-REPUBLISH)", gen, capdesc);
+            }
+        }
+        return reef_service_.get();
+    }
     if (reef_service_failed_) {
         errmsg = reef_service_error_;
         return nullptr;
@@ -81,6 +124,10 @@ gl::ReefOrch* CommandDispatcher::ensure_reef_service(std::string& errmsg) {
     const int tp =
         static_cast<int>(deps_.live_config->hardware.gpus.size());
     std::vector<int> caps(static_cast<size_t>(tp));
+    // Latch the elastic topology generation the caps are derived from —
+    // the refresh branch above re-reads them when it moves
+    // (TD-KVXP-CAPACITY-REPUBLISH).
+    reef_caps_generation_ = deps_.expert_cache->elastic_generation();
     for (int g = 0; g < tp; ++g)
         caps[static_cast<size_t>(g)] = deps_.expert_cache->total_slots(
             g, memory::CacheZone::kStable);
@@ -91,6 +138,43 @@ gl::ReefOrch* CommandDispatcher::ensure_reef_service(std::string& errmsg) {
                                            std::move(caps), &psrc);
     } catch (const std::exception& e) {
         return fail(std::string("reef service: ") + e.what());
+    }
+    // TD-MOE-PLACEMENT-CAPACITY-CAP: per-layer route caps on the EP-XTP
+    // (expert-only, non-DCP) positions. XTP ranks are excluded from wave
+    // passes (TD-MOE-EP-XTP-WAVES): their arrived experts hold stable slots
+    // until finalize, so one layer's share must fit the stable zone
+    // SIMULTANEOUSLY — an over-capacity share cannot stream through a cold
+    // cache and finalizes DEGRADED (incomplete expert set). Cap each XTP
+    // position at its MEASURED stable-zone slot count (the same
+    // total_slots(kStable) already in caps — never a tuned constant); DCP
+    // ranks stay uncapped (INV-FAR-WAVE rolling waves stream their
+    // over-capacity shares). ep_xtp_gpus_ is populated in the constructor,
+    // strictly before this lazy init. LS_REEF_ROUTE_CAP=0 disables
+    // (diagnostic off-switch; the degraded finalize + serving retry then
+    // remain the only net).
+    if (!ep_xtp_gpus_.empty()) {
+        const char* rc = std::getenv("LS_REEF_ROUTE_CAP");
+        if (rc && *rc == '0') {
+            spdlog::warn("[reef-service] XTP route caps DISABLED "
+                         "(LS_REEF_ROUTE_CAP=0 diagnostic) — over-capacity "
+                         "XTP shares finalize degraded "
+                         "(TD-MOE-PLACEMENT-CAPACITY-CAP)");
+        } else {
+            reef_service_->route_cap.assign(static_cast<size_t>(tp), -1);
+            std::string capdesc;
+            for (int g : ep_xtp_gpus_) {
+                if (g < 0 || g >= tp) continue;
+                reef_service_->route_cap[static_cast<size_t>(g)] =
+                    reef_service_->cap[static_cast<size_t>(g)];
+                capdesc += (capdesc.empty() ? "" : " ") + std::to_string(g)
+                           + ":" + std::to_string(
+                                 reef_service_->cap[static_cast<size_t>(g)]);
+            }
+            spdlog::info("[reef-service] XTP route caps armed (pos:slots {}) "
+                         "— per-layer shares on wave-excluded ranks capped "
+                         "at measured stable-zone capacity "
+                         "(TD-MOE-PLACEMENT-CAPACITY-CAP)", capdesc);
+        }
     }
     // Bank seam (INV-REEF-BANK, TD-BRIDGE-CPP-GAP Q1 flip, 2026-08-23):
     // the ONE shared epoch-latched PAIRED bank input builder
@@ -267,6 +351,144 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
 
     // ── 1. Attention (+ fused gate & routing export on MoE layers) — the
     // exact D_B_CMD_RUN_ATTENTION internals via a synthesized command.
+    //
+    // P-29 step 13 phase B (p.spec_verify): the speculative-verify shape runs a
+    // PER-ROW loop of B=1 DECODE-shaped dispatches instead of one batched
+    // attention: row j reads descriptor j (staged into slot 0 per row),
+    // addresses hidden rows at row_offset=j, exports its routed top-K at
+    // sideband dst row j (cumulative header), and — on KDA layers — the
+    // recurrent state advances through the exact per-token decode kernels
+    // (INV-KDA-CARRY: a non-64 chunked-scan cut is only tolerance-equal,
+    // so the chunk path is NEVER used here). kda_snap_mask bit j takes a
+    // per-layer anchor copy right after row j's state update (pool-
+    // boundary crossings; INV-KDA-REWIND anchor-and-replay). Span graphs
+    // are bypassed for the whole loop so verify row shapes never spend
+    // the kVariantCap variant budget.
+    if (p.spec_verify) {
+        const uint32_t R = p.num_seqs;
+        if (R > 8) {
+            write_error(cmd.cmd_seq, cmd.gpu_idx,
+                        ipc::CmpErrorCategory::kFetchAndRunMoe,
+                        "far_forward_layer: spec_verify rows > 8");
+            return;
+        }
+        auto* be = reinterpret_cast<ipc::BatchDescriptorEntry*>(
+            deps_.sideband_base + ipc::IpcLayout::kBatchDescriptorOff);
+        ipc::BatchDescriptorEntry saved[8];
+        for (uint32_t j = 0; j < R; ++j) saved[j] = be[j];
+        for (uint32_t j = 1; j < R; ++j) {
+            if (saved[j].seq_id != saved[0].seq_id
+                || saved[j].token_pos != saved[0].token_pos + j) {
+                write_error(cmd.cmd_seq, cmd.gpu_idx,
+                            ipc::CmpErrorCategory::kFetchAndRunMoe,
+                            "far_forward_layer: spec_verify rows must be "
+                            "one sequence at consecutive positions");
+                return;
+            }
+        }
+        // Linear-layer bookkeeping for KDA anchors.
+        const auto& mcfg = deps_.live_config->model;
+        model::ModelConfig mc(mcfg);
+        const bool is_linear = mc.is_linear_attention_layer(
+            static_cast<int>(p.layer_idx));
+        int linear_ord = 0, linear_total = 0;
+        if (is_linear || p.kda_snap_mask) {
+            for (int l = 0; l < mcfg.num_hidden_layers; ++l) {
+                if (!mc.is_linear_attention_layer(l)) continue;
+                if (l < static_cast<int>(p.layer_idx)) ++linear_ord;
+                ++linear_total;
+            }
+        }
+        SequenceState* st = find_seq(saved[0].seq_id);
+        const int kp = std::max(1, mcfg.index_kpool);
+
+        // P-29 step 13: span graphs STAY ON for verify rows — the span keys carry
+        // a row axis (make_key rank + 16*row), so each (chain, layer, rank,
+        // row) captures its own variants and row-0 (plain decode) keys are
+        // never polluted. Replays are safe by the INV-0.6(b) device-read
+        // argument, row buffers are per-row-offset stable, and the eager
+        // alternative measured ~20 ms/row of host launch time.
+
+        bool ok = true;
+        const char* why = nullptr;
+        for (uint32_t j = 0; j < R && ok; ++j) {
+            be[0] = saved[j];
+            ipc::Command ac{};
+            ac.cmd_type = ipc::D_B_CMD_RUN_ATTENTION;
+            ac.cmd_seq  = cmd.cmd_seq;
+            ac.gpu_idx  = cmd.gpu_idx;
+            ac.run_attention.layer_idx    = p.layer_idx;
+            ac.run_attention.num_seqs     = 1;
+            ac.run_attention.is_prefill   = 0;
+            ac.run_attention.chunk_start  = 0;
+            ac.run_attention.chunk_len    = 0;
+            ac.run_attention.emit_gating  = is_moe ? 1 : 0;
+            ac.run_attention.store_gating = is_moe ? 1 : 0;
+            ac.run_attention.row_offset   = j;
+            ac.run_attention.spec_flags   = 1;  // export at dst row j
+            if (!dispatch_fused_attention(ac)) { ok = false; break; }
+            // KDA anchor snapshot after this row's state update (this
+            // layer's span only — other layers copy in their own sweep
+            // commands; the anchor commits when the LAST linear layer's
+            // copy lands, and invalidates at the first).
+            if (is_linear && st && ((p.kda_snap_mask >> j) & 1)) {
+                const uint32_t anchor_pos = saved[j].token_pos + 1;
+                // Slot 0 = pool-boundary anchors, slot 1 = per-round
+                // anchors (see handle_kda_snapshot).
+                const int slot = (anchor_pos % kp == 0) ? 0 : 1;
+                // Anchor slots are claimed at ADMISSION (seq_create/fork).
+                // A missing slot (probe producer / claim-failed fork)
+                // gets a best-effort LAZY claim here — a silent skip
+                // would poison the orchestrator's anchor mirror and turn
+                // a later restore into a request-fatal refusal.
+                if (st->kda_anchors.slots[slot].empty()
+                    && linear_ord == 0) {
+                    std::string aerr;
+                    if (!claim_kda_state(saved[0].seq_id,
+                                         static_cast<int>(cmd.gpu_idx),
+                                         st->kda_anchors.slots[slot],
+                                         aerr)) {
+                        st->kda_anchors.slots[slot].clear();
+                        spdlog::warn(
+                            "spec_verify: KDA anchor slot {} claim failed "
+                            "for seq {} ({}) — snapshot skipped",
+                            slot, saved[0].seq_id, aerr);
+                    }
+                }
+                if (st->kda_anchors.slots[slot].empty()) {
+                    // Claim failed: leave pos kNone (the restore will
+                    // refuse loudly rather than restore garbage).
+                } else {
+                    if (linear_ord == 0)
+                        st->kda_anchors.pos[slot] =
+                            SequenceState::KdaAnchors::kNone;
+                    if (!kda_anchor_copy_layer(*st, slot, linear_ord,
+                                               /*to_anchor=*/true)) {
+                        ok = false;
+                        why = "spec_verify: KDA anchor layer copy failed";
+                        break;
+                    }
+                    if (linear_ord == linear_total - 1)
+                        st->kda_anchors.pos[slot] = anchor_pos;
+                }
+            }
+        }
+        be[0] = saved[0];  // restore the descriptor region
+        if (!ok) {
+            write_error(cmd.cmd_seq, cmd.gpu_idx,
+                        why ? ipc::CmpErrorCategory::kFetchAndRunMoe
+                            : (last_internal_error_msg_
+                                   ? last_internal_error_cat_
+                                   : ipc::CmpErrorCategory::
+                                         kComputeValidation),
+                        why ? why
+                            : (last_internal_error_msg_
+                                   ? last_internal_error_msg_
+                                   : "far_forward_layer: spec_verify "
+                                     "attention dispatch failed"));
+            return;
+        }
+    } else {
     ipc::Command ac{};
     ac.cmd_type = ipc::D_B_CMD_RUN_ATTENTION;
     ac.cmd_seq  = cmd.cmd_seq;
@@ -288,8 +510,28 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
                         : "far_forward_layer: attention dispatch failed");
         return;
     }
+    }
     perf_trace::record(perf_trace::kFarAttnDispatched, 0,
                        static_cast<uint32_t>(cmd.cmd_seq), p.layer_idx, 0);
+
+    // ── 1.5 P-29 step 16 (LS_FAR_PROLOGUE_PREISSUE): pre-issue the routing-
+    // independent MoE prologue NOW — the whole attention chain (incl. fused
+    // gating top-K + routing export) is already enqueued and attn_moe_event
+    // is recorded after all of it, so the per-rank collapse+norm and the
+    // EP-XTP broadcast queue safely behind their producers and EXECUTE
+    // during the readback spin + union/REEF/decider host window below,
+    // instead of serializing after it (the P-29 step-15 measured ~70 us
+    // readback->first-MoE-kernel box-empty gap, ~29x/token). Decode-shaped
+    // MoE commands only; any failure leaves the flags clear and the
+    // finalize path re-emits byte-identically. Non-qualifying commands
+    // clear any stale pre-issue so a later dispatch of the same layer at a
+    // different shape can never consume a 1-row primed buffer.
+    if (is_moe && !p.spec_verify && p.num_seqs == 1 && !p.is_prefill
+        && deps_.cuda_kernels_enabled && far_prologue_preissue_enabled()) {
+        preissue_far_moe_prologue(p.layer_idx, p.num_seqs, cmd.gpu_idx);
+    } else {
+        clear_far_prologue();
+    }
 
     // ── 2. Daemon-side wait for the attention stream — covers the
     // routing-export D2H (issued on the same stream), replacing the
@@ -349,10 +591,21 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
             pc.cmd_type   = cmd.cmd_type;
             pc.layer_idx  = p.layer_idx;
             pc.cuda_event = event;
+            // TD-INDEXER-NO-DENSE-FALLBACK witness byte (attention ran
+            // above under this command).
+            pc.indexer_dense = step_indexer_dense_;
+            step_indexer_dense_ = 0;
             pending_compute_.push_back(pc);
         } else {
+            const uint8_t idense = step_indexer_dense_;
+            step_indexer_dense_ = 0;
             write_compute_completion(cmd.cmd_type, cmd.cmd_seq, cmd.gpu_idx,
-                                     p.layer_idx, /*status=*/0);
+                                     p.layer_idx, /*status=*/0,
+                                     /*host_buf_offset=*/0, /*data_bytes=*/0,
+                                     /*top1_prob=*/0.0f, /*entropy=*/0.0f,
+                                     /*routed_miss_count=*/0,
+                                     /*moe_degraded=*/0,
+                                     /*indexer_dense=*/idense);
         }
         return;
     }
@@ -371,16 +624,18 @@ void CommandDispatcher::handle_far_forward_layer(const ipc::Command& cmd) {
         deps_.sideband_base + ipc::IpcLayout::kRoutingExportIndicesOff);
     const uint32_t rn = hdr->num_tokens * hdr->topk;
     const int num_experts = deps_.live_config->model.n_routed_experts;
-    uint8_t seen[ipc::kMaxExperts] = {0};
     std::vector<uint16_t> topk;
     topk.reserve(64);
-    for (uint32_t k = 0; k < rn; ++k) {
-        const int32_t e = ridx[k];
-        if (e < 0 || e >= num_experts || e >= ipc::kMaxExperts || seen[e])
-            continue;
-        seen[e] = 1;
-        if (topk.size() >= ipc::kMaxExpertPrefetch) break;
-        topk.push_back(static_cast<uint16_t>(e));
+    // TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: the union builder must never
+    // silently thin the routed set (kMaxExperts >= every shipped
+    // n_routed_experts, enforced at boot); a cap violation here is a loud
+    // error, not a skip.
+    if (!build_routed_union(ridx, rn, num_experts, topk)) {
+        write_error(cmd.cmd_seq, cmd.gpu_idx,
+                    ipc::CmpErrorCategory::kFetchAndRunMoe,
+                    "far_forward_layer: n_routed_experts exceeds "
+                    "ipc::kMaxExperts (routed union would truncate)");
+        return;
     }
     if (topk.empty()) {
         write_error(cmd.cmd_seq, cmd.gpu_idx,

@@ -934,7 +934,11 @@ class CommandWriter:
         return cmd
 
     def seq_fork(self, gpu: int, src_seq_id: int,
-                 dst_seq_id: int) -> Command:
+                 dst_seq_id: int, prefix_len: int = 0) -> Command:
+        """CMD_SEQ_FORK.  ``prefix_len`` (R4a): 0 = full fork (legacy,
+        byte-identical); N > 0 = truncating fork — the child takes only
+        the parent's first N tokens.  Engine-rejected on V4 side-tier
+        architectures (mutate-in-place rings)."""
         cmd = Command()
         cmd.cmd_type = CMD_SEQ_FORK
         cmd.cmd_seq = self._next()
@@ -942,6 +946,7 @@ class CommandWriter:
         cmd.stream_id = 0
         cmd.payload.seq_fork.src_seq_id = src_seq_id
         cmd.payload.seq_fork.dst_seq_id = dst_seq_id
+        cmd.payload.seq_fork.prefix_len = prefix_len
         return cmd
 
     # ── NVMe tier + cancel ───────────────────────────────────────────────

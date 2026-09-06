@@ -122,6 +122,29 @@ class TestEngineMetadata:
         )
         assert m.gpus == ()
 
+    def test_first_moe_layer_legacy_fallback(self):
+        # Not supplied => the historical `num_layers - num_moe_layers`
+        # identity, so every caller predating P-29 step 13 keeps its exact
+        # geometry.
+        m = EngineMetadata(
+            num_gpus=1, num_moe_layers=58, num_experts=1,
+            num_layers=61, expert_bytes=100, kv_bytes_per_page=100,
+        )
+        assert m.first_moe_layer == 3
+
+    def test_first_moe_layer_explicit_wins_over_mtp_census(self):
+        # P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS: with the MTP expert
+        # census armed the engine reports 43 MoE layers on a 45-layer
+        # glm5_next model — the subtraction would say 2 (dense layer 2
+        # misread as MoE); the config-supplied first_k_dense_replace wins.
+        m = EngineMetadata(
+            num_gpus=1, num_moe_layers=43, num_experts=1,
+            num_layers=45, expert_bytes=100, kv_bytes_per_page=100,
+            first_moe_layer=3,
+        )
+        assert m.num_layers - m.num_moe_layers == 2
+        assert m.first_moe_layer == 3
+
 
 class TestPrefetchHint:
     def test_construction(self):

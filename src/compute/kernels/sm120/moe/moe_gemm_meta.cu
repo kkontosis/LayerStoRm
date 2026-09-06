@@ -1,5 +1,6 @@
 // Populate grouped GEMM metadata from device-resident expert_offsets.
-// One 256-thread block (num_experts <= 256): each thread owns one expert; the
+// One 1024-thread block (num_experts <= kBlockExperts = 1024; a guarded serial
+// fallback covers more): each thread owns one expert; the
 // sf_offsets exclusive prefix sum of pad128(M_e) is a shared-memory block scan.
 // Bit-identical to the former single-thread sequential scan (was a <<<1,1>>>
 // one-thread kernel ~8 us/launch, 2x/layer/GPU = ~4.5 ms/tok aggregate at

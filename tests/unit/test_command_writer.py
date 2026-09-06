@@ -551,6 +551,16 @@ class TestSequenceCommands:
         assert cmd.cmd_type == CMD_SEQ_FORK
         assert cmd.payload.seq_fork.src_seq_id == 4000
         assert cmd.payload.seq_fork.dst_seq_id == 4001
+        # R4a: prefix_len defaults to 0 = FULL fork (legacy wire shape).
+        assert cmd.payload.seq_fork.prefix_len == 0
+
+    def test_seq_fork_truncated(self):
+        # R4a truncating fork: prefix_len rides the same command.
+        w = CommandWriter()
+        cmd = w.seq_fork(gpu=0, src_seq_id=4000, dst_seq_id=4002,
+                         prefix_len=1536)
+        assert cmd.cmd_type == CMD_SEQ_FORK
+        assert cmd.payload.seq_fork.prefix_len == 1536
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

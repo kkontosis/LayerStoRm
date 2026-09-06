@@ -80,7 +80,8 @@ PinnedUploadPlan build_upload_plan(
     int tp_degree,
     int rank,
     const GgufModelExpertTypes* gguf_shared_types,
-    const GgufModelExpertTypes* gguf_dense_types) {
+    const GgufModelExpertTypes* gguf_dense_types,
+    const GgufNonExpertWidths* gguf_widths) {
 
     (void)rank;
 
@@ -109,6 +110,13 @@ PinnedUploadPlan build_upload_plan(
     // AttentionDims below are meaningless for V4 (its config carries inert MLA
     // schema defaults) and are bypassed per layer.
     const bool v4 = model_cfg.is_v4();
+
+    // glm5_next (GF3.3): the hybrid stack has TWO per-layer anatomies (KDA
+    // linear vs NoPE sparse MLA) and its own dtype mix, so the legacy MLA
+    // `attn_dims` path — which would size every layer as a V3.2-shaped MLA
+    // layer AND add the legacy indexer formula on top — must be bypassed for
+    // BOTH the hidden layers and the MTP block (no double counting).
+    const bool glm5 = model_cfg.is_glm5_next();
 
     AttentionDims attn_dims = compute_attn_dims(m);
 
@@ -239,9 +247,15 @@ PinnedUploadPlan build_upload_plan(
 
         if (is_pinned(pin.attention, l)) {
             // V4: per-layer size from the layer's attention type (V4-3a).
+            // glm5_next: KDA vs sparse-MLA anatomy per layer_types[l]; every
+            // HIDDEN layer (0..44) also carries the mHC stream weights.
             const int64_t attn_bytes = v4
                 ? v4_attention_layer_bytes(
                       m, model_cfg.attention_type_for_layer(l), tp)
+                : glm5
+                ? glm5_next_attention_layer_bytes(
+                      m, wq, model_cfg.is_linear_attention_layer(l),
+                      /*include_hc=*/true, tp, gguf_widths, l)
                 : attn_per_layer;
             emit(PinnedComponent::attention, l, attn_bytes);
             emit(PinnedComponent::layer_norm, l, per_layer_norm_bytes);
@@ -310,7 +324,11 @@ PinnedUploadPlan build_upload_plan(
          static_cast<int64_t>(m.hidden_size) * 2);
 
     // ── 4b. V4 mHC head collapse weights (model-level, F32) ──────────────
-    if (model_cfg.has_mhc()) {
+    // glm5_next runs mHC too (hc_mult 4) but ships NO model-level
+    // output_hc_{fn,base,scale} tensors — the collapse before the LM head uses
+    // the last layer's streams (MODELINFO §3e / GF3.3). Emitting the slot
+    // would reserve dead VRAM and break the plan-vs-upload byte equality.
+    if (model_cfg.has_mhc() && !glm5) {
         emit(PinnedComponent::output_hc, -1, v4_output_hc_bytes(m));
     }
 
@@ -326,8 +344,18 @@ PinnedUploadPlan build_upload_plan(
         // V3.2 NVFP4 checkpoints store MTP attention o_proj as BF16 (not NVFP4),
         // unlike regular layers where o_proj is quantized to NVFP4.
         bool mtp_bf16_oproj = (wq == config::WeightQuant::nvfp4);
-        int64_t mtp_attn = attention_layer_bytes(attn_dims, wq, include_kv_b, tp,
-                                                  mtp_has_indexer, mtp_bf16_oproj);
+        // glm5_next: the MTP block is sparse-MLA + IndexPool indexer by
+        // checkpoint (MODELINFO §5) and carries NO hc_* tensors.
+        // GF3.15: sized per MTP block, since the header pre-scan resolves each
+        // block's own tensors (`mtp_attn_for` is called with mtp_layer below).
+        auto mtp_attn_for = [&](int mtp_layer) {
+            return glm5
+                ? glm5_next_attention_layer_bytes(m, wq, /*linear_attention=*/false,
+                                                  /*include_hc=*/false, tp,
+                                                  gguf_widths, mtp_layer)
+                : attention_layer_bytes(attn_dims, wq, include_kv_b, tp,
+                                        mtp_has_indexer, mtp_bf16_oproj);
+        };
 
         // MTP-specific tensor sizes
         int64_t mtp_embed_bytes = static_cast<int64_t>(m.vocab_size) * m.hidden_size *
@@ -344,7 +372,7 @@ PinnedUploadPlan build_upload_plan(
             int mtp_layer = m.num_hidden_layers + mi;
 
             // 5a. Attention + layer norms
-            emit(PinnedComponent::attention, mtp_layer, mtp_attn);
+            emit(PinnedComponent::attention, mtp_layer, mtp_attn_for(mtp_layer));
             emit(PinnedComponent::layer_norm, mtp_layer, per_layer_norm_bytes);
 
             // 5b. Gating (MTP blocks are MoE layers)
@@ -383,9 +411,19 @@ PinnedUploadPlan build_upload_plan(
                 emit(PinnedComponent::shared_expert_down, mtp_layer, se_down_sharded);
             }
 
-            // 5d. MTP-specific tensors
-            emit(PinnedComponent::mtp_embed_tokens, mtp_layer, mtp_embed_bytes);
-            emit(PinnedComponent::mtp_shared_head_weight, mtp_layer, mtp_shared_head_w_bytes);
+            // 5d. MTP-specific tensors.
+            // glm5_next ships EXACTLY four MTP extras (safetensors index at HF
+            // rev 04c4e9e9 / MODELINFO §5): eh_proj, enorm, hnorm and
+            // shared_head.norm — all BF16. There is NO shared_head.head weight
+            // (the MTP block shares lm_head) and NO per-MTP embed_tokens (it
+            // shares model.embed_tokens), so those two slots must NOT be
+            // emitted or ~1.3 GB/rank of dead VRAM is reserved and the
+            // plan-vs-upload equality breaks.
+            if (!glm5) {
+                emit(PinnedComponent::mtp_embed_tokens, mtp_layer, mtp_embed_bytes);
+                emit(PinnedComponent::mtp_shared_head_weight, mtp_layer,
+                     mtp_shared_head_w_bytes);
+            }
             emit(PinnedComponent::mtp_shared_head_norm, mtp_layer, mtp_shared_head_n_bytes);
             emit(PinnedComponent::mtp_eh_proj, mtp_layer, mtp_eh_proj_bytes);
             emit(PinnedComponent::mtp_enorm, mtp_layer, mtp_norm_bytes);
@@ -503,12 +541,21 @@ void validate_plan(
         for (const auto& sb : sharded) {
             // TD-73c: Norm weight tensors are F32 in checkpoint but uploaded as BF16.
             // Subtract half the weight size for norm components (aux unchanged).
+            // GF3.3: the halving is a DTYPE fact, not a component fact — the
+            // glm5_next checkpoint already ships q_a_layernorm / kv_a_layernorm
+            // / indexer k_norm weight+bias as BF16 (MODELINFO §3b/§3c, all in
+            // the FP8 skip list), and those upload 1:1. Gate on the loaded
+            // dtype so F32 checkpoints (V3.2 / GLM-5.2) keep the conversion and
+            // BF16 ones stay byte-exact.
             const bool is_norm =
                 sb.id.component == TensorComponent::q_a_norm ||
                 sb.id.component == TensorComponent::kv_a_norm ||
                 sb.id.component == TensorComponent::indexer_k_norm_weight ||
                 sb.id.component == TensorComponent::indexer_k_norm_bias;
-            actual += sb.total_bytes() - (is_norm ? sb.weight.size_bytes() / 2 : 0);
+            const bool converts_f32_to_bf16 =
+                is_norm && sb.weight.dtype == SafetensorsDtype::F32;
+            actual += sb.total_bytes()
+                    - (converts_f32_to_bf16 ? sb.weight.size_bytes() / 2 : 0);
         }
 
         // Slot may include up to 15 bytes of alignment padding beyond actual data.
@@ -518,8 +565,14 @@ void validate_plan(
         // smaller. The upload records real per-projection pointers and bumps the
         // cursor to the slot end, so an over-sized slot is structurally safe —
         // only an UNDER-sized slot (actual > slot, data overflows) is a bug.
+        // GF3.9: glm5_next's GGUF arm (glm5_next_attention_layer_bytes) sizes
+        // every packed matrix at BF16 and every F32 tensor at F32, so EVERY
+        // gguf quant — not just the generic per-tensor-mixed `gguf` — is an
+        // upper bound there and the packed upload is legitimately smaller.
         const bool gguf_upper_bound =
-            (cfg.quantization.weights == config::WeightQuant::gguf);
+            (cfg.quantization.weights == config::WeightQuant::gguf) ||
+            (model_cfg.is_glm5_next() &&
+             gguf::is_gguf_weight_quant(cfg.quantization.weights));
         const bool too_big = actual > attn_slot->size_bytes;
         const bool too_small = !gguf_upper_bound
                              && actual < attn_slot->size_bytes - 15;
@@ -534,10 +587,13 @@ void validate_plan(
         auto* norm_slot = plan.find(PinnedComponent::layer_norm, idx);
         if (!norm_slot) return;
 
-        // TD-73c: Layer norms are F32 in checkpoint, uploaded as BF16 (halved).
+        // TD-73c: F32 layer norms are uploaded as BF16 (halved); glm5_next
+        // ships input/post_attention_layernorm already BF16, which uploads 1:1.
         int64_t norm_actual = 0;
         for (const auto& bundle : lw.norms) {
-            norm_actual += static_cast<int64_t>(bundle.weight.data.size()) / 2;
+            const int64_t raw = static_cast<int64_t>(bundle.weight.data.size());
+            norm_actual +=
+                (bundle.weight.dtype == SafetensorsDtype::F32) ? raw / 2 : raw;
         }
         if (norm_actual != norm_slot->size_bytes) {
             throw std::runtime_error(
@@ -555,7 +611,15 @@ void validate_plan(
     // sizing itself is exercised by layer_registry/pinned-layout unit tests.
     if (!model_cfg.is_v4()) {
         for (const auto& layer : loaded.layers) {
-            validate_attention_layer(layer, layer.layer_idx, has_dsa);
+            // glm5_next (GF3.3): only the sparse-MLA layers carry an indexer —
+            // KDA linear layers have NONE (the loader enforces an empty
+            // indexer vector for them), and their plan slot is sized without
+            // one. Mirror that per layer instead of the model-wide has_dsa.
+            const bool include_indexer =
+                model_cfg.is_glm5_next()
+                    ? !model_cfg.is_linear_attention_layer(layer.layer_idx)
+                    : has_dsa;
+            validate_attention_layer(layer, layer.layer_idx, include_indexer);
         }
     }
     if (loaded.mtp) {
@@ -563,8 +627,11 @@ void validate_plan(
             int mtp_idx = m.num_hidden_layers + static_cast<int>(i);
             const auto& blk = loaded.mtp->block_layers[i];
 
-            // MTP attention + norms (include indexer when DSA enabled)
-            validate_attention_layer(blk, mtp_idx, has_dsa);
+            // MTP attention + norms (include indexer when DSA enabled).
+            // glm5_next: the MTP block IS a sparse-MLA layer with the full
+            // IndexPool indexer (MODELINFO §5) — always include it.
+            validate_attention_layer(blk, mtp_idx,
+                                     model_cfg.is_glm5_next() ? true : has_dsa);
 
             // MTP gating
             auto* gw_slot = plan.find(PinnedComponent::gating_weight, mtp_idx);
@@ -657,7 +724,11 @@ void validate_plan(
             if (!slot) continue;
             int64_t actual = static_cast<int64_t>(bundle.weight.data.size());
             if (tp_sharded) actual /= tp;
-            if (is_norm) actual /= 2;  // F32→BF16
+            // TD-74b: F32 norms convert to BF16 on upload. glm5_next's MTP
+            // enorm/hnorm/shared_head.norm are BF16 already (MODELINFO §5) —
+            // gate on dtype so both cases stay byte-exact.
+            if (is_norm && bundle.weight.dtype == SafetensorsDtype::F32)
+                actual /= 2;
             // GG-9 (mirrors the attention-slot rule in Pass 5): with the
             // generic `gguf` weight quant the quantizable MTP tensors
             // (embed_tokens, shared_head, eh_proj) are plan-sized at a BF16
@@ -683,7 +754,11 @@ void validate_plan(
     // Pass 6: Final norm size (TD-73c: F32→BF16 during upload, so halved)
     if (auto* slot = plan.find(PinnedComponent::final_norm, -1);
         slot && loaded.final_norm) {
-        int64_t actual = static_cast<int64_t>(loaded.final_norm->weight.data.size()) / 2;
+        const int64_t raw =
+            static_cast<int64_t>(loaded.final_norm->weight.data.size());
+        int64_t actual =
+            (loaded.final_norm->weight.dtype == SafetensorsDtype::F32) ? raw / 2
+                                                                       : raw;
         if (actual != slot->size_bytes) {
             throw std::runtime_error(
                 "Plan validation: final_norm size mismatch: loaded " +

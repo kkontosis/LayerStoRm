@@ -108,6 +108,16 @@ lc::Config dense_mha_config() {
     return lc::parse_config(j);
 }
 
+
+// GLM-5.3-Flash NoPE sparse MLA (GF3.4): the V3.2 MLA geometry with the rope
+// block removed — qk_rope_head_dim = 0, kv_lora_rank still 512. Cloned from
+// v32_config() so ONLY the rope dim differs.
+lc::Config nope_mla_config() {
+    auto cfg = v32_config();
+    cfg.model.qk_rope_head_dim = 0;
+    return cfg;
+}
+
 }  // namespace
 
 // ── kv_bytes_per_token ──────────────────────────────────────────────────────
@@ -172,6 +182,26 @@ TEST(VramAllocatorKv, TurboQuantModel1BytesPerToken) {
                                         lc::AttentionBackendType::turboquant_mla), 354);
 }
 
+TEST(VramAllocatorKv, NoPeMlaFp8BytesPerToken) {
+    auto cfg = nope_mla_config();
+    lmod::ModelConfig mcfg(cfg);
+    // NoPE MLA: kv_lora_rank(512) * 1.0 (fp8) + qk_rope_head_dim(0) * 2.0 (bf16)
+    // + 4 (scale) = 516 — the V3.2 644 B row minus its 128 B BF16 rope tail.
+    EXPECT_EQ(lmem::kv_bytes_per_token(mcfg, lc::KvCacheQuant::fp8_e4m3,
+                                        lc::AttentionBackendType::snapmla), 516);
+    EXPECT_EQ(lmem::kv_bytes_per_token(mcfg, lc::KvCacheQuant::fp8_e5m2,
+                                        lc::AttentionBackendType::snapmla), 516);
+}
+
+TEST(VramAllocatorKv, NoPeMlaTurboQuantBytesPerToken) {
+    auto cfg = nope_mla_config();
+    lmod::ModelConfig mcfg(cfg);
+    // NoPE TQ: kv_lora_rank(512) * 0.5 + 2 (FP16 norm) + qk_rope_head_dim(0)
+    // * 2.0 = 258 (vs 386 at the V3.2 rope geometry).
+    EXPECT_EQ(lmem::kv_bytes_per_token(mcfg, lc::KvCacheQuant::fp8_e4m3,
+                                        lc::AttentionBackendType::turboquant_mla), 258);
+}
+
 TEST(VramAllocatorKv, TurboQuantIgnoresKvQuant) {
     // TQ formula is independent of kv_cache quant setting (always 4-bit packed)
     auto cfg = v32_config();
@@ -216,6 +246,154 @@ TEST(VramAllocatorKv, TurboQuantV32BytesPerPage16) {
     EXPECT_EQ(lmem::kv_bytes_per_page(mcfg, cfg), 6176);
 }
 
+TEST(VramAllocatorKv, NoPeBytesPerPage16) {
+    auto cfg = nope_mla_config();
+    lmod::ModelConfig mcfg(cfg);
+    // 516 * 16 = 8256
+    EXPECT_EQ(lmem::kv_bytes_per_page(mcfg, cfg), 8256);
+}
+
+// ── GF3.5: IndexPool pooled indexer-K page geometry ─────────────────────────
+
+// glm5_next geometry on top of the NoPE fixture: index_kpool 4, learned
+// compress, layer_types 34 linear + 11 sparse (3+4k, 43).
+static lc::Config glm5n_config() {
+    auto cfg = nope_mla_config();
+    cfg.model.architecture = lc::Architecture::glm5_next;
+    cfg.model.index_kpool = 4;
+    cfg.model.index_kpool_compress = true;
+    cfg.model.index_kpool_always_select_tail = true;
+    cfg.model.num_hidden_layers = 45;
+    cfg.model.layer_types.clear();
+    for (int l = 0; l < 45; ++l)
+        cfg.model.layer_types.push_back(
+            (l % 4 == 3) || l == 43
+                ? lc::LayerAttentionType::deepseek_sparse_attention
+                : lc::LayerAttentionType::linear_attention);
+    lc::LinearAttnConfig la;
+    la.num_heads = 64;
+    la.head_dim = 128;
+    la.short_conv_kernel_size = 4;
+    la.gate_lower_bound = -5.0;
+    cfg.model.linear_attn_config = la;
+    return cfg;
+}
+
+TEST(VramAllocatorIndexPool, LegacyGeometryUnchanged) {
+    // GLM-5.2/V3.2: entries == token positions, no tail, page = 132 * PT.
+    auto cfg = v32_config();
+    cfg.memory.kv_cache.indexer_k_page_size_tokens = 8192;
+    lmod::ModelConfig mcfg(cfg);
+    EXPECT_EQ(lmem::indexer_k_entries_per_page(mcfg, cfg), 8192);
+    EXPECT_EQ(lmem::indexer_k_tail_bytes(mcfg), 0);
+    // 128 fp8 + 4 B f32 scale = 132/token; * 8192 = 1081344.
+    EXPECT_EQ(lmem::indexer_k_bytes_per_page(mcfg, cfg), 1081344);
+}
+
+TEST(VramAllocatorIndexPool, PooledPageSpansTokensStoresEntries) {
+    // GF3.5: a page still SPANS PT token positions (owner / reservation /
+    // coverage math unchanged) but STORES PT/kpool pooled entries plus the
+    // in-progress-pool tail region ([2, kpool, 128] bf16 = 2048 B).
+    auto cfg = glm5n_config();
+    cfg.memory.kv_cache.indexer_k_page_size_tokens = 8192;
+    lmod::ModelConfig mcfg(cfg);
+    ASSERT_TRUE(mcfg.has_index_pool());
+    EXPECT_EQ(lmem::indexer_k_entries_per_page(mcfg, cfg), 2048);
+    EXPECT_EQ(lmem::indexer_k_tail_bytes(mcfg), 2 * 4 * 128 * 2);
+    // 2048 entries * 132 B + 2048 B tail = 272384.
+    EXPECT_EQ(lmem::indexer_k_bytes_per_page(mcfg, cfg), 272384);
+    // INV-SLAB-1 arithmetic at the glm5_next kMain page (516 * 16 = 8256):
+    // pages_per_slab = ceil(272384 / 8256) = 33, sliver 64 B. The formula is
+    // shared with GLM-5.2/V4 but only glm5_next's page bytes changed.
+    const int64_t kv_page = lmem::kv_bytes_per_page(mcfg, cfg);
+    EXPECT_EQ(kv_page, 8256);
+    EXPECT_EQ((lmem::indexer_k_bytes_per_page(mcfg, cfg) + kv_page - 1)
+                  / kv_page, 33);
+}
+
+TEST(VramAllocatorIndexPool, PooledPageSmallPt) {
+    // Fine-grained PT stays exact: PT 64 -> 16 entries, page 16*132+2048.
+    auto cfg = glm5n_config();
+    cfg.memory.kv_cache.indexer_k_page_size_tokens = 64;
+    lmod::ModelConfig mcfg(cfg);
+    EXPECT_EQ(lmem::indexer_k_entries_per_page(mcfg, cfg), 16);
+    EXPECT_EQ(lmem::indexer_k_bytes_per_page(mcfg, cfg), 16 * 132 + 2048);
+}
+
+// ── GF3.9 (TD-KV-POOL-SIZED-OVER-ALL-LAYERS): KV pool funds only KV-bearing
+// layers ────────────────────────────────────────────────────────────────────
+
+TEST(VramAllocatorKv, Glm5NextKvPoolFundsOnlyKvBearingLayers) {
+    // Demand-bound shapes: tiny max_seq/max_req so the VRAM cap never binds.
+    // The hybrid stack (34 linear + 11 sparse, nextn 1 sparse-MLA) must fund
+    // kMain for 11 + 1 layers; an all-sparse twin (same arch, same indexer
+    // geometry, every hidden layer KV-bearing) funds 45 + 1. Every shared
+    // term (spec pool, indexer share, scratch) cancels in the difference.
+    auto mk = [](bool hybrid) {
+        auto cfg = glm5n_config();
+        if (!hybrid) {
+            for (auto& t : cfg.model.layer_types)
+                t = lc::LayerAttentionType::deepseek_sparse_attention;
+        }
+        cfg.serving.max_sequence_length = 256;
+        cfg.serving.max_concurrent_requests = 2;
+        // glm5_next sizing supports the native-FP8 artifact (GF3.3); the
+        // fixture's inherited nvfp4 would hit the loud unsupported-quant
+        // refusal.
+        cfg.quantization.weights = lc::WeightQuant::fp8_e4m3;
+        // This test isolates KV-LAYER funding. Since the 2026-08-31
+        // promotion the default-mapped KDA state folds its policy share
+        // into kv_main on the HYBRID arm only (the all-sparse twin has no
+        // linear layers), which would swamp the layer-count comparison —
+        // pin the carve off-path so the shared terms cancel again.
+        cfg._internal_kda_state.mapped = false;
+        return cfg;
+    };
+    unsetenv("LS_KDA_STATE_MAPPED");
+    auto cfg_h = mk(true);
+    auto cfg_a = mk(false);
+    lmod::ModelConfig mcfg_h(cfg_h);
+    lmod::ModelConfig mcfg_a(cfg_a);
+    ASSERT_EQ(mcfg_h.num_kv_layers(), 11);
+    ASSERT_EQ(mcfg_a.num_kv_layers(), 45);
+    lmod::Nvfp4 nvfp4_h, nvfp4_a;
+    lmod::LayerRegistry reg_h(mcfg_h, cfg_h, nvfp4_h);
+    lmod::LayerRegistry reg_a(mcfg_a, cfg_a, nvfp4_a);
+    auto layout_h = lmem::compute_vram_layout(cfg_h, reg_h, mcfg_h);
+    auto layout_a = lmem::compute_vram_layout(cfg_a, reg_a, mcfg_a);
+
+    const int page_size = cfg_h.memory.kv_cache.page_size_tokens;
+    const int pages_per_seq = (256 + page_size - 1) / page_size;
+    // Full-occupancy demand of the hybrid stack: 2 seqs x pages_per_seq x
+    // (11 sparse + 1 sparse-MLA MTP) layers.
+    const int demand_h = 2 * pages_per_seq * (11 + 1);
+    bool checked = false;
+    for (size_t i = 0; i < layout_h.gpus.size(); ++i) {
+        if (layout_h.gpus[i].kv_main_pages <= 0) continue;
+        // (a) The hybrid pool still covers its own full-occupancy demand.
+        EXPECT_GE(layout_h.gpus[i].kv_main_pages, demand_h)
+            << "GPU " << layout_h.gpus[i].gpu_id;
+        // (b) The hybrid pool is strictly smaller than the all-KV twin —
+        // before this fix both were funded over all 45 (+1) layers and the
+        // two layouts were page-identical (exact page deltas fold in the
+        // computing-layer indexer share and slab quantization, so the
+        // assertion is structural, not arithmetic).
+        EXPECT_LT(layout_h.gpus[i].kv_main_pages,
+                  layout_a.gpus[i].kv_main_pages)
+            << "GPU " << layout_h.gpus[i].gpu_id;
+        checked = true;
+    }
+    EXPECT_TRUE(checked);
+}
+
+TEST(VramAllocatorKv, TurboQuantNoPeBytesPerPage16) {
+    auto cfg = nope_mla_config();
+    cfg.compute.attention_backend = lc::AttentionBackendType::turboquant_mla;
+    lmod::ModelConfig mcfg(cfg);
+    // 258 * 16 = 4128
+    EXPECT_EQ(lmem::kv_bytes_per_page(mcfg, cfg), 4128);
+}
+
 TEST(VramAllocatorKv, TurboQuantMoreKvPagesThanSnapMla) {
     // Same VRAM budget: TQ gets more KV pages than SnapMLA
     auto cfg_snap = v32_config();
@@ -257,6 +435,7 @@ TEST(VramAllocatorBudget, RegionsSumToTotal) {
     for (const auto& gpu : layout.gpus) {
         int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                       gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                       gpu.expert_stable_bytes +
                       gpu.expert_streaming_bytes + gpu.safety_margin_bytes;
         EXPECT_EQ(sum, gpu.total_vram_bytes)
@@ -320,12 +499,20 @@ TEST(VramAllocatorBudget, KvPageCountsConsistent) {
     for (const auto& gpu : layout.gpus) {
         EXPECT_GE(gpu.max_kv_pages, 0);
         // Page counts derived from byte allocations via floor division,
-        // so sum may be ≤ max_kv_pages (off-by-one from speculation floor).
+        // so sum may be ≤ max_kv_pages (off-by-one from speculation floor,
+        // plus up to pages_per_slab-1 pages dropped by the S1 slab
+        // quantization of the kMain span).
+        // S4: kv_main additionally carries the elastic indexer SHARE
+        // (whole slabs folded into the span).
+        const int share_pages =
+            gpu.indexer_share_slabs * layout.pages_per_slab;
         EXPECT_LE(gpu.kv_main_pages + gpu.kv_speculation_pages,
-                  gpu.max_kv_pages)
+                  gpu.max_kv_pages + share_pages)
             << "GPU " << gpu.gpu_id;
+        const int slab_slack =
+            layout.pages_per_slab > 0 ? layout.pages_per_slab - 1 : 0;
         EXPECT_GE(gpu.kv_main_pages + gpu.kv_speculation_pages,
-                  gpu.max_kv_pages - 1)
+                  gpu.max_kv_pages + share_pages - 1 - slab_slack)
             << "GPU " << gpu.gpu_id;
         // Page count * bytes_per_page <= actual byte allocation
         EXPECT_LE(static_cast<int64_t>(gpu.kv_main_pages) * layout.kv_bytes_per_page,
@@ -375,8 +562,10 @@ TEST(VramAllocatorBudget, SpeculationPoolFraction) {
     for (const auto& gpu : layout.gpus) {
         int64_t kv_total = gpu.kv_total_bytes();
         if (kv_total > 0) {
-            // Spec fraction applies to KV data (excluding scratch), then aligned
-            int64_t kv_data = kv_total - gpu.prefill_scratch_preallocated_bytes;
+            // Spec fraction applies to KV data (excluding scratch and the
+            // S4 elastic indexer share, which rides in kv_main), aligned.
+            int64_t kv_data = kv_total - gpu.prefill_scratch_preallocated_bytes
+                              - gpu.indexer_share_bytes;
             int64_t expected_spec = align256(static_cast<int64_t>(
                 std::floor(static_cast<double>(kv_data) * spec_frac)));
             EXPECT_EQ(gpu.kv_speculation_bytes, expected_spec)
@@ -579,6 +768,7 @@ TEST(VramAllocatorBudget, SingleGpuNoTp) {
     // Regions sum to total
     int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                   gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                   gpu.expert_stable_bytes +
                   gpu.expert_streaming_bytes + gpu.safety_margin_bytes;
     EXPECT_EQ(sum, gpu.total_vram_bytes);
@@ -600,6 +790,7 @@ TEST(VramAllocatorBudget, AllDenseModelNoExpertMinimum) {
     auto& gpu = layout.gpus[0];
     int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                   gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                   gpu.expert_stable_bytes +
                   gpu.expert_streaming_bytes + gpu.safety_margin_bytes;
     EXPECT_EQ(sum, gpu.total_vram_bytes);
@@ -811,21 +1002,26 @@ TEST(VramAllocatorClass, RegionsContiguous) {
         const auto& gpu = alloc.layout().gpus[i];
         auto* base = static_cast<char*>(reg.base);
 
-        // Layout: pinned | kv_speculation | indexer_k | kv_main (+scratch) | expert_streaming | expert_stable
+        // Layout (S1): pinned | kv_speculation | kv_hca | kv_swa |
+        //   [pad] indexer_k | kv_main (+scratch) | expert_streaming |
+        //   expert_stable — the indexer/kv_main boundary is SLAB-EXACT
+        //   (no alignment gap; the pad shim precedes the indexer span).
         EXPECT_EQ(reg.pinned, base);
         EXPECT_EQ(reg.kv_speculation, base + gpu.pinned_bytes);
         EXPECT_EQ(reg.indexer_k,
-                  base + gpu.pinned_bytes + gpu.kv_speculation_bytes);
+                  base + gpu.pinned_bytes + gpu.kv_speculation_bytes +
+                  gpu.kv_hca_bytes + gpu.kv_swa_bytes +
+                  gpu.indexer_k_pad_bytes);
         EXPECT_EQ(reg.kv_main,
-                  base + gpu.pinned_bytes + gpu.kv_speculation_bytes +
-                  gpu.indexer_k_bytes);
+                  static_cast<char*>(reg.indexer_k) + gpu.indexer_k_bytes);
         EXPECT_EQ(reg.expert_streaming,
-                  base + gpu.pinned_bytes + gpu.kv_speculation_bytes +
-                  gpu.indexer_k_bytes + gpu.kv_main_bytes);
+                  static_cast<char*>(reg.kv_main) + gpu.kv_main_bytes);
         EXPECT_EQ(reg.expert_stable,
-                  base + gpu.pinned_bytes + gpu.kv_speculation_bytes +
-                  gpu.indexer_k_bytes + gpu.kv_main_bytes +
+                  static_cast<char*>(reg.expert_streaming) +
                   gpu.expert_streaming_bytes);
+        // kv_main stays 256-aligned even when the slab stride is not a
+        // multiple of 256 (the pad shim absorbs the difference).
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(reg.kv_main) % 256, 0u);
     }
 }
 
@@ -1055,14 +1251,77 @@ TEST(VramAllocatorIndexerK, NonZeroForDsa) {
     lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
 
     auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
-    // TP GPUs (0,1) should have indexer K
-    EXPECT_GT(layout.gpus[0].indexer_k_bytes, 0);
-    EXPECT_GT(layout.gpus[0].indexer_k_pages, 0);
-    EXPECT_GT(layout.gpus[1].indexer_k_bytes, 0);
-    // Non-TP GPUs (2,3) should not have indexer K
+    // S4 (TD-INDEXER-POOL-ELASTIC): slabbed models carry NO fixed carve —
+    // TP GPUs (0,1) fold a nonzero indexer SHARE into kv_main instead.
+    ASSERT_GT(layout.slab_bytes, 0);
+    EXPECT_EQ(layout.gpus[0].indexer_k_bytes, 0);
+    EXPECT_EQ(layout.gpus[0].indexer_k_pages, 0);
+    EXPECT_GT(layout.gpus[0].indexer_share_slabs, 0);
+    EXPECT_EQ(layout.gpus[0].indexer_share_bytes,
+              static_cast<int64_t>(layout.gpus[0].indexer_share_slabs) *
+                  layout.slab_bytes);
+    EXPECT_GT(layout.gpus[1].indexer_share_slabs, 0);
+    // Non-TP GPUs (2,3) carry neither carve nor share
     EXPECT_EQ(layout.gpus[2].indexer_k_bytes, 0);
+    EXPECT_EQ(layout.gpus[2].indexer_share_slabs, 0);
     EXPECT_EQ(layout.gpus[3].indexer_k_bytes, 0);
+    EXPECT_EQ(layout.gpus[3].indexer_share_slabs, 0);
     EXPECT_GT(layout.indexer_k_bytes_per_page, 0);
+}
+
+// ── S1 shared-region slab geometry (TD-INDEXER-POOL-ELASTIC) ────────────────
+
+TEST(VramAllocatorSlab, SlabGeometryRule2) {
+    // RADIX_SLAB_DESIGN §1 rule 2: slab = ceil(indexer_page / kmain_page)
+    // × kmain_page. V3.2 SnapMLA: indexer 132×8192 = 1081344 B, kMain
+    // 644×16 = 10304 B → 105 pages/slab, slab 1081920 B.
+    auto cfg = v32_config();
+    lmod::ModelConfig mcfg(cfg);
+    lmod::Nvfp4 nvfp4;
+    lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
+    auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
+
+    EXPECT_EQ(layout.pages_per_slab, 105);
+    EXPECT_EQ(layout.slab_bytes, 105 * 10304);
+    EXPECT_EQ(layout.slab_bytes % layout.kv_bytes_per_page, 0);
+    EXPECT_GE(layout.slab_bytes, layout.indexer_k_bytes_per_page);
+}
+
+TEST(VramAllocatorSlab, IndexerCarveIsWholeSlabs) {
+    auto cfg = v32_config();
+    lmod::ModelConfig mcfg(cfg);
+    lmod::Nvfp4 nvfp4;
+    lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
+    auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
+
+    for (const auto& gpu : layout.gpus) {
+        // One slab per indexer page, span slab-exact; pad shim keeps the
+        // span END (kv_main base) 256-aligned.
+        EXPECT_EQ(gpu.indexer_k_bytes,
+                  static_cast<int64_t>(gpu.indexer_k_pages) *
+                      layout.slab_bytes)
+            << "GPU " << gpu.gpu_id;
+        EXPECT_EQ((gpu.indexer_k_pad_bytes + gpu.indexer_k_bytes) % 256, 0)
+            << "GPU " << gpu.gpu_id;
+        // kMain span quantized to whole slabs on slabbed models.
+        if (gpu.indexer_k_pages > 0) {
+            EXPECT_EQ(gpu.kv_main_pages % layout.pages_per_slab, 0)
+                << "GPU " << gpu.gpu_id;
+        }
+    }
+}
+
+TEST(VramAllocatorSlab, ZeroWhenNoIndexerPool) {
+    auto cfg = v32_config();
+    cfg.model.index_topk = 0;  // non-DSA
+    lmod::ModelConfig mcfg(cfg);
+    lmod::Nvfp4 nvfp4;
+    lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
+    auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
+    EXPECT_EQ(layout.slab_bytes, 0);
+    EXPECT_EQ(layout.pages_per_slab, 0);
+    for (const auto& gpu : layout.gpus)
+        EXPECT_EQ(gpu.indexer_k_pad_bytes, 0);
 }
 
 TEST(VramAllocatorIndexerK, IndexerKBytesPerToken) {
@@ -1090,9 +1349,9 @@ TEST(VramAllocatorIndexerK, IndexShareAwareSizing) {
     lmod::ModelConfig mcfg_all(base);
     lmod::LayerRegistry reg_all(mcfg_all, base, nvfp4);
     auto layout_all = lmem::compute_vram_layout(base, reg_all, mcfg_all);
-    ASSERT_EQ(layout_all.gpus[0].indexer_k_pages % base.model.num_hidden_layers, 0);
+    ASSERT_EQ(layout_all.gpus[0].indexer_share_slabs % base.model.num_hidden_layers, 0);
     const int pages_per_seq =
-        layout_all.gpus[0].indexer_k_pages / base.model.num_hidden_layers;
+        layout_all.gpus[0].indexer_share_slabs / base.model.num_hidden_layers;
     ASSERT_GT(pages_per_seq, 0);
 
     // IndexShare (GLM-5.2 pattern): freq=4, offset=3 → full layers are
@@ -1112,12 +1371,12 @@ TEST(VramAllocatorIndexerK, IndexShareAwareSizing) {
     for (int l = 0; l < n_idx_layers; ++l)
         if (mcfg_sh.is_full_index_layer(l) || l == 0) ++computing;
     EXPECT_EQ(computing, 17);
-    EXPECT_EQ(layout_sh.gpus[0].indexer_k_pages, pages_per_seq * computing);
-    EXPECT_LT(layout_sh.gpus[0].indexer_k_bytes,
-              layout_all.gpus[0].indexer_k_bytes);
+    EXPECT_EQ(layout_sh.gpus[0].indexer_share_slabs, pages_per_seq * computing);
+    EXPECT_LT(layout_sh.gpus[0].indexer_share_bytes,
+              layout_all.gpus[0].indexer_share_bytes);
 }
 
-// INV-KVT-14b / TD-INDEXER-POOL-EVICT: the kIndexerK pool must cover
+// INV-KVT-14b / TD-INDEXER-POOL-EVICT: the indexer sizing SHARE must cover
 // serving.max_concurrent_requests CONCURRENT sequences, not one. Sizing it
 // for a single sequence made it a hard per-sequence wall — serving always
 // has more than one live sequence (every prefix-cache holder is one, pinning
@@ -1133,7 +1392,7 @@ TEST(VramAllocatorIndexerK, PoolScalesWithMaxConcurrentRequests) {
     lmod::ModelConfig mcfg1(one);
     lmod::LayerRegistry reg1(mcfg1, one, nvfp4);
     auto layout1 = lmem::compute_vram_layout(one, reg1, mcfg1);
-    const int64_t pages1 = layout1.gpus[0].indexer_k_pages;
+    const int64_t pages1 = layout1.gpus[0].indexer_share_slabs;
     ASSERT_GT(pages1, 0);
 
     for (int max_req : {2, 4, 8}) {   // all below this config's VRAM cap
@@ -1142,11 +1401,11 @@ TEST(VramAllocatorIndexerK, PoolScalesWithMaxConcurrentRequests) {
         lmod::ModelConfig mcfg(cfg);
         lmod::LayerRegistry reg(mcfg, cfg, nvfp4);
         auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
-        EXPECT_EQ(layout.gpus[0].indexer_k_pages, pages1 * max_req)
+        EXPECT_EQ(layout.gpus[0].indexer_share_slabs, pages1 * max_req)
             << "max_concurrent_requests=" << max_req;
         // Bytes track pages (region alignment only rounds UP).
-        EXPECT_GE(layout.gpus[0].indexer_k_bytes,
-                  layout1.gpus[0].indexer_k_bytes * max_req)
+        EXPECT_GE(layout.gpus[0].indexer_share_bytes,
+                  layout1.gpus[0].indexer_share_bytes * max_req)
             << "max_concurrent_requests=" << max_req;
     }
 
@@ -1165,7 +1424,7 @@ TEST(VramAllocatorIndexerK, PoolScalesWithMaxConcurrentRequests) {
                     + cfg2.model.num_nextn_predict_layers;
     for (int l = 0; l < n_idx; ++l)
         if (mcfg2.is_full_index_layer(l) || l == 0) ++computing;
-    EXPECT_EQ(layout2.gpus[0].indexer_k_pages,
+    EXPECT_EQ(layout2.gpus[0].indexer_share_slabs,
               static_cast<int64_t>(pages_per_seq) * computing * 2);
 }
 
@@ -1185,7 +1444,7 @@ TEST(VramAllocatorIndexerK, PoolConcurrencyCappedByVramHeadroom) {
     auto layout = lmem::compute_vram_layout(cfg, reg, mcfg);
 
     const auto& gpu = layout.gpus[0];
-    ASSERT_GT(gpu.indexer_k_pages, 0);
+    ASSERT_GT(gpu.indexer_share_slabs, 0);
     // THE regression guard: KV still gets pages. This is what an unbounded
     // multiple destroyed.
     EXPECT_GT(gpu.max_kv_pages, 0)
@@ -1198,9 +1457,9 @@ TEST(VramAllocatorIndexerK, PoolConcurrencyCappedByVramHeadroom) {
     lmod::ModelConfig mcfg1(one);
     lmod::LayerRegistry reg1(mcfg1, one, nvfp4);
     auto layout1 = lmem::compute_vram_layout(one, reg1, mcfg1);
-    ASSERT_GT(layout1.gpus[0].indexer_k_pages, 0);
-    EXPECT_GE(gpu.indexer_k_pages, layout1.gpus[0].indexer_k_pages);
-    EXPECT_EQ(gpu.indexer_k_pages % layout1.gpus[0].indexer_k_pages, 0);
+    ASSERT_GT(layout1.gpus[0].indexer_share_slabs, 0);
+    EXPECT_GE(gpu.indexer_share_slabs, layout1.gpus[0].indexer_share_slabs);
+    EXPECT_EQ(gpu.indexer_share_slabs % layout1.gpus[0].indexer_share_slabs, 0);
     // ... and the one-sequence carve is what KV was measured against, so the
     // capped pool must not have cost KV more than the quarter it may spend.
     EXPECT_GE(gpu.max_kv_pages, layout1.gpus[0].max_kv_pages * 3 / 4);
@@ -1209,8 +1468,8 @@ TEST(VramAllocatorIndexerK, PoolConcurrencyCappedByVramHeadroom) {
     // lockstep, so a richer rank must not be given pages the tightest rank
     // cannot match (they would be unusable).
     for (const auto& g : layout.gpus)
-        if (g.indexer_k_pages > 0)
-            EXPECT_EQ(g.indexer_k_pages, gpu.indexer_k_pages)
+        if (g.indexer_share_slabs > 0)
+            EXPECT_EQ(g.indexer_share_slabs, gpu.indexer_share_slabs)
                 << "GPU " << g.gpu_id;
 }
 
@@ -1259,6 +1518,7 @@ void expect_regions_sum_to_total(const lmem::VramLayout& layout,
     for (const auto& gpu : layout.gpus) {
         int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                       gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                       gpu.expert_stable_bytes +
                       gpu.expert_streaming_bytes + gpu.safety_margin_bytes;
         EXPECT_EQ(sum, gpu.total_vram_bytes)
@@ -1432,31 +1692,34 @@ TEST(VramAllocatorDcp, DcpIndexerModeLocal) {
 
     // TP GPUs should have halved indexer K pages and bytes
     for (int i : {0, 1}) {
-        EXPECT_GT(layout_rep.gpus[i].indexer_k_pages, 0) << "TP GPU " << i;
-        EXPECT_GT(layout_local.gpus[i].indexer_k_pages, 0) << "TP GPU " << i;
+        EXPECT_GT(layout_rep.gpus[i].indexer_share_slabs, 0) << "TP GPU " << i;
+        EXPECT_GT(layout_local.gpus[i].indexer_share_slabs, 0) << "TP GPU " << i;
 
         // pages_per_seq is halved (integer division), so indexer_k_pages should be ~half
         // With TP=2, dcp_shard_factor=2: local pages = replicated pages / 2
-        int expected_pages = layout_rep.gpus[i].indexer_k_pages / 2;
-        EXPECT_EQ(layout_local.gpus[i].indexer_k_pages, expected_pages)
-            << "TP GPU " << i << ": local mode should halve indexer K pages";
+        int expected_pages = layout_rep.gpus[i].indexer_share_slabs / 2;
+        EXPECT_EQ(layout_local.gpus[i].indexer_share_slabs, expected_pages)
+            << "TP GPU " << i << ": local mode should halve the indexer share (slabs)";
 
+        // S4: the share is one SLAB per indexer page.
         int64_t expected_bytes = static_cast<int64_t>(expected_pages) *
-                                 layout_rep.indexer_k_bytes_per_page;
-        EXPECT_EQ(layout_local.gpus[i].indexer_k_bytes, expected_bytes)
-            << "TP GPU " << i << ": local mode should halve indexer K bytes";
+                                 layout_rep.slab_bytes;
+        EXPECT_EQ(layout_local.gpus[i].indexer_share_bytes, expected_bytes)
+            << "TP GPU " << i << ": local mode should halve the indexer share bytes";
     }
 
     // Non-TP GPUs should still have zero indexer K
     for (int i : {2, 3}) {
-        EXPECT_EQ(layout_local.gpus[i].indexer_k_bytes, 0) << "Non-TP GPU " << i;
-        EXPECT_EQ(layout_local.gpus[i].indexer_k_pages, 0) << "Non-TP GPU " << i;
+        EXPECT_EQ(layout_local.gpus[i].indexer_share_bytes, 0) << "Non-TP GPU " << i;
+        EXPECT_EQ(layout_local.gpus[i].indexer_share_slabs, 0) << "Non-TP GPU " << i;
     }
 
-    // Regions should still sum to total VRAM
+    // Regions should still sum to total VRAM (the S4 indexer share lives
+    // INSIDE kv_main — no separate region).
     for (const auto& gpu : layout_local.gpus) {
         int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                       gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                       gpu.expert_stable_bytes +
                       gpu.expert_streaming_bytes + gpu.safety_margin_bytes;
         EXPECT_EQ(sum, gpu.total_vram_bytes)
@@ -1845,22 +2108,36 @@ TEST(VramAllocatorV4, LayoutPageCountsDemandDriven) {
     EXPECT_EQ(layout.kv_bytes_per_page, 74240);  // CSA bucket page
     EXPECT_EQ(layout.kv_cache_format, lmem::KvCacheFormat::kV4Fp8);
     EXPECT_EQ(layout.indexer_k_bytes_per_page, 270336);
+    // S1 slab geometry over the CSA page: ceil(270336/74240) = 4 pages.
+    EXPECT_EQ(layout.pages_per_slab, 4);
+    EXPECT_EQ(layout.slab_bytes, 4 * 74240);
+    // S4 elastic: no fixed LID carve — the LID demand is the shared-pool
+    // SHARE, folded into the CSA span as whole slabs.
+    EXPECT_EQ(gpu.indexer_k_pages, 0);
+    EXPECT_EQ(gpu.indexer_k_bytes, 0);
+    EXPECT_EQ(gpu.indexer_share_bytes,
+              static_cast<int64_t>(gpu.indexer_share_slabs) *
+                  layout.slab_bytes);
+    EXPECT_EQ(gpu.kv_main_pages % layout.pages_per_slab, 0);
 
     // 32 req × ceil(32768/256)=128 blocks × layer counts (demand fits VRAM).
     // Side tiers additionally carry the DEFAULT prefix-holder budget
     // (serving.prefix_cache: enabled, max_entries=8, uncapped entry length
     // → 8 full-length copy-on-fork holder tier sets, INV-PREFIX-CACHE-3);
     // kMain (CSA) is refcount-shared with holders and NOT holder-scaled.
-    EXPECT_EQ(gpu.kv_main_pages, 32 * 128 * 21);        // 86016 CSA pages
+    // CSA pages = demand (S1-quantized; 86016 % 4 == 0) + the LID share
+    // folded in as whole slabs (S4).
+    EXPECT_EQ(gpu.kv_main_pages,
+              32 * 128 * 21 + gpu.indexer_share_slabs * layout.pages_per_slab);
     EXPECT_EQ(gpu.kv_hca_pages, (32 + 8) * 128 * 20);   // 102400 HCA pages
     // SWA/raw: per seq — 2 SWA layers×2 + 21 CSA×3 + 20 HCA×3 + 1 MTP×2.
     EXPECT_EQ(gpu.kv_swa_pages, (32 + 8) * (2 * 2 + 21 * 3 + 20 * 3 + 2));
     // Speculation: CSA-page-size sibling, 15 % of CSA demand.
     EXPECT_EQ(gpu.kv_speculation_pages,
               static_cast<int>(32 * 128 * 21 * 0.15));
-    // Indexer: ceil(32768/8192)=4 pages/seq × 21 CSA layers × (32 req + 8
-    // holders).
-    EXPECT_EQ(gpu.indexer_k_pages, 4 * 21 * (32 + 8));
+    // Indexer share: ceil(32768/8192)=4 pages/seq × 21 CSA layers × (32
+    // req + 8 holders) — one slab each.
+    EXPECT_EQ(gpu.indexer_share_slabs, 4 * 21 * (32 + 8));
     EXPECT_EQ(gpu.max_kv_pages, gpu.kv_main_pages + gpu.kv_speculation_pages);
 }
 
@@ -1884,14 +2161,17 @@ TEST(VramAllocatorV4, SideTierPoolsIncludeHolderBudget) {
     // Per holder at the 8192-token cap: LID ceil(8192/8192)=1 page × 21 CSA
     // layers; HCA ceil(8192/256)=32 blocks × 20 layers; SWA full per-seq set
     // (2×2 + 21×3 + 20×3 + 1 MTP×2 = 129 pages).
-    EXPECT_EQ(on.indexer_k_pages - off.indexer_k_pages, 5 * 1 * 21);
+    EXPECT_EQ(on.indexer_share_slabs - off.indexer_share_slabs, 5 * 1 * 21);
     EXPECT_EQ(on.kv_hca_pages - off.kv_hca_pages, 5 * 32 * 20);
     EXPECT_EQ(on.kv_swa_pages - off.kv_swa_pages,
               5 * (2 * 2 + 21 * 3 + 20 * 3 + 2));
     // kMain (CSA) + speculation are refcount-shared with holders — NOT
     // holder-scaled (their holder pressure stays soft: max_cached_tokens
-    // budget + evict-on-exhaustion, TD-INDEXER-POOL-EVICT).
-    EXPECT_EQ(on.kv_main_pages, off.kv_main_pages);
+    // budget + evict-on-exhaustion, TD-INDEXER-POOL-EVICT). S4: kv_main
+    // differs only by the LID share slabs folded into the span.
+    EXPECT_EQ(on.kv_main_pages,
+              off.kv_main_pages +
+                  (on.indexer_share_slabs - off.indexer_share_slabs) * 4);
     EXPECT_EQ(on.kv_speculation_pages, off.kv_speculation_pages);
 }
 
@@ -1907,7 +2187,7 @@ TEST(VramAllocatorV4, HolderBudgetUncappedUsesMaxSequenceLength) {
     auto on = v4_layout(lc::parse_config(jon)).gpus[0];
 
     // Full-length holder: LID ceil(32768/8192)=4 × 21; HCA 128 × 20.
-    EXPECT_EQ(on.indexer_k_pages - off.indexer_k_pages, 2 * 4 * 21);
+    EXPECT_EQ(on.indexer_share_slabs - off.indexer_share_slabs, 2 * 4 * 21);
     EXPECT_EQ(on.kv_hca_pages - off.kv_hca_pages, 2 * 128 * 20);
 }
 
@@ -1916,6 +2196,7 @@ TEST(VramAllocatorV4, RegionsSumToTotal) {
     const auto& gpu = layout.gpus[0];
     int64_t sum = gpu.pinned_bytes + gpu.kv_main_bytes +
                   gpu.kv_speculation_bytes + gpu.indexer_k_bytes +
+                      gpu.indexer_k_pad_bytes +
                   gpu.kv_hca_bytes + gpu.kv_swa_bytes +
                   gpu.expert_stable_bytes + gpu.expert_streaming_bytes +
                   gpu.safety_margin_bytes;
@@ -1928,8 +2209,12 @@ TEST(VramAllocatorV4, RegionsSumToTotal) {
 TEST(VramAllocatorV4, TqShrinksCsaBytes) {
     auto fp8 = v4_layout(v4_config("csa_hca"));
     auto tq = v4_layout(v4_config("csa_hca_tq"));
-    // Same demand-driven page counts, smaller pages under TQ.
-    EXPECT_EQ(tq.gpus[0].kv_main_pages, fp8.gpus[0].kv_main_pages);
+    // Same demand-driven page counts NET OF the S4 LID share (whole slabs;
+    // pages_per_slab differs across codecs), smaller pages under TQ.
+    EXPECT_EQ(tq.gpus[0].kv_main_pages -
+                  tq.gpus[0].indexer_share_slabs * tq.pages_per_slab,
+              fp8.gpus[0].kv_main_pages -
+                  fp8.gpus[0].indexer_share_slabs * fp8.pages_per_slab);
     EXPECT_LT(tq.kv_bytes_per_page, fp8.kv_bytes_per_page);
     EXPECT_LT(tq.gpus[0].kv_main_bytes, fp8.gpus[0].kv_main_bytes);
     // SWA tier identical (always FP8).
@@ -2026,14 +2311,17 @@ TEST(VramAllocatorV4, AllocatorPartitionsTierRegions) {
     const auto& reg0 = vram.region(0);
     const auto& g = snapshot.gpus[0];
 
-    // Ordering: pinned < kv_speculation < indexer_k < kv_hca < kv_swa <
-    // kv_main < expert_streaming < expert_stable.
+    // Ordering: pinned < kv_speculation < kv_hca < kv_swa < kv_main <
+    // expert_streaming < expert_stable. S4: no indexer span exists — the
+    // indexer_k pointer collapses onto kv_main (elastic claims come from
+    // the shared slab pool inside kv_main).
     EXPECT_LT(reg0.pinned, reg0.kv_speculation);
-    EXPECT_LT(reg0.kv_speculation, reg0.indexer_k);
-    EXPECT_LT(reg0.indexer_k, reg0.kv_hca);
+    EXPECT_LT(reg0.kv_speculation, reg0.kv_hca);
     EXPECT_LT(reg0.kv_hca, reg0.kv_swa);
-    EXPECT_LT(reg0.kv_swa, reg0.kv_main);
+    EXPECT_LE(reg0.kv_swa, reg0.indexer_k);
+    EXPECT_EQ(reg0.indexer_k, reg0.kv_main);
     EXPECT_LT(reg0.kv_main, reg0.expert_streaming);
+    EXPECT_EQ(g.indexer_k_bytes, 0);
 
     // Region spans hold their page pools.
     auto span = [](void* a, void* b) {

@@ -174,11 +174,19 @@ public:
     /// built under a DIFFERENT placement (or none) is wiped, never
     /// mis-adopted. 0 (policy off) is NOT folded, so every pre-placement
     /// store keeps its exact historical hash (no spurious one-time wipe).
+    /// `census_id` (P-29 step 13 phase B): non-zero when the MoE-layer census
+    /// extends beyond num_hidden_layers (MTP/NextN experts armed as arena
+    /// tenants) — folds the extended census into the identity so a store
+    /// built at 42 layers / 12,096 slots is never silently adopted by a
+    /// 43-layer / 12,384-slot engine (or vice versa); the mismatch takes
+    /// the existing on_conflict path instead. 0 (census == historical
+    /// formula) is NOT folded, so every existing store keeps its hash.
     static uint64_t hash_config(size_t slot_size_bytes, size_t scratch_bytes,
                                 const std::vector<NodeIdentity>& nodes,
                                 const config::PinHostExpertPoolSizingConfig& sizing,
                                 const config::CrossNodeSpillConfig& spill,
-                                uint64_t placement_id = 0);
+                                uint64_t placement_id = 0,
+                                uint64_t census_id = 0);
 
     /// Warm attach, step 1: validate the header (magic, schema, geometry/
     /// source hashes) and the spans' SELF-consistency (record count, bounds

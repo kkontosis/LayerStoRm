@@ -446,3 +446,192 @@ class TestGlm52Template:
         assert tc.function.name == "get_weather"
         args = json.loads(tc.function.arguments)
         assert args == {"city": "Paris", "days": 3, "metric": True}
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3-Flash (glm5_next) — reasoning_effort / clear_thinking / tool calls
+#
+# Semantics differ from GLM-5.2: there is NO enable_thinking/thinking switch
+# in this template at all (thinking is unconditionally pre-seeded by the
+# generation prompt), effort falls back to "max" for anything outside
+# {low, high}, and prior-turn reasoning is governed by `clear_thinking`.
+# ---------------------------------------------------------------------------
+
+_GLM53 = _TEST_DATA / "GLM-5.3-Flash"
+
+
+@pytest.mark.skipif(not _GLM53.is_dir(), reason="GLM-5.3-Flash test data absent")
+class TestGlm5NextTemplate:
+
+    @pytest.fixture()
+    def renderer(self):
+        return ChatTemplateRenderer(_GLM53)
+
+    _MSGS = [{"role": "user", "content": "hi"}]
+
+    # -- header / reasoning effort ------------------------------------------
+
+    def test_default_prefix_effort_and_seeded_think(self, renderer):
+        out = renderer.render(self._MSGS)
+        assert out.startswith("[gMASK]<sop>")
+        assert "<|system|>Reasoning Effort: Max" in out
+        # Generation prompt unconditionally pre-seeds the thinking block.
+        assert out.rstrip().endswith("<|assistant|><think>")
+
+    def test_reasoning_effort_low(self, renderer):
+        out = renderer.render(self._MSGS, reasoning_effort="low")
+        assert "<|system|>Reasoning Effort: Low" in out
+
+    def test_reasoning_effort_high(self, renderer):
+        out = renderer.render(self._MSGS, reasoning_effort="high")
+        assert "<|system|>Reasoning Effort: High" in out
+
+    def test_reasoning_effort_max_is_the_fallback_spelling(self, renderer):
+        # "max" is not in the template's allow-list {low, high}; it lands on
+        # the same fallback branch and still renders "Max".
+        out = renderer.render(self._MSGS, reasoning_effort="max")
+        assert "<|system|>Reasoning Effort: Max" in out
+
+    def test_reasoning_effort_unknown_value_falls_back_to_max(self, renderer):
+        out = renderer.render(self._MSGS, reasoning_effort="medium")
+        assert "<|system|>Reasoning Effort: Max" in out
+
+    # -- clear_thinking ------------------------------------------------------
+
+    _MULTI_TURN = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning_content": "R1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2", "reasoning_content": "R2"},
+    ]
+
+    def test_prior_turn_reasoning_kept_by_default(self, renderer):
+        # clear_thinking is deliberately NOT passed: template default is false.
+        out = renderer.render(self._MULTI_TURN)
+        assert "<think>R1</think>a1" in out
+        assert "<think>R2</think>a2" in out
+
+    def test_clear_thinking_drops_only_pre_last_user_reasoning(self, renderer):
+        out = renderer.render(self._MULTI_TURN, clear_thinking=True)
+        # Turn before the last user message loses its reasoning...
+        assert "<think></think>a1" in out
+        assert "R1" not in out
+        # ...but the turn after ns.last_user_index keeps it.
+        assert "<think>R2</think>a2" in out
+
+    def test_clear_thinking_strips_reasoning_embedded_in_content(self, renderer):
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "<think>R</think>Answer"},
+            {"role": "user", "content": "q2"},
+        ]
+        out = renderer.render(msgs, clear_thinking=True)
+        assert "<think></think>Answer" in out
+        assert "R</think>" not in out
+
+    def test_content_embedded_reasoning_kept_when_not_clearing(self, renderer):
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "<think>R</think>Answer"},
+            {"role": "user", "content": "q2"},
+        ]
+        out = renderer.render(msgs, clear_thinking=False)
+        assert "<think>R</think>Answer" in out
+
+    def test_assistant_without_reasoning_renders_empty_think(self, renderer):
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "plain"},
+            {"role": "user", "content": "q2"},
+        ]
+        out = renderer.render(msgs, clear_thinking=False)
+        # reasoning_content undefined ⇒ empty think even with clearing off.
+        assert "<think></think>plain" in out
+
+    def test_reasoning_does_not_leak_across_assistant_turns(self, renderer):
+        # Jinja scopes the per-iteration `set reasoning_content` to the loop
+        # body, so a later reasoning-less assistant turn must not inherit it.
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1", "reasoning_content": "R1"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q2"},
+        ]
+        out = renderer.render(msgs)
+        assert "<think>R1</think>a1" in out
+        assert "<think></think>a2" in out
+
+    # -- tools ---------------------------------------------------------------
+
+    def test_tool_call_render_roundtrip(self, renderer):
+        from server.tool_parsers import get_tool_parser
+        tools = [{"type": "function", "function": {
+            "name": "get_weather",
+            "description": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "metric": {"type": "boolean"},
+                },
+            },
+        }}]
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": json.dumps(
+                        {"city": "Paris", "days": 3, "metric": True}),
+                },
+            }]},
+            {"role": "tool", "content": "Sunny 20C", "tool_call_id": "call_1"},
+        ]
+        out = renderer.render(msgs, tools=tools)
+        # Tool declarations land inside the <tools>...</tools> system block.
+        # NOTE: the block is preceded by prose that itself spells out the
+        # literal "<tools></tools>" tag pair, so the real declaration list is
+        # the LAST such pair, not the first.
+        assert "<tools>" in out and "</tools>" in out
+        decl = out[out.rindex("<tools>"):out.rindex("</tools>")]
+        assert '"name": "get_weather"' in decl
+        # Tool-role message renders as an observation turn.
+        assert "<|observation|><tool_response>Sunny 20C</tool_response>" in out
+
+        # NOTE: the tools system block itself embeds a literal
+        # "<tool_call>{function-name}..." format example, so the real call
+        # is the LAST <tool_call> in the rendered prompt, not the first.
+        seg = out[out.rindex("<tool_call>"):]
+        seg = seg[: seg.index("</tool_call>") + len("</tool_call>")]
+        assert seg.startswith("<tool_call>get_weather<arg_key>city</arg_key>")
+        assert "<arg_value>Paris</arg_value>" in seg
+        # Non-string values are tojson'd on the wire.
+        assert "<arg_key>days</arg_key><arg_value>3</arg_value>" in seg
+        assert "<arg_key>metric</arg_key><arg_value>true</arg_value>" in seg
+
+        parsed = get_tool_parser("glm47")(tools=None).extract_tool_calls(seg)
+        assert len(parsed.tool_calls) == 1
+        tc = parsed.tool_calls[0]
+        assert tc.function.name == "get_weather"
+        # Without a schema the glm47 parser leaves every value a string
+        # (ref/vllm's without-schema rule) — the typed roundtrip needs tools.
+        assert json.loads(tc.function.arguments) == {
+            "city": "Paris", "days": "3", "metric": "true",
+        }
+        typed = get_tool_parser("glm47")(tools=tools).extract_tool_calls(seg)
+        assert json.loads(typed.tool_calls[0].function.arguments) == {
+            "city": "Paris", "days": 3, "metric": True,
+        }
+
+    # -- no thinking-off control --------------------------------------------
+
+    def test_no_thinking_off_switch(self, renderer):
+        # Unlike GLM-5.2, this template has no enable_thinking/thinking
+        # variable: passing thinking=False changes nothing.
+        out = renderer.render(self._MSGS, thinking=False)
+        assert "Reasoning Effort" in out
+        assert out.rstrip().endswith("<|assistant|><think>")
+        assert out == renderer.render(self._MSGS)

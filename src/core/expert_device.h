@@ -60,12 +60,18 @@ enum class MoeCombineMode : int {
 
 /// GGUF weight quantization tag. CANONICAL set — value order matches the kernel
 /// compute::GgufType (gguf_dequant_gemm.h) AND model::GgufKQuantType
-/// (gguf_kquant.h): {Q2_K=0, Q3_K=1, Q4_K=2, Q5_K=3, Q6_K=4, Q8_0=5}. The
-/// engine→kernel boundary (CudaSm120ExpertDevice::gguf_grouped_gemm) casts by
-/// value. The CPU ik bridge (to_ik_gguf) maps the 4 ik-supported families
-/// (Q4_K/Q5_K/Q6_K/Q8_0) and throws on Q2_K/Q3_K (no ik vendor support — those
-/// are GPU-only; the CPU expert path never receives them). The legacy vestigial
-/// q5_0 (never produced by the GGUF reader, GG-6) was dropped in GG-5.
+/// (gguf_kquant.h): {Q2_K=0, Q3_K=1, Q4_K=2, Q5_K=3, Q6_K=4, Q8_0=5, MXFP4=6}.
+/// The engine→kernel boundary (CudaSm120ExpertDevice::gguf_grouped_gemm) casts
+/// by value. NEVER ordinal-cast model::GgufKQuantType into this enum by hand —
+/// use model::gguf::to_compute_gguf (model/quantization/gguf_compute_cast.h),
+/// whose static_asserts pin every enumerator AND the enum length, so the two
+/// enums cannot silently diverge again (TD-GGUF-ENUM-MXFP4-DIVERGENCE). The
+/// engine→kernel casts are pinned the same way inside the CUDA TUs
+/// (cuda_sm120_expert_device.cu / cuda_sm120_device_backend.cu). The CPU ik
+/// bridge (to_ik_gguf) maps the 4 ik-supported families (Q4_K/Q5_K/Q6_K/Q8_0)
+/// and throws on Q2_K/Q3_K/MXFP4 (no ik vendor support — those are GPU-only;
+/// the CPU expert path never receives them). The legacy vestigial q5_0 (never
+/// produced by the GGUF reader, GG-6) was dropped in GG-5.
 enum class GgufQuantType {
     Q2_K = 0,  ///< K-quant 2-bit (super-block 256). GPU-only (no ik CPU path).
     Q3_K = 1,  ///< K-quant 3-bit (super-block 256). GPU-only (no ik CPU path).
@@ -73,7 +79,14 @@ enum class GgufQuantType {
     Q5_K = 3,  ///< K-quant 5-bit (super-block 256). Activations -> Q8_K (CPU) / Q8_1 (GPU).
     Q6_K = 4,  ///< K-quant 6-bit (super-block 256). Activations -> Q8_K (CPU) / Q8_1 (GPU).
     Q8_0 = 5,  ///< legacy 8-bit (block 32). Activations -> Q8_2_X4 (CPU) / Q8_1 (GPU).
+    MXFP4 = 6, ///< OCP MX e2m1 + E8M0 block scale (block 32; V4 QAT routed experts). GPU-only (no ik CPU path).
 };
+
+/// Number of GgufQuantType enumerators. MUST stay equal to
+/// model::kNumGgufKQuantTypes and cover the kernel compute::GgufType —
+/// statically enforced in model/quantization/gguf_compute_cast.h and the
+/// CUDA device TUs (TD-GGUF-ENUM-MXFP4-DIVERGENCE).
+inline constexpr int kNumGgufQuantTypes = 7;
 
 /// Parameters for a GGUF grouped GEMM over experts (one projection: gate, up, or
 /// down). Like Nvfp4GroupedGemmParams but with packed GGUF weights + a type tag.
@@ -107,6 +120,18 @@ struct GgufGroupedGemmParams {
 
     const int32_t* expert_offsets; ///< [num_experts + 1] cumulative token counts
     const void** B_ptrs;           ///< [num_experts] packed GGUF weight blocks
+
+    /// TD-GLM5-TP-COMBINE-PRECISION: when true, D_base is a [total_tokens, N]
+    /// FP32 buffer and the GEMM stores its fp32 accumulator RAW (no bf16
+    /// rounding) — the TP partial combine sums partials across ranks BEFORE
+    /// the single bf16 round. Supported ONLY for the dense/shared 1-expert
+    /// shape (num_experts == 1) with B0_host set; the GPU device THROWS on
+    /// anything else, the CPU devices always throw (no fp32-out CPU path).
+    bool d_fp32 = false;
+    /// Host-known packed-weight pointer of expert 0 (dense/shared call sites
+    /// know it: dw->down / se->down). Lets the d_fp32 path dispatch the
+    /// single-expert f32c kernels directly without a D2H of B_ptrs.
+    const void* B0_host = nullptr;
 };
 
 class ExpertDevice {

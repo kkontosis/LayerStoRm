@@ -1,6 +1,8 @@
 #include "model/pinned_region_layout.h"
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 
 #include "config/config_parser.h"
 #include "model/layer_registry.h"
@@ -295,6 +297,264 @@ int64_t v4_output_hc_bytes(const config::ModelConfig& m) {
     return (hc * static_cast<int64_t>(m.hidden_size) * hc + hc + 1) * kF32;
 }
 
+// ── glm5_next attention sizing (GF3.3) ─────────────────────────────────────
+
+namespace {
+
+constexpr int64_t kGlmBf16 = 2;
+constexpr int64_t kGlmF32 = 4;
+constexpr int64_t kFp8ScaleTile = 128;  // weight_block_size [128,128] (§7)
+
+constexpr int64_t ceil_div_i64(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+/// F32 blockwise-scale BYTES for an [n_rows, k_cols] FP8 projection whose ROW
+/// axis is split across `row_tp` ranks and whose COLUMN axis is split across
+/// `col_tp` ranks.  Mirrors TpWeightSharder::shard_scale, which shards the
+/// [ceil(n/128), ceil(k/128)] scale tensor on the SAME axis as its parent.
+int64_t glm_fp8_scale_bytes(int64_t n_rows, int64_t k_cols,
+                            int64_t row_tp, int64_t col_tp) {
+    return (ceil_div_i64(n_rows, kFp8ScaleTile) / row_tp) *
+           (ceil_div_i64(k_cols, kFp8ScaleTile) / col_tp) * kGlmF32;
+}
+
+/// mHC per-layer stream weights (MODELINFO §3e).  BF16 fn + F32 base + F32
+/// scale, one set for the attention wrap and one for the FFN wrap.  Replicated.
+/// GF3.9: quant-independent — the GGUF ships hc_*_fn packed Q8_0 (< 2 B/elem,
+/// so the BF16 term stays an upper bound) and hc_*_base / hc_*_scale F32 (exact).
+int64_t glm5_next_hc_bytes(const config::ModelConfig& m) {
+    const int64_t hc = std::max(1, m.hc_mult);
+    const int64_t hc_mix = (2 + hc) * hc;                 // 24 at hc=4
+    const int64_t fn = hc_mix * (hc * static_cast<int64_t>(m.hidden_size));
+    // GF3.9: hc_*_fn is WIDENED TO F32 at load (weight_loader glm5_next
+    // post-pass) because launch_mhc_pre's contract is F32 row-major
+    // (mhc.h) — the FP8 checkpoint ships it BF16 and the unsloth GGUF
+    // Q8_0, neither of which the kernel can consume raw. Size the slot at
+    // the uploaded F32 width.
+    const int64_t one_set = fn * kGlmF32 + hc_mix * kGlmF32 + 3 * kGlmF32;
+    return 2 * one_set;  // hc_attn_* + hc_ffn_*
+}
+
+}  // namespace
+
+int64_t glm5_next_attention_layer_bytes(const config::ModelConfig& m,
+                                        config::WeightQuant wq,
+                                        bool linear_attention,
+                                        bool include_hc,
+                                        int tp,
+                                        const GgufNonExpertWidths* widths,
+                                        int layer_idx) {
+    using WQ = config::WeightQuant;
+
+    // GF3.3: only the native FP8 checkpoint (and a hypothetical uniform
+    // non-scaled release) are sized by the dtype-exact arms below.  NVFP4 would
+    // additionally need a KDA requant story that does not exist — fail loudly
+    // rather than silently under-size the region.
+    if (wq == WQ::nvfp4) {
+        throw std::runtime_error(
+            "[GF3.3] glm5_next_attention_layer_bytes: weight quant 'nvfp4' is "
+            "not a supported glm5_next artifact path — GLM-5.3-Flash ships "
+            "native FP8 (block 128x128) with BF16 KDA/kv_b/indexer tensors, or "
+            "a GGUF k-quant release; no NVFP4 glm5_next loader exists yet");
+    }
+
+    // GF3.9: the unsloth GLM-5.3-Flash GGUF (scratchpad/gf39/SURVEY_BOOT.md
+    // §3.7) is the first bootable glm5_next artifact, and its dtype mix is NOT
+    // the native FP8 one — every attention MATRIX ships packed Q8_0
+    // (34 B / 32 elems = 1.0625 B/elem) and every vector / norm / APE ships
+    // F32.  Sizing rule (mirrors the generic-`gguf` upper bound in
+    // attention_layer_bytes):
+    //   * packed matrices → BF16 (2 B/elem).  A safe UPPER BOUND for every
+    //     GGUF type (Q8_0 is the widest at 34/32), and EXACT when the loader
+    //     dequants the tensor to BF16 (kpool compressor gate, GF3.9).
+    //   * F32-shipped tensors → F32 (4 B/elem), EXCEPT the four norm
+    //     components validate_plan halves by dtype (q_a_layernorm,
+    //     kv_a_layernorm, indexer k_norm weight+bias), which are sized BF16 so
+    //     the slot and validate_plan's `converts_f32_to_bf16` correction agree
+    //     exactly.  Every other F32 tensor (KDA conv1d, kda_o_norm, A_log,
+    //     dt_bias, indexer weights_proj, compressor APE, hc base/scale) is
+    //     sized at its checkpoint F32 width: an upper bound whether the engine
+    //     uploads it verbatim (today) or narrows it to BF16, and exactly what
+    //     validate_plan's uncorrected `sb.total_bytes()` pass computes for it.
+    //   * the compressor APE in particular must NOT be sized BF16 here: the
+    //     GGUF ships it F32 [index_kpool, index_head_dim] and it uploads
+    //     verbatim (SURVEY_BOOT §4.5), so BF16 would UNDER-size the slot.  The
+    //     native-FP8 arm keeps its BF16 APE sizing (GF3.4/3.5 semantics)
+    //     untouched.
+    // The surplus is trailing slack inside the attention slot; validate_plan
+    // legitimizes it for glm5_next+GGUF exactly as it does for the generic
+    // `gguf` quant (`gguf_upper_bound`, pinned_upload_plan.cpp).  Only an
+    // UNDER-sized slot is a bug.
+    const bool gguf_ckpt = gguf::is_gguf_weight_quant(wq);
+
+    const int64_t t = std::max(1, tp);
+    const int64_t hidden = m.hidden_size;
+
+    // GF3.15 (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): size a PACKED matrix at
+    // the checkpoint's real k-quant width when the header pre-scan supplies it,
+    // and at the BF16 upper bound otherwise.  `in` is the per-rank contraction
+    // extent — gguf_packed_bytes requires `in % QK == 0`, which a TP split can
+    // break; fall back to the bound rather than throw out of a sizing pass.
+    // Only matrices the loader uploads PACKED are routed through here (see the
+    // header for the transform exclusions).
+    auto packed = [&](TensorComponent comp, int64_t out, int64_t in) -> int64_t {
+        if (widths && layer_idx >= 0) {
+            if (auto ty = widths->find(layer_idx, comp)) {
+                const int64_t qk = gguf::block_values(*ty);
+                if (qk > 0 && in % qk == 0)
+                    return gguf::gguf_packed_bytes(out, in, *ty);
+            }
+        }
+        return out * in * kGlmBf16;
+    };
+
+    int64_t b = 0;
+
+    if (linear_attention) {
+        // KDA anatomy is dtype-fixed in the native checkpoint (the whole layer
+        // sits in the FP8 skip list, §7), so `wq` never enters this branch's
+        // arithmetic beyond the GF3.9 GGUF widths noted below.
+        // GF3.2's config validator is the authority here: it REJECTS a
+        // glm5_next config that has linear_attention layers but no
+        // linear_attn_config block (error on `model.linear_attn_config`), and
+        // that same validator runs its VRAM-budget pass through this sizing
+        // path. Falling back to the schema defaults (64 heads / 128 dim /
+        // kernel 4 — the GLM-5.3-Flash values) keeps the budget pass total
+        // instead of throwing out of a validator that is already reporting the
+        // real error.
+        const config::LinearAttnConfig la =
+            m.linear_attn_config.value_or(config::LinearAttnConfig{});
+        const int64_t H = la.num_heads;                    // 64
+        const int64_t D = la.head_dim;                     // 128
+        const int64_t K = la.short_conv_kernel_size;       // 4
+        const int64_t HD = H * D;                          // 8192
+
+        b += packed(TensorComponent::kda_q_proj, HD / t, hidden);
+        b += packed(TensorComponent::kda_k_proj, HD / t, hidden);
+        b += packed(TensorComponent::kda_v_proj, HD / t, hidden);
+        b += packed(TensorComponent::kda_b_proj, H / t, hidden);
+        b += packed(TensorComponent::kda_f_a_proj, D, hidden);   // replicated
+        b += packed(TensorComponent::kda_g_a_proj, D, hidden);   // replicated
+        b += packed(TensorComponent::kda_f_b_proj, HD / t, D);
+        b += packed(TensorComponent::kda_g_b_proj, HD / t, D);
+        // GF3.9: the GGUF ships the three depthwise convs and o_norm F32
+        // (§3.7) and neither is in the engine's F32→BF16 upload list, so size
+        // them F32 there — an upper bound that also covers a later narrowing.
+        const int64_t conv_bpe = gguf_ckpt ? kGlmF32 : kGlmBf16;
+        const int64_t o_norm_bpe = gguf_ckpt ? kGlmF32 : kGlmBf16;
+        b += 3 * (HD / t) * K * conv_bpe;        // q/k/v_conv1d [HD, 1, K]
+        b += (H / t) * kGlmF32;                  // A_log
+        b += (HD / t) * kGlmF32;                 // dt_bias
+        b += D * o_norm_bpe;                     // o_norm (replicated)
+        b += packed(TensorComponent::o_proj, hidden, HD / t);  // row-parallel
+    } else if (gguf_ckpt) {
+        // GF3.9 GGUF sparse-MLA arm (SURVEY_BOOT §3.7 blk.3 / blk.45).  All of
+        // q_a / q_b / kv_a / o_proj / kv_b (split attn_k_b+attn_v_b, consumed
+        // in-kernel packed) / indexer wq_b / indexer wk / compressor gate ship
+        // packed Q8_0 → sized at the BF16 upper bound.  The layernorms and the
+        // indexer k_norm pair ship F32 and upload BF16 (dtype-gated engine
+        // conversion, mirrored by validate_plan) → sized BF16.  weights_proj
+        // and the compressor APE ship F32 → sized F32.  There are NO blockwise
+        // scale tensors on this path (k-quant scales live inside the blocks).
+        const int64_t q_lora = m.q_lora_rank;                        // 1536
+        const int64_t kv_lora = m.kv_lora_rank;                      // 512
+        const int64_t qk_head = m.qk_nope_head_dim + m.qk_rope_head_dim;
+        const int64_t heads = m.num_attention_heads;                 // 64
+        const int64_t q_b_out = heads * qk_head;                     // 16384
+        const int64_t kv_a_out = kv_lora + m.qk_rope_head_dim;       // 512
+        const int64_t kv_b_out = heads * (m.qk_nope_head_dim + m.v_head_dim);
+        const int64_t o_in = heads * m.v_head_dim;                   // 16384
+
+        b += packed(TensorComponent::q_a_proj, q_lora, hidden);   // replicated
+        b += q_lora * kGlmBf16;                  // q_a_layernorm (F32→BF16)
+        b += packed(TensorComponent::q_b_proj, q_b_out / t, q_lora);
+        b += packed(TensorComponent::kv_a_proj_with_mqa, kv_a_out, hidden);
+        b += kv_lora * kGlmBf16;                 // kv_a_layernorm (F32→BF16)
+        // kv_b: the split attn_k_b/attn_v_b halves are DEQUANTED, transposed and
+        // stacked into ONE combined BF16 kv_b_proj at load (GLM-1
+        // assemble_split_kv_b_groups) — BF16 is the uploaded width, exact, and
+        // must NOT be narrowed to the halves' packed k-quant.
+        b += (kv_b_out / t) * kv_lora * kGlmBf16;
+        b += packed(TensorComponent::o_proj, hidden, o_in / t);  // row-parallel
+
+        // Lightning indexer with IndexPool (§3c) — replicated.
+        const int64_t idx_h = m.index_n_heads;    // 32
+        const int64_t idx_d = m.index_head_dim;   // 128
+        b += packed(TensorComponent::indexer_wq_b, idx_h * idx_d, q_lora);
+        b += packed(TensorComponent::indexer_wk, idx_d, hidden);
+        b += 2 * idx_d * kGlmBf16;                // k_norm weight + bias
+        b += idx_h * hidden * kGlmF32;            // weights_proj [32, 4096] F32
+        if (m.index_kpool > 1) {
+            // compress_gate ships Q8_0 and is DEQUANTED to BF16 at load (the
+            // executor GEMM is BF16-only) — BF16 is the uploaded width, exact.
+            b += idx_d * hidden * kGlmBf16;
+            // compress_ape [index_kpool, idx_d] — F32 in the GGUF, uploaded
+            // verbatim into the kernel's `const float*` (SURVEY_BOOT §4.5).
+            b += static_cast<int64_t>(m.index_kpool) * idx_d * kGlmF32;
+        }
+    } else {
+        const bool fp8 = (wq == WQ::fp8_e4m3 || wq == WQ::fp8_e5m2);
+        // Non-FP8 releases carry no blockwise scales; the projections are then
+        // stored at the quant's flat bytes/element.
+        const double proj_bpe = fp8 ? 1.0 : bytes_per_element(wq);
+
+        const int64_t q_lora = m.q_lora_rank;                        // 1536
+        const int64_t kv_lora = m.kv_lora_rank;                      // 512
+        const int64_t qk_head = m.qk_nope_head_dim + m.qk_rope_head_dim;  // 256
+        const int64_t heads = m.num_attention_heads;                 // 64
+        const int64_t q_b_out = heads * qk_head;                     // 16384
+        const int64_t kv_a_out = kv_lora + m.qk_rope_head_dim;       // 512
+        const int64_t kv_b_out = heads * (m.qk_nope_head_dim + m.v_head_dim);
+        const int64_t o_in = heads * m.v_head_dim;                   // 16384
+
+        auto quant_bytes = [&](int64_t n, int64_t k) -> int64_t {
+            return static_cast<int64_t>(static_cast<double>(n * k) * proj_bpe);
+        };
+
+        // q_a_proj [q_lora, hidden] — REPLICATED (existing MLA discipline).
+        b += quant_bytes(q_lora, hidden);
+        if (fp8) b += glm_fp8_scale_bytes(q_lora, hidden, 1, 1);
+        b += q_lora * kGlmBf16;                  // q_a_layernorm (BF16, repl.)
+
+        // q_b_proj [heads*qk_head, q_lora] — column-parallel.
+        b += quant_bytes(q_b_out / t, q_lora);
+        if (fp8) b += glm_fp8_scale_bytes(q_b_out, q_lora, t, 1);
+
+        // kv_a_proj_with_mqa [kv_lora (+rope=0), hidden] — REPLICATED.
+        b += quant_bytes(kv_a_out, hidden);
+        if (fp8) b += glm_fp8_scale_bytes(kv_a_out, hidden, 1, 1);
+        b += kv_lora * kGlmBf16;                 // kv_a_layernorm (BF16, repl.)
+
+        // kv_b_proj [heads*(nope+v), kv_lora] — ALWAYS BF16 (skip list §7),
+        // no scale tensor at all. Column-parallel.
+        b += (kv_b_out / t) * kv_lora * kGlmBf16;
+
+        // o_proj [hidden, heads*v_head_dim] — row-parallel (K axis ÷tp).
+        b += quant_bytes(hidden, o_in / t);
+        if (fp8) b += glm_fp8_scale_bytes(hidden, o_in, 1, t);
+
+        // ── Lightning indexer with IndexPool (§3c) — ALL BF16, ALL
+        //    replicated (existing DSA discipline).
+        const int64_t idx_h = m.index_n_heads;    // 32
+        const int64_t idx_d = m.index_head_dim;   // 128
+        b += idx_h * idx_d * q_lora * kGlmBf16;   // wq_b   [4096, 1536]
+        b += idx_d * hidden * kGlmBf16;           // wk     [128, 4096]
+        b += 2 * idx_d * kGlmBf16;                // k_norm weight + bias
+        b += idx_h * hidden * kGlmBf16;           // weights_proj [32, 4096]
+        if (m.index_kpool > 1) {
+            b += idx_d * hidden * kGlmBf16;       // index_kpool_compress_gate
+            b += static_cast<int64_t>(m.index_kpool) * idx_d * kGlmBf16;  // _ape
+        }
+    }
+
+    // mHC stream weights: hidden layers only (the MTP block runs the non-mHC
+    // path — MODELINFO §3e/§5).
+    if (include_hc) b += glm5_next_hc_bytes(m);
+
+    // 16-byte round-up so the following slot starts aligned (same rule as
+    // attention_layer_bytes / v4_attention_layer_bytes).
+    return (b + 15) & ~int64_t{15};
+}
+
 int64_t v4_hash_gating_table_bytes(const config::ModelConfig& m) {
     // ffn_gate_tid2eid [num_experts_per_tok, vocab_size] I32.
     return static_cast<int64_t>(m.num_experts_per_tok) * m.vocab_size * 4;
@@ -307,7 +567,8 @@ PinnedRegionLayout compute_pinned_layout(
     const config::Config& cfg,
     const QuantInterface& expert_quant,
     int tp_degree,
-    int rank) {
+    int rank,
+    const GgufNonExpertWidths* widths) {
 
     // GG-9: the pinned REGION size must be an upper bound over the actual upload.
     // A mixed `gguf` checkpoint's shared experts can be Q8_0 (the largest k-quant)
@@ -322,7 +583,7 @@ PinnedRegionLayout compute_pinned_layout(
     const bool gguf_generic = cfg.quantization.weights == config::WeightQuant::gguf;
     auto plan = build_upload_plan(model_cfg, cfg, expert_quant, tp_degree, rank,
                                   gguf_generic ? &kQ8 : nullptr,
-                                  gguf_generic ? &kQ8 : nullptr);
+                                  gguf_generic ? &kQ8 : nullptr, widths);
     const int num_hidden = model_cfg.raw().num_hidden_layers;
 
     PinnedRegionLayout layout{};

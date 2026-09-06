@@ -28,9 +28,10 @@ def test_struct_sizes():
     assert ctypes.sizeof(GpuSnapshot) == 56
     assert ctypes.sizeof(RequestAcceptance) == 16
     # Cross-language invariant: must match C++ sizeof(StateSnapshot) exactly.
-    # C++ alignas(64) on seqlock forces sizeof to a multiple of 64 = 1676928.
+    # C++ alignas(64) on seqlock forces sizeof to a multiple of 64 = 2095744.
+    # TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: kMaxExperts 256→320 (glm5_next 288).
     # TD-IPC-MOE-LAYER-CAP: kMaxMoeLayers 64→128 doubles the per-(layer,expert) arrays.
-    assert ctypes.sizeof(StateSnapshot) == 1676928
+    assert ctypes.sizeof(StateSnapshot) == 2095744
 
 
 # ── Field offsets ────────────────────────────────────────────────────────────
@@ -60,8 +61,18 @@ def test_field_offsets():
 
     # EngineInfo: cross-language invariant — must match C++ offsetof exactly
     # (232 since V4-7a added v4_hc_mult/v4_num_hash_layers/
-    # v4_attention_types[96]; test_ipc_struct_layout pins the full map)
-    assert ctypes.sizeof(EngineInfo) == 232
+    # attention_types[96]; 264 since TD-GLM5-KDA-SLOTS-EXPORT appended the
+    # KDA state-pool geometry block at 232; 272 since P-30 step 1 inserted
+    # moe_chunk_capacity after vocab_size — +4 shift for everything after,
+    # +4 alignment padding before the int64 kda_state_slot_bytes;
+    # test_ipc_struct_layout pins the full map)
+    assert ctypes.sizeof(EngineInfo) == 272
+    assert EngineInfo.moe_chunk_capacity.offset == 124
+    assert EngineInfo.kda_state_mapped.offset == 236
+    assert EngineInfo.kda_state_slots.offset == 240
+    assert EngineInfo.kda_state_slot_bytes.offset == 248
+    assert EngineInfo.kda_state_pages_per_seq.offset == 256
+    assert EngineInfo.kda_state_pool_pages.offset == 264
     assert EngineInfo.ipc_base.offset == 0
     assert EngineInfo.ipc_total_bytes.offset == 8
     assert EngineInfo.cmd_ring_offset.offset == 16

@@ -25,8 +25,11 @@
 // original data-gated conditions (hc_streams > 1, layer < moe_hash_layers,
 // use_gguf && !gate_is_gguf) inside the override — the V4 overrides fall
 // back to the base body when the condition does not hold, so behavior is
-// byte-identical under ANY config even where arch selection (the attention
-// driver's is_v4 condition) and the data gate could hypothetically disagree.
+// byte-identical under ANY config even where arch selection (the ONE shared
+// predicate, CommandDispatcher::select_moe_arch — both the single-shot
+// driver and the chunked MOE_BIG sibling use it,
+// TD-MOE-BIG-GLM5NEXT-MHC-POST) and the data gate could hypothetically
+// disagree.
 // The arch classes are stateless facades over CommandDispatcher (friend
 // access, `d_`).
 
@@ -85,8 +88,9 @@ public:
     /// into the hidden state. Base: plain residual add. V4: V4-5b mHC
     /// hc_post stream mix when hc_streams > 1 (EP-xTP extras, pair_idx < 0,
     /// skip it — their local result is never committed).
-    virtual void residual_update(uint32_t gpu, void* hidden_input,
-                                 void* add_src, int num_tokens, int hidden,
+    virtual void residual_update(int layer_idx, uint32_t gpu,
+                                 void* hidden_input, void* add_src,
+                                 int num_tokens, int hidden,
                                  int pair_idx, void* stream);
 
     MoeArch(const MoeArch&) = delete;

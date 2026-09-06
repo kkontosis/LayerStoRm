@@ -48,6 +48,13 @@ def _read_json(path: Path) -> dict | None:
 def _detect_eos_from_config(config: dict) -> tuple[int, ...]:
     raw = config.get("eos_token_id")
     if raw is None:
+        # Multimodal wrapper configs (GLM-5.3-Flash) nest the text model's
+        # generation fields under text_config — look one level down before
+        # giving up (config.json has NO top-level eos_token_id there).
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            raw = text_config.get("eos_token_id")
+    if raw is None:
         return ()
     if isinstance(raw, list):
         return tuple(int(x) for x in raw if isinstance(x, (int, float)))
@@ -83,6 +90,38 @@ def _scan_added_tokens_for_think(
     return start_id, end_id
 
 
+def _scan_tokenizer_json_for_think(model_dir: Path) -> tuple[int, int]:
+    """Scan tokenizer.json's added_tokens for <think>/</think> ids.
+
+    transformers v5-era tokenizer directories (GLM-5.3-Flash) no longer
+    duplicate added tokens into tokenizer_config.json's
+    added_tokens_decoder — tokenizer.json's added_tokens array is the only
+    stdlib-readable source of the think-marker ids there.
+    """
+    data = _read_json(model_dir / "tokenizer.json")
+    if data is None:
+        return -1, -2
+    added = data.get("added_tokens")
+    if not isinstance(added, list):
+        return -1, -2
+    start_id = -1
+    end_id = -2
+    for entry in added:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content", "")
+        token_id = entry.get("id")
+        if not isinstance(token_id, int):
+            continue
+        if content == "<think>" and start_id < 0:
+            start_id = token_id
+        elif content == "</think>" and end_id < 0:
+            end_id = token_id
+        if start_id >= 0 and end_id >= 0:
+            break
+    return start_id, end_id
+
+
 def detect_special_tokens(model_path: str | Path) -> SpecialTokenIds:
     """Detect special token IDs from model directory JSON files.
 
@@ -103,9 +142,26 @@ def detect_special_tokens(model_path: str | Path) -> SpecialTokenIds:
     else:
         log.warning("could not read config.json in %s", model_path)
 
+    if not eos_ids:
+        # generation_config.json is the authoritative stop-token list for
+        # checkpoints whose config.json omits it (and it carries the FULL
+        # id list where the tokenizer object knows only one eos —
+        # GLM-5.3-Flash: [154820 <|endoftext|>, 154827 <|user|>,
+        # 154829 <|observation|>]).
+        generation_config = _read_json(model_dir / "generation_config.json")
+        if generation_config is not None:
+            eos_ids = _detect_eos_from_config(generation_config)
+
     tokenizer_config = _read_json(model_dir / "tokenizer_config.json")
     if tokenizer_config is not None:
         think_start, think_end = _scan_added_tokens_for_think(tokenizer_config)
+
+    if think_start < 0 or think_end < 0:
+        ts, te = _scan_tokenizer_json_for_think(model_dir)
+        if think_start < 0:
+            think_start = ts
+        if think_end < 0:
+            think_end = te
 
     if think_start < 0 or think_end < 0:
         model_type = config.get("model_type", "") if config else ""

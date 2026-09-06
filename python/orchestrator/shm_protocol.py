@@ -11,7 +11,7 @@ import ctypes
 PROTOCOL_VERSION = 1
 MAX_GPUS = 8
 MAX_MOE_LAYERS = 128  # TD-IPC-MOE-LAYER-CAP: mirror kMaxMoeLayers (>= GLM-5.2's 75 MoE + MTP)
-MAX_EXPERTS = 256
+MAX_EXPERTS = 320  # TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: mirror ipc::kMaxExperts (>= glm5_next's 288 routed)
 MAX_TRACKED_REQUESTS = 64
 
 DEFAULT_CMD_RING_SLOTS = 8192
@@ -21,8 +21,11 @@ CMP_SLOT_BYTES = 128
 
 # Sideband sub-region max entry counts (IPC-8b).
 MAX_BATCH_DESCRIPTORS  = 512
-MAX_EXPERT_PREFETCH    = 256
-MAX_EXPERT_EVICTION    = 256
+# GF3.15: 512 (was 256) — must cover the largest n_routed_experts any model
+# ships (glm5_next: 288); a prefill-superchunk union can hit all of them.
+# Mirrors ipc_protocol.h kMaxExpertPrefetch/kMaxExpertEviction.
+MAX_EXPERT_PREFETCH    = 512
+MAX_EXPERT_EVICTION    = 512
 MAX_TRANSFER_BATCH     = 256
 MAX_RESERVE_BATCH      = 256
 MAX_NVME_READ_BATCH    = 256
@@ -67,6 +70,11 @@ CMD_NUMA_MIGRATE           = 0x0501
 CMD_SEQ_CREATE             = 0x0600
 CMD_SEQ_FREE               = 0x0601
 CMD_SEQ_FORK               = 0x0602
+# R3 prefix-holder lifecycle (TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE):
+# FROZEN fork (CoW-free registration fork of a never-appending holder) and
+# HIBERNATE (demote a frozen holder's hot kMain pages to the cold pool).
+CMD_SEQ_FORK_FROZEN        = 0x0605
+CMD_SEQ_HIBERNATE          = 0x0606
 
 CMD_NVME_READ              = 0x0700
 CMD_NVME_WRITE             = 0x0701
@@ -95,6 +103,9 @@ D_CMD_RUN_MTP_STEP         = 0x0A06  # fused MTP draft step (#62d)
 D_CMD_RUN_SELF_SPEC_FORWARD = 0x0A07  # fused self-spec forward pass (#62e)
 D_CMD_MTP_PROJECT          = 0x0A08  # MTP projection: enorm(Emb)+hnorm(h) -> eh_proj (#16)
 D_CMD_RUN_DSPARK_STEP      = 0x0A09  # fused DSpark DFlash-backbone draft step (DSP-3/DSP-5)
+D_CMD_KDA_SNAPSHOT         = 0x0A0A  # P-29 step 13: KDA anchor snapshot (INV-KDA-REWIND)
+D_CMD_KDA_RESTORE          = 0x0A0B  # P-29 step 13: KDA anchor restore + frontier rollback
+D_CMD_KDA_CKPT             = 0x0A0C  # P-29 step 24: host-RAM KDA prefix checkpoint (GF3.12)
 
 # Config update (9.8-1b)
 CMD_CONFIG_UPDATE          = 0x0B00
@@ -267,7 +278,7 @@ class ExpertFfnPayload(ctypes.Structure):
         ("workspace_buf_id",     ctypes.c_uint32),    # KD-2
         ("k_dim",                ctypes.c_uint32),    # GG-5: input dim K (GGUF path)
         ("quant_mode",           ctypes.c_uint8),     # KD-2: 0=NVFP4,1=FP8,2=GGUF
-        ("gguf_type",            ctypes.c_uint8),     # GG-5: GgufKQuantType (Q2_K=0..Q8_0=5)
+        ("gguf_type",            ctypes.c_uint8),     # GG-5: GgufKQuantType (Q2_K=0..MXFP4=6)
         ("_pad_eff",             ctypes.c_uint8 * 2),
     ]
 
@@ -308,6 +319,10 @@ class OutputHeadPayload(ctypes.Structure):
                                                     # last-row logits to the pinned
                                                     # readback row (TD-SERVE-NAMED-
                                                     # TOOL-CHOICE)
+        ("norm_only",           ctypes.c_uint8),    # P-29 step 13: collapse+final-norm
+                                                    # only (MTP prefill feed)
+        ("_pad_oh",             ctypes.c_uint8),
+        ("input_row",           ctypes.c_uint16),   # P-29 step 13: input row offset
     ]
 
 class SampleTokensPayload(ctypes.Structure):
@@ -336,7 +351,10 @@ class RunAttentionPayload(ctypes.Structure):
         # TD-PREFILL-SUPERCHUNK: sub-chunk launch of a superchunk (coverage
         # window relaxation) + hidden-state row offset for its rows.
         ("superchunk",      ctypes.c_uint8),
-        ("_pad_ra",         ctypes.c_uint8),
+        # P-29 step 13 phase B: bit0 = spec-verify row (routing export lands at
+        # sideband dst row == row_offset, cumulative header; span-graph
+        # bypass bracketed daemon-side).
+        ("spec_flags",      ctypes.c_uint8),
         ("row_offset",      ctypes.c_uint32),
     ]
 
@@ -445,7 +463,11 @@ class MtpProjectPayload(ctypes.Structure):
         ("input_token_id", ctypes.c_uint32),
         ("step_idx",       ctypes.c_uint8),
         ("hidden_row",     ctypes.c_uint8),
-        ("_pad",           ctypes.c_uint8 * 2),
+        ("prev_src",       ctypes.c_uint8),  # 0=attn_buf row; 1=post-final-
+                                             # norm head hidden (P-29 step 11 probe;
+                                             # P-29 step 13: row-selectable + tp>1)
+        ("dest_row",       ctypes.c_uint8),  # P-29 step 13: attn_buf dest row
+                                             # (H-stride; MTP single-stream)
     ]
 
 class SelfSpecForwardPayload(ctypes.Structure):
@@ -528,6 +550,22 @@ class ReefRoutePayload(ctypes.Structure):
         ("expert_count", ctypes.c_uint32),
     ]
 
+class KdaAnchorPayload(ctypes.Structure):
+    """D_CMD_KDA_SNAPSHOT / D_CMD_KDA_RESTORE — P-29 step 13 KDA anchor-and-replay.
+
+    SNAPSHOT copies the sequence's whole KDA state (recurrent + conv rings,
+    every linear layer, every rank) into a per-seq anchor slot chosen by
+    (pos / index_kpool) % 2 and records pos (must equal the uniform
+    frontier). RESTORE copies the anchor recorded at pos back and rolls
+    every linear layer's kda_next_pos to pos; loud refusal when no anchor
+    matches (INV-KDA-REWIND: never approximate a rewind).
+    """
+    _fields_ = [
+        ("_pad0",  ctypes.c_uint32),
+        ("seq_id", ctypes.c_uint64),
+        ("pos",    ctypes.c_uint32),
+    ]
+
 class FarForwardLayerPayload(ctypes.Structure):
     """E_CMD_FAR_FORWARD_LAYER — fused attention + routed FETCH layer.
 
@@ -547,7 +585,10 @@ class FarForwardLayerPayload(ctypes.Structure):
         ("timeout_us",  ctypes.c_uint32),
         ("is_prefill",  ctypes.c_uint8),
         ("route_mode",  ctypes.c_uint8),
-        ("_pad",        ctypes.c_uint8 * 2),
+        # P-29 step 13: spec_verify = per-row attention loop + one cross-row union
+        # + one M=R MoE; kda_snap_mask bit j = KDA anchor snapshot after row j.
+        ("spec_verify",   ctypes.c_uint8),
+        ("kda_snap_mask", ctypes.c_uint8),
     ]
 
 assert ctypes.sizeof(ReefRoutePayload) == 8
@@ -678,10 +719,14 @@ class NumaMigratePayload(ctypes.Structure):
 
 class SeqCreatePayload(ctypes.Structure):
     _fields_ = [
-        ("seq_id",     ctypes.c_uint64),
-        ("prompt_len", ctypes.c_uint32),
-        ("pool",       ctypes.c_uint8),
-        ("_pad",       ctypes.c_uint8 * 3),
+        ("seq_id",         ctypes.c_uint64),
+        ("prompt_len",     ctypes.c_uint32),
+        ("pool",           ctypes.c_uint8),
+        ("_pad",           ctypes.c_uint8 * 3),
+        # TD-INDEXER-NO-DENSE-FALLBACK (Route 1): total context the sequence
+        # may ever reach; engine reserves indexer-K pages for it at create
+        # (clamped to serving.max_sequence_length).  0 = legacy lazy growth.
+        ("reserve_tokens", ctypes.c_uint32),
     ]
 
 class SeqFreePayload(ctypes.Structure):
@@ -693,6 +738,26 @@ class SeqForkPayload(ctypes.Structure):
     _fields_ = [
         ("src_seq_id", ctypes.c_uint64),
         ("dst_seq_id", ctypes.c_uint64),
+        # R4a truncating fork: 0 = full fork (legacy, byte-identical);
+        # N > 0 = the child takes only the parent's first N tokens (KV
+        # pages to ceil(N/page_size), indexer-K to ceil(N/PT), coverage
+        # clamped, fresh rewind epoch).  Rejected by the engine on V4
+        # side-tier architectures (in-place rings).
+        ("prefix_len", ctypes.c_uint32),
+        # TD-INDEXER-NO-DENSE-FALLBACK: child's indexer-K reservation target
+        # (same semantics as SeqCreatePayload.reserve_tokens; 0 = legacy;
+        # ignored on frozen forks).
+        ("reserve_tokens", ctypes.c_uint32),
+    ]
+
+class SeqHibernatePayload(ctypes.Structure):
+    _fields_ = [
+        ("seq_id", ctypes.c_uint64),
+        ("kv_len", ctypes.c_uint32),
+        # TD-PREFIX-TIDY-COLD-SPILL: 1 = also spill the hibernated
+        # holder's cold pages to disk (2nd tiering hop); 0 = legacy.
+        ("spill", ctypes.c_uint8),
+        ("_pad_spill", ctypes.c_uint8 * 3),
     ]
 
 class NvmeReadPayload(ctypes.Structure):
@@ -904,6 +969,7 @@ class CommandPayload(ctypes.Union):
         ("seq_create",       SeqCreatePayload),
         ("seq_free",         SeqFreePayload),
         ("seq_fork",         SeqForkPayload),
+        ("seq_hibernate",    SeqHibernatePayload),
         ("nvme_read",        NvmeReadPayload),
         ("nvme_write",       NvmeWritePayload),
         ("nvme_evict_host",  NvmeEvictHostPayload),
@@ -921,6 +987,7 @@ class CommandPayload(ctypes.Union):
         ("run_adapter_forward",  RunAdapterForwardPayload),
         ("run_mtp_step",         MtpStepPayload),
         ("mtp_project",          MtpProjectPayload),
+        ("kda_anchor",           KdaAnchorPayload),
         ("self_spec_forward",    SelfSpecForwardPayload),
         ("run_dspark_step",      DsparkStepPayload),
         ("fetch_and_run_moe",    FetchAndRunMoePayload),
@@ -964,14 +1031,24 @@ class ComputeCompletionPayload(ctypes.Structure):
         ("top1_prob",          ctypes.c_float),     # IPC-8g
         ("entropy",            ctypes.c_float),     # IPC-8g
         ("routed_miss_count",  ctypes.c_uint8),     # TD-89n: top-K experts not resident
-        ("_pad_rmc",           ctypes.c_uint8 * 3),
+        ("moe_degraded",       ctypes.c_uint8),     # TD-MOE-PROGRESSIVE-DEGRADED-SILENT:
+                                                    #   1 = degraded progressive finalize
+        ("indexer_dense",      ctypes.c_uint8),     # TD-INDEXER-NO-DENSE-FALLBACK
+                                                    #   witness: 1 = this attention step
+                                                    #   ran (some row) DSA-DENSE (dead
+                                                    #   indexer coverage) — MUST be 0
+        ("_pad_rmc",           ctypes.c_uint8 * 1),
     ]
 
 class SeqOpCompletionPayload(ctypes.Structure):
     _fields_ = [
         ("seq_id",     ctypes.c_uint64),
         ("page_count", ctypes.c_uint32),
-        ("_pad",       ctypes.c_uint32),
+        # TD-INDEXER-NO-DENSE-FALLBACK: GRANTED indexer-K reservation in
+        # tokens (0 = none).  Deliberately aliases ComputeCompletionPayload
+        # .data_bytes (same union offset) so the bridge's generic completion
+        # view carries it without a seq_op-specific parse arm.
+        ("reserved_tokens", ctypes.c_uint32),
     ]
 
 class NvmeCompletionPayload(ctypes.Structure):
@@ -1091,13 +1168,13 @@ assert ctypes.sizeof(RequestAcceptance) == 16
 # ── StateSnapshot ────────────────────────────────────────────────────────────
 # Matches C++ layout including alignas(64) on seqlock via explicit padding.
 
-_RESIDENCY_BITMAP_SIZE = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_GPUS // 8  # 16384
-_GPU_TRIPLE_SIZE       = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_GPUS       # 131072
-_EXPERT_ARRAY_SIZE     = MAX_MOE_LAYERS * MAX_EXPERTS                  # 16384
-_HOST_BITMAP_SIZE      = MAX_MOE_LAYERS * MAX_EXPERTS // 8             # 2048
+_RESIDENCY_BITMAP_SIZE = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_GPUS // 8  # 40960
+_GPU_TRIPLE_SIZE       = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_GPUS       # 327680
+_EXPERT_ARRAY_SIZE     = MAX_MOE_LAYERS * MAX_EXPERTS                  # 40960
+_HOST_BITMAP_SIZE      = MAX_MOE_LAYERS * MAX_EXPERTS // 8             # 5120
 
 MAX_NUMA = 8
-_NUMA_TIER_SIZE = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_NUMA  # 131072
+_NUMA_TIER_SIZE = MAX_MOE_LAYERS * MAX_EXPERTS * MAX_NUMA  # 327680
 
 class StateSnapshot(ctypes.Structure):
     _fields_ = [
@@ -1205,14 +1282,40 @@ class EngineInfo(ctypes.Structure):
         # TD-VOCAB-AUTODETECT: the engine's resolved vocab width
         # (weights-derived or cross-checked); prefer over config/tokenizer.
         ("vocab_size",      ctypes.c_int32),
+        # P-30 step 1: realized single-shot MoE chunk bound after the elastic
+        # chunk fail-safe. EP-beyond-TP superchunk strides MUST clamp to this
+        # (batches above it run the chunked path, rejected with expert-only
+        # ranks resident — TD-MOE-EP-XTP-WAVES).
+        ("moe_chunk_capacity", ctypes.c_int32),
 
         # ── DeepSeek-V4 metadata (V4-7a) — all zero for non-V4 models ──
         ("v4_hc_mult",         ctypes.c_int32),   # mHC streams (0 = non-V4)
         ("v4_num_hash_layers", ctypes.c_int32),   # tid2eid-routed layers
-        # Per hidden layer attention type from compress_ratios: 0 = SWA,
-        # 1 = CSA (ratio 4), 2 = HCA (ratio 128).  First num_layers
-        # entries valid when v4_hc_mult > 0 (kV4MaxLayers = 96).
-        ("v4_attention_types", ctypes.c_uint8 * 96),
+        # Per hidden layer attention type (GF3.2 / TD-ATTN-TYPES-V4-NAMING:
+        # renamed from v4_attention_types — same offset/size).  V4 (valid
+        # when v4_hc_mult > 0, from compress_ratios): 0 = SWA, 1 = CSA
+        # (ratio 4), 2 = HCA (ratio 128).  glm5_next (entries always
+        # nonzero, from model.layer_types): 3 = linear (KDA), 4 = sparse
+        # MLA.  All-zero + v4_hc_mult == 0 = homogeneous arch, unpopulated
+        # (kMaxAttentionTypeLayers = 96).
+        ("attention_types", ctypes.c_uint8 * 96),
+        # R4b arch capability (INV-SEQ-FORK-TRUNC): 1 iff CMD_SEQ_FORK
+        # honours prefix_len truncation on this boot's architecture (no
+        # lossy position-indexed ring state).  0 => the engine rejects
+        # truncating forks and the orchestrator must not offer mid-edge
+        # prefix reuse.
+        ("seq_fork_truncatable", ctypes.c_int32),
+        # ── TD-GLM5-KDA-SLOTS-EXPORT: KDA state-pool geometry ──
+        # All zero for models without linear-attention per-request state.
+        # mapped=1: state units are whole-slab runs in the SHARED kMain
+        # pool (pool_pages, pages_per_seq per admission); mapped=0: a
+        # dedicated carve of `kda_state_slots` whole-request slots — the
+        # hard concurrency cap.  slot_bytes = one request's per-rank state.
+        ("kda_state_mapped",        ctypes.c_int32),
+        ("kda_state_slots",         ctypes.c_int32),
+        ("kda_state_slot_bytes",    ctypes.c_int64),
+        ("kda_state_pages_per_seq", ctypes.c_int64),
+        ("kda_state_pool_pages",    ctypes.c_int64),
     ]
 
 # ── IPC layout calculator ───────────────────────────────────────────────────

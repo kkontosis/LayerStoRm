@@ -700,6 +700,167 @@ void validate_v4(const Config& cfg, ValidationResult& r) {
     }
 }
 
+// ── glm5_next architecture rules (PLAN.md Phase GF3, GF3.2) ─────────────────
+// GLM-5.3-Flash family: hybrid KDA linear attention + NoPE sparse MLA per
+// layer_types, IndexPool indexer. Ground truth:
+// spec/GLM-5.3-FLASH-MODELINFO.md (config.json of zai-org/GLM-5.3-Flash).
+void validate_glm5_next(const Config& cfg, ValidationResult& r) {
+    const auto& m = cfg.model;
+    const bool is_g5n = m.architecture == Architecture::glm5_next;
+
+    if (!is_g5n) {
+        // glm5_next-only knobs are inert-but-suspicious elsewhere (mirrors
+        // the compress_ratios warning in validate_v4).
+        if (!m.layer_types.empty()) {
+            warn(r, "model.layer_types",
+                 "layer_types is set but architecture is not glm5_next; "
+                 "ignored");
+        }
+        if (m.linear_attn_config.has_value()) {
+            warn(r, "model.linear_attn_config",
+                 "linear_attn_config is set but architecture is not "
+                 "glm5_next; ignored");
+        }
+        if (m.index_kpool > 1) {
+            warn(r, "model.index_kpool",
+                 "index_kpool > 1 is set but architecture is not glm5_next; "
+                 "ignored");
+        }
+        if (m.mla_use_nope) {
+            warn(r, "model.mla_use_nope",
+                 "mla_use_nope is set but architecture is not glm5_next; "
+                 "ignored");
+        }
+        return;
+    }
+
+    // layer_types is the per-layer dispatch axis — required, exactly one
+    // entry per hidden layer (the MTP layer is NOT in the array; it is
+    // sparse MLA by checkpoint — MODELINFO §5).
+    if (static_cast<int>(m.layer_types.size()) != m.num_hidden_layers) {
+        error(r, "model.layer_types",
+              "glm5_next requires exactly num_hidden_layers (" +
+              std::to_string(m.num_hidden_layers) + ") layer_types entries, "
+              "got " + std::to_string(m.layer_types.size()) +
+              " (GLM-5.3-Flash: 45 — 34 linear_attention + 11 "
+              "deepseek_sparse_attention)");
+    }
+    const bool has_linear = [&] {
+        for (const auto t : m.layer_types)
+            if (t == LayerAttentionType::linear_attention) return true;
+        return false;
+    }();
+
+    // KDA geometry: required when any layer is linear_attention.
+    if (has_linear && !m.linear_attn_config.has_value()) {
+        error(r, "model.linear_attn_config",
+              "Required when any layer_types entry is linear_attention "
+              "(GLM-5.3-Flash: num_heads 64, head_dim 128, "
+              "short_conv_kernel_size 4, gate_lower_bound -5.0)");
+    }
+    if (m.linear_attn_config.has_value()) {
+        const auto& la = *m.linear_attn_config;
+        const int tp = cfg.parallelism.tensor_parallelism;
+        if (tp > 1 && la.num_heads % tp != 0) {
+            error(r, "parallelism.tensor_parallelism",
+                  "glm5_next: linear_attn_config.num_heads (" +
+                  std::to_string(la.num_heads) + ") must be divisible by "
+                  "tensor_parallelism (" + std::to_string(tp) +
+                  ") — KDA q/k/v/conv/f_b/g_b shard column-parallel by head");
+        }
+    }
+
+    // NoPE MLA: the sparse layers carry no rope block anywhere (KV latent =
+    // kv_lora_rank exactly). A nonzero rope dim under mla_use_nope would
+    // silently mis-size every page layout and kernel contraction.
+    if (m.mla_use_nope && m.qk_rope_head_dim != 0) {
+        error(r, "model.qk_rope_head_dim",
+              "Must be 0 when mla_use_nope=true (NoPE MLA has no rope "
+              "component; KV latent per token = kv_lora_rank), got " +
+              std::to_string(m.qk_rope_head_dim));
+    }
+    if (!m.mla_use_nope && m.qk_rope_head_dim == 0) {
+        error(r, "model.mla_use_nope",
+              "qk_rope_head_dim == 0 requires mla_use_nope=true (a rope-MLA "
+              "layer with a zero rope dim has no defined prep path)");
+    }
+
+    // IndexPool: index_topk is a TOKEN budget — top-k selects
+    // index_topk/index_kpool pools (MODELINFO §3d), so divisibility is
+    // structural, and pooling weights are LEARNED (no unlearned variant
+    // exists in any reference — fail closed).
+    if (m.index_kpool > 1) {
+        if (m.index_topk % m.index_kpool != 0) {
+            error(r, "model.index_kpool",
+                  "index_topk (" + std::to_string(m.index_topk) +
+                  ") must be divisible by index_kpool (" +
+                  std::to_string(m.index_kpool) + ") — top-k selects "
+                  "index_topk/index_kpool pooled units");
+        }
+        if (!m.index_kpool_compress) {
+            error(r, "model.index_kpool_compress",
+                  "Required true when index_kpool > 1: pooling is LEARNED "
+                  "(index_kpool_compress_{gate,ape} tensors); no unlearned "
+                  "pooled variant exists (fail closed)");
+        }
+        // Pool-alignment invariant (MODELINFO §10.8): every engine-produced
+        // prefill boundary must be a multiple of index_kpool or the pooled
+        // indexer store fragments (the vLLM reference hard-asserts
+        // block_size % index_kpool == 0).
+        const auto check_mult = [&](int v, const char* path) {
+            if (v > 0 && v % m.index_kpool != 0) {
+                error(r, path,
+                      "Must be a multiple of model.index_kpool (" +
+                      std::to_string(m.index_kpool) + ") — pool-alignment "
+                      "invariant (spec/GLM-5.3-FLASH-MODELINFO.md §10.8), "
+                      "got " + std::to_string(v));
+            }
+        };
+        check_mult(cfg.memory.kv_cache.page_size_tokens,
+                   "memory.kv_cache.page_size_tokens");
+        check_mult(cfg.memory.kv_cache.indexer_k_page_size_tokens,
+                   "memory.kv_cache.indexer_k_page_size_tokens");
+        check_mult(cfg.orchestrator.prefill_chunk_tokens,
+                   "orchestrator.prefill_chunk_tokens");
+        check_mult(cfg.compute.prefill_superchunk_tokens,
+                   "compute.prefill_superchunk_tokens");
+        // P-30 step 1: on EP-beyond-TP topologies the single-shot chunk
+        // bound IS the served superchunk stride (TD-MOE-EP-XTP-WAVES), so
+        // it must sit on the indexer pool grid too.
+        check_mult(cfg.compute.moe_big_chunk_tokens,
+                   "compute.moe_big_chunk_tokens");
+        // GF3.5: the SELECTION budget handed to the top-k kernel is
+        // index_topk/index_kpool POOLS and must fit the kernel's MAX_TOPK
+        // (deps lightning_topk.cu: 2048 — it silently clamps beyond).
+        // The EXPANDED row count is index_topk + index_kpool - 1 (pools ×
+        // kpool + the <=kpool-1 always-selected tail rows); every row
+        // stride/capacity in the engine is sized to that derived value, so
+        // no bound is needed on it here — but the two numbers are distinct
+        // and must never be conflated (scratchpad/GF35_SURVEY.md, the 2051
+        // overflow).
+        if (m.index_topk / m.index_kpool > 2048) {
+            error(r, "model.index_topk",
+                  "index_topk/index_kpool (" +
+                  std::to_string(m.index_topk / m.index_kpool) +
+                  ") exceeds the top-k kernel MAX_TOPK (2048) — the pooled "
+                  "selection budget must fit lightning_topk");
+        }
+    }
+
+    // mHC consistency (validate_v4's hc checks are behind its is_v4 early
+    // return, so glm5_next re-states them; GLM-5.3-Flash: hc_mult 4,
+    // 20 iters, eps 1e-6 — identical to V4's).
+    if (m.hc_mult > 1) {
+        if (m.hc_sinkhorn_iters < 1) {
+            error(r, "model.hc_sinkhorn_iters",
+                  "Must be >= 1 when hc_mult > 1 (GLM-5.3-Flash: 20)");
+        }
+        if (m.hc_eps <= 0.0) {
+            error(r, "model.hc_eps", "Must be positive when hc_mult > 1");
+        }
+    }
+}
+
 // P-24b memory.arena_attach.on_conflict × persist compatibility. persist=true
 // declares the holder store authoritative and never-wiped, so only 'fail' is
 // coherent with it. Also enforced (throwing) in finalize_config so every
@@ -789,6 +950,7 @@ ValidationResult validate_config(const Config& cfg) {
     validate_attention_backend(cfg, result);
     validate_gating_activation(cfg, result);
     validate_v4(cfg, result);
+    validate_glm5_next(cfg, result);
     validate_arena_attach(cfg, result);
     validate_live_prepack(cfg, result);
 

@@ -1287,6 +1287,31 @@ TEST(GpuLoaderSolver256, GreedyTierDeterministic) {
   EXPECT_EQ(dbits(r1.predicted_us), dbits(r3.predicted_us));
 }
 
+// GF3.3 (GLM-5.3-Flash): a full 288-expert layer union — glm5_next has 288
+// routed experts, above the pre-GF3.3 bound of 256 (which would have tripped
+// the N <= NMax assertion on the first GLM-5.3 prefill). kMaxExpertsLarge is
+// now 320; a 288-union must route, respect pins, and stay deterministic.
+TEST(GpuLoaderSolver256, Glm53Flash288ExpertUnionRoutes) {
+  static_assert(gl::kMaxExpertsLarge >= 288,
+                "GLM-5.3-Flash prefill unions reach 288 experts");
+  const auto k = make_constants(4, 4, /*egress=*/50.0);
+  const int N = 288, hits = 200;
+  const auto req = make_union_request(4, N, hits, /*with_place=*/true);
+  gl::LoaderSolver256 s;
+  const auto r = s.solve(k, req);
+  ASSERT_EQ(r.n, N);
+  for (int i = 0; i < hits; ++i)
+    ASSERT_EQ(r.assignment[static_cast<size_t>(i)], i % 4) << "pin violated at " << i;
+  for (int i = 0; i < N; ++i) {
+    ASSERT_GE(r.assignment[static_cast<size_t>(i)], 0);
+    ASSERT_LT(r.assignment[static_cast<size_t>(i)], 4);
+  }
+  EXPECT_GT(r.predicted_us, 0.0);
+  const auto r2 = s.solve(k, req);
+  EXPECT_EQ(avn(r), avn(r2));
+  EXPECT_EQ(dbits(r.predicted_us), dbits(r2.predicted_us));
+}
+
 // Load-balance sanity 1: fully symmetric all-miss union splits exactly evenly
 // (the greedy ranks by the same makespan term the exact tiers use).
 TEST(GpuLoaderSolver256, GreedyTierBalancesSymmetricMisses) {

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 from dataclasses import dataclass
@@ -104,8 +105,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Serve a model over an OpenAI-compatible HTTP API "
                     "(engine + orchestrator + tokenizer in one process).",
     )
-    p.add_argument("--config", required=True,
-                   help="engine config JSON (config/schema.json)")
+    p.add_argument("--config", default="",
+                   help="engine config JSON (config/schema.json). Required "
+                        "unless --autoconfig --model derives one (P-31); "
+                        "with both, --config carries extras into the "
+                        "derivation (base recipe)")
+    p.add_argument("--model", default="",
+                   help="with --autoconfig: derive the recipe from the "
+                        "WEIGHTS themselves (a .gguf file, a dir of GGUF "
+                        "shards, or a HF model dir) — no --config needed. "
+                        "Measured artifacts beside the weights (trained "
+                        "loader calibration, arena placement table) are "
+                        "reused; the derive is CPU-only "
+                        "(TD-AUTOCONFIG-NO-GLM5NEXT-PROFILE consumer)")
+    p.add_argument("--accuracy", default=None,
+                   choices=["compact", "standard", "high", "superior"],
+                   help="with --autoconfig: the numerics FLOOR (autoconfig "
+                        "lever 4, AUTOCONFIG §2.4)")
+    p.add_argument("--prefer", default=None,
+                   choices=["speed", "balanced", "capacity"],
+                   help="with --autoconfig: what the fit gives up FIRST "
+                        "(autoconfig lever 3, AUTOCONFIG §2.3; order only)")
     p.add_argument("--host", default=None,
                    help="bind address (overrides serving.host)")
     p.add_argument("--port", type=int, default=None,
@@ -150,13 +170,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "structural boundary "
                         "(overrides serving.reasoning_config)")
     p.add_argument("--tokenizer-mode", default=None,
-                   choices=["auto", "hf", "deepseek_v4"],
+                   choices=["auto", "hf", "deepseek_v4", "glm5_next"],
                    help="serving tokenizer mode (vLLM parity subset): "
                         "'auto' resolves from model.architecture "
-                        "(deepseek_v4 models → deepseek_v4), 'hf' forces "
-                        "the legacy behavior, 'deepseek_v4' switches "
-                        "chat-template kwarg normalization + thinking "
-                        "defaults to the DeepSeek-V4 rules "
+                        "(deepseek_v4 models → deepseek_v4, glm5_next "
+                        "models → glm5_next), 'hf' forces the legacy "
+                        "behavior, 'deepseek_v4' switches chat-template "
+                        "kwarg normalization + thinking defaults to the "
+                        "DeepSeek-V4 rules, 'glm5_next' to the GLM-5.3 "
+                        "rules (reasoning_effort low/high/max default "
+                        "max; clear_thinking default true for chat; "
+                        "thinking always on; generation_config.json "
+                        "sampling defaults) "
                         "(overrides serving.tokenizer_mode)")
     p.add_argument("--speculation-depth", type=int, default=None,
                    help="speculative decode depth; default derives from "
@@ -168,15 +193,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-engine", action="store_true",
                    help="start the engine with null backends (no CUDA) — "
                         "smoke-testing the serve stack only")
+    p.add_argument("--autoconfig", action="store_true",
+                   help="OPT-IN hardware-fit derivation (TD-AUTOCONFIG-"
+                        "HARDWARE-FIT): detect the hardware, derive a recipe "
+                        "from the config's autoconfig levers, persist it next "
+                        "to --config, and serve THAT recipe. Reuses the "
+                        "persisted recipe while the hardware fingerprint "
+                        "matches. Without this flag, autoconfig.enabled=true "
+                        "in the config re-derives/serves IN PLACE only when "
+                        "its output_path is the --config file itself; a "
+                        "differing output_path REFUSES rather than silently "
+                        "booting another file (TD-AUTOCONFIG-SERVE-"
+                        "SUBSTITUTES-THE-CONFIG)")
+    p.add_argument("--autoconfig-redetect", action="store_true",
+                   help="with --autoconfig: re-derive even if the stored "
+                        "hardware fingerprint still matches")
     return p
 
 
 def _resolve_tokenizer_mode(mode: str, architecture: str) -> str:
     """vLLM tokenizer-mode auto-default rule (ref/vllm
-    vllm/config/model.py:617): "auto" resolves to "deepseek_v4" for
-    deepseek_v4 models, else the legacy behavior ("hf")."""
+    vllm/config/model.py:617): "auto" resolves to the model-family mode
+    for architectures that have one ("deepseek_v4", "glm5_next"), else
+    the legacy behavior ("hf")."""
     if mode == "auto":
-        return "deepseek_v4" if architecture == "deepseek_v4" else "hf"
+        if architecture in ("deepseek_v4", "glm5_next"):
+            return architecture
+        return "hf"
     return mode
 
 
@@ -276,6 +319,35 @@ def resolve_tokenizer_dir(
         f"found in {candidate} — set serving.tokenizer_path in the config "
         "(GGUF-embedded tokenizers are not extracted; "
         "see TD-SERVE-GGUF-TOKENIZER)")
+
+
+def read_sampling_defaults(
+    tokenizer_dir: str | Path, tokenizer_mode: str,
+) -> dict:
+    """Model-recommended sampling defaults for the serving layer.
+
+    glm5_next only (GF3.13): GLM-5.3-Flash's generation_config.json
+    recommends temperature 1.0 / top_p 0.95.  The server applies ONLY
+    top_p, and only to requests that explicitly opt into sampling
+    (explicit temperature > 0) while leaving top_p unset — the
+    greedy-champion routing of unspecified temperature is deliberately
+    unchanged, and every other tokenizer mode returns {} so their
+    serving paths stay byte-identical.
+    """
+    if tokenizer_mode != "glm5_next":
+        return {}
+    path = Path(tokenizer_dir) / "generation_config.json"
+    try:
+        with open(path) as f:
+            gen = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        log.warning("cannot read %s — no sampling defaults applied", path)
+        return {}
+    defaults = {}
+    top_p = gen.get("top_p")
+    if isinstance(top_p, (int, float)) and 0.0 < float(top_p) <= 1.0:
+        defaults["top_p"] = float(top_p)
+    return defaults
 
 
 # ---------------------------------------------------------------------------
@@ -388,12 +460,18 @@ def build_stack(
     weights_path = model_cfg.get("weights_path") or ""
 
     # ── Tokenizer + chat template (before engine start: fail fast) ──────
+    sampling_defaults: dict = {}
     if tokenizer is None:
         tok_dir = resolve_tokenizer_dir(weights_path, opts.tokenizer_path)
         log.info("loading tokenizer from %s", tok_dir)
         tokenizer = TokenizerWrapper(str(tok_dir))
         if chat_template is None:
             chat_template = ChatTemplateRenderer(tok_dir)
+        sampling_defaults = read_sampling_defaults(
+            tok_dir, opts.tokenizer_mode)
+        if sampling_defaults:
+            log.info("sampling defaults (%s, generation_config.json): %s",
+                     opts.tokenizer_mode, sampling_defaults)
     elif chat_template is None:
         raise ValueError(
             "chat_template must be provided when tokenizer is injected")
@@ -470,6 +548,7 @@ def build_stack(
             reasoning_parser=opts.reasoning_parser,
             reasoning_config=_parse_reasoning_config(opts.reasoning_config),
             tokenizer_mode=opts.tokenizer_mode,
+            sampling_defaults=sampling_defaults,
         )
     except Exception:
         engine.stop_engine()
@@ -525,11 +604,127 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.model and not args.autoconfig:
+        log.error("--model requires --autoconfig (a hand recipe boots via "
+                  "--config)")
+        return 2
+    if (args.accuracy or args.prefer) and not args.autoconfig:
+        log.error("--accuracy/--prefer are autoconfig levers — pass "
+                  "--autoconfig (they change the derivation, not a served "
+                  "recipe)")
+        return 2
+    if not args.config and not args.model:
+        log.error("pass --config <recipe>, or --autoconfig --model "
+                  "<weights> to derive one")
+        return 2
+
+    # P-31: serve.py --autoconfig turns the serving-shape flags into HARD
+    # solver constraints (pins) — as ServeOptions overrides alone they
+    # would change the HTTP surface but not the engine sizing, which reads
+    # serving.* from the config file (the KV pool is sized for
+    # max_concurrent_requests concurrent sequences).
+    autoconfig_pins = None
+    if args.autoconfig and (args.max_sequence_length is not None
+                            or args.max_concurrent is not None):
+        from autoconfig.pins import parse_pin_args
+        pin_args = []
+        if args.max_sequence_length is not None:
+            pin_args.append(
+                f"serving.max_sequence_length={args.max_sequence_length}")
+        if args.max_concurrent is not None:
+            pin_args.append(
+                f"serving.max_concurrent_requests={args.max_concurrent}")
+        autoconfig_pins = parse_pin_args(pin_args)
+
+    if args.autoconfig and args.model and not args.config:
+        # derive-from-weights route: CPU-only, artifacts beside the
+        # weights reused; the derived recipe is then served like any
+        # --config file
+        from autoconfig.pipeline import derive_for_serve
+        rc, out = derive_for_serve(
+            args.model, repo_root=".",
+            prefer=args.prefer, accuracy=args.accuracy,
+            pins=autoconfig_pins, redetect=args.autoconfig_redetect)
+        if rc != 0:
+            log.error("autoconfig --model derivation failed (exit %d) — "
+                      "refusing to boot a guessed config", rc)
+            return rc
+        log.warning("autoconfig: derived %s from --model %s — serving it",
+                    out, args.model)
+        args.config = out
+        args.autoconfig = False   # derivation done; do not re-derive below
+                                  # (a pin-less re-derive would clobber the
+                                  # pinned recipe)
+
     try:
         config = load_config(args.config)
     except (OSError, json.JSONDecodeError) as exc:
         log.error("cannot load config %s: %s", args.config, exc)
         return 1
+    # Opt-in autoconfig (TD-AUTOCONFIG-HARDWARE-FIT): derive/reuse a
+    # hardware-fit recipe and re-point BOTH consumers of the config path at
+    # the persisted file (this dict AND the C++ start_engine(path) inside
+    # Orchestrator.boot must see the same bytes). Default OFF — a hand-tuned
+    # recipe always wins unless the flag or autoconfig.enabled asks.
+    #
+    # NEVER a silent substitution (TD-AUTOCONFIG-SERVE-SUBSTITUTES-THE-
+    # CONFIG): when the derived recipe is a DIFFERENT file than --config,
+    # serving it is either explicitly requested (--autoconfig, logged at
+    # WARNING with both paths) or REFUSED — autoconfig.enabled=true inside
+    # the config alone only re-derives/serves in place when output_path IS
+    # the --config file (a derived recipe refreshing itself). Booting a
+    # file other than the one on the command line silently invalidated
+    # A/B bisect arms.
+    if args.autoconfig or (config.get("autoconfig") or {}).get("enabled"):
+        from autoconfig.cli import default_output_path, run as autoconfig_run
+        out = ((config.get("autoconfig") or {}).get("output_path")
+               or default_output_path(args.config))
+        substitutes = os.path.realpath(out) != os.path.realpath(args.config)
+        if substitutes and not args.autoconfig:
+            log.error(
+                "config %s carries autoconfig.enabled=true with output_path "
+                "%s — refusing to boot a different file than --config "
+                "(TD-AUTOCONFIG-SERVE-SUBSTITUTES-THE-CONFIG). Either pass "
+                "--autoconfig to derive and serve the derived recipe, boot "
+                "the derived file directly (--config %s), or remove/disable "
+                "the config's autoconfig block to serve %s as-is.",
+                args.config, out, out, args.config)
+            return 2
+        rc = autoconfig_run(args.config, out,
+                            redetect=args.autoconfig_redetect,
+                            prefer=args.prefer, accuracy=args.accuracy,
+                            pins=autoconfig_pins)
+        if rc != 0:
+            log.error("autoconfig failed (exit %d) — refusing to boot a "
+                      "guessed config", rc)
+            return rc
+        if substitutes:
+            log.warning(
+                "autoconfig: --config %s is the derivation SOURCE — serving "
+                "the derived recipe %s instead (explicitly requested via "
+                "--autoconfig)", args.config, out)
+        else:
+            log.info("autoconfig: serving derived recipe %s (== --config)",
+                     out)
+        args.config = out
+        config = load_config(out)
+    # DETERMINISM SUPERFLAGS (flag 1: compute.deterministic /
+    # LS_DETERMINISTIC = run-to-run determinism; flag 2:
+    # compute.reference_trajectory_identity /
+    # LS_REFERENCE_TRAJECTORY_IDENTITY = reference-trajectory identity,
+    # which IMPLIES flag 1): applied on the FINAL config (post-autoconfig
+    # repoint), BEFORE the engine import inside build_stack — os.environ
+    # writes putenv through to the C++ getenv sites, and the engine's own
+    # registry apply then sees conforming values.  Refuses loudly (exit 2)
+    # on env pins that contradict the requested mode — including requesting
+    # flag 2 while suppressing flag 1 — instead of silently overriding.
+    from orchestrator.determinism import (DeterminismConflictError,
+                                          apply_deterministic_mode)
+    try:
+        apply_deterministic_mode(config)
+    except DeterminismConflictError as exc:
+        log.error("%s", exc)
+        return 2
     opts = resolve_options(config, args)
     try:
         stack = build_stack(opts, config=config)

@@ -52,9 +52,16 @@ struct LayerInfo {
 
 class LayerRegistry {
 public:
+    /// `gguf_widths` (GF3.15, TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): the
+    /// checkpoint's real per-tensor GGUF widths from a header pre-scan, so the
+    /// pinned region is sized at what the upload actually writes rather than a
+    /// BF16 upper bound. nullptr (the default, and every pure-config caller)
+    /// keeps the pre-load upper-bound sizing — an OVER-estimate, never an
+    /// under-estimate, so a caller without the file stays safe.
     LayerRegistry(const ModelConfig& model_cfg,
                   const config::Config& cfg,
-                  const QuantInterface& expert_quant);
+                  const QuantInterface& expert_quant,
+                  const GgufNonExpertWidths* gguf_widths = nullptr);
 
     // Layer access
     int num_layers() const { return static_cast<int>(layers_.size()); }

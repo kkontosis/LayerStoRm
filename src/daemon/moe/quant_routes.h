@@ -26,6 +26,7 @@
 #include "daemon/command_dispatcher.h"
 #include "core/expert_device.h"
 #include "core/memory/expert_cache.h"
+#include "model/quantization/gguf_compute_cast.h"
 #include "model/quantization/gguf_kquant.h"
 
 namespace layerstorm::daemon {
@@ -45,11 +46,13 @@ struct MoeQuantRoutes {
     int64_t gguf_up_off   = 0;
     int64_t gguf_down_off = 0;
 
-    // GG-5c: ordinal-preserving cast for the dense/shared structs' OWN
-    // per-projection model::GgufKQuantType (may differ from the routed
-    // types on a mixed-quant GGUF).
+    // GG-5c: conversion for the dense/shared structs' OWN per-projection
+    // model::GgufKQuantType (may differ from the routed types on a
+    // mixed-quant GGUF). Delegates to the static_assert-guarded bridge
+    // (gguf_compute_cast.h) — never a raw ordinal cast
+    // (TD-GGUF-ENUM-MXFP4-DIVERGENCE).
     static compute::GgufQuantType to_gguf_compute(model::GgufKQuantType t) {
-        return static_cast<compute::GgufQuantType>(static_cast<int>(t));
+        return model::gguf::to_compute_gguf(t);
     }
 
     // Per-projection in-slot offset: GGUF uses the per-layer offsets above;

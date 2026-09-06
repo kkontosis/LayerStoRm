@@ -541,6 +541,55 @@ TEST(TransferEngine, Staging_FlushRespectsMaxInflight) {
     event_ready = true;  // Allow drain() in destructor to complete.
 }
 
+// P-29 step 19 (LS_FAR_GATE_DISPATCH consumer): dispatch_staged_at_least
+// force-dispatches staged demand-priority transfers past max_inflight_per_gpu,
+// leaving lower-priority staged items untouched. Models the measured gated-
+// final fallback: the inflight window full of undetected copies (deferred
+// backend, events never ready) blocks the staged demand copy at flush time.
+TEST(TransferEngine, Staging_DispatchStagedAtLeastBypassesInflightCap) {
+    bool event_ready = false;
+    auto dc = make_deferred_context(event_ready, 1);
+    dc.opts.min_dispatch_per_gpu = 2;
+    dc.opts.max_inflight_per_gpu = 2;
+
+    lt::TransferEngine engine(std::move(dc.opts));
+    std::vector<uint8_t> buf(64);
+    const float demand = std::numeric_limits<float>::max();
+
+    // Fill the inflight window (dispatched, never detected — stale window).
+    engine.enqueue_h2d(ek(0, 0), 0, buf.data(), buf.data(), 64, 0.0f);
+    engine.enqueue_h2d(ek(0, 1), 0, buf.data(), buf.data(), 64, 0.0f);
+    EXPECT_TRUE(engine.is_dispatched_h2d(ek(0, 0), 0));
+
+    // Demand copy + a low-priority prefetch: both stage (window full).
+    auto td = engine.enqueue_h2d(ek(1, 0), 0, buf.data(), buf.data(), 64,
+                                 demand);
+    auto tp = engine.enqueue_h2d(ek(2, 0), 0, buf.data(), buf.data(), 64,
+                                 -1.0f);
+    ASSERT_TRUE(td.has_value());
+    ASSERT_TRUE(tp.has_value());
+    EXPECT_EQ(engine.staged_count(0), 2);
+
+    // flush_staged honors the cap — the demand copy stays staged (this is
+    // the fb_not_dispatched fallback shape).
+    engine.flush_staged();
+    EXPECT_EQ(engine.staged_count(0), 2);
+    EXPECT_FALSE(engine.is_dispatched_h2d(ek(1, 0), 0));
+
+    // Force-dispatch at demand priority: dispatches the demand copy past the
+    // cap, leaves the prefetch staged.
+    const int n = engine.dispatch_staged_at_least(0, demand);
+    EXPECT_EQ(n, 1);
+    EXPECT_TRUE(engine.is_dispatched_h2d(ek(1, 0), 0));
+    EXPECT_EQ(engine.staged_count(0), 1);
+    EXPECT_FALSE(engine.is_dispatched_h2d(ek(2, 0), 0));
+
+    // Out-of-range GPU is a no-op.
+    EXPECT_EQ(engine.dispatch_staged_at_least(7, demand), 0);
+
+    event_ready = true;  // Allow drain() in destructor to complete.
+}
+
 // ELB demand-join re-assertion: raising a staged transfer's priority reorders
 // the staged admission queue (a demand fetch joining a low-priority prefetch
 // must dispatch before other staged prefetches).

@@ -280,13 +280,29 @@ float compute_determinant(const float* Q, int d) {
 
 // ── TqResources ─────────────────────────────────────────────────────────────
 
+namespace {
+// TD-TQ-MTP-PI-RANGE: fail LOUD in every build. The debug-only assert let a
+// release build read out of bounds when a layer beyond the sized count (e.g.
+// an MTP layer TqResources was not sized for) asked for its rotation.
+[[noreturn]] void tq_pi_range_fail(int layer_idx, size_t sized) {
+    throw std::out_of_range(
+        "TQ device_Pi: layer " + std::to_string(layer_idx)
+        + " outside the sized rotation count " + std::to_string(sized)
+        + " — TqResources was not sized for this layer "
+        "(TD-TQ-MTP-PI-RANGE: KV layers = num_hidden_layers + "
+        "num_nextn_predict_layers)");
+}
+}  // namespace
+
 const float* TqResources::device_Pi(int layer_idx) const {
-    assert(layer_idx >= 0 && layer_idx < static_cast<int>(rotations.size()));
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(rotations.size()))
+        tq_pi_range_fail(layer_idx, rotations.size());
     return rotations[layer_idx].d_Pi;
 }
 
 const float* TqResources::device_Pi_t(int layer_idx) const {
-    assert(layer_idx >= 0 && layer_idx < static_cast<int>(rotations.size()));
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(rotations.size()))
+        tq_pi_range_fail(layer_idx, rotations.size());
     return rotations[layer_idx].d_Pi_t;
 }
 

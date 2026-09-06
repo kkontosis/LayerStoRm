@@ -13,6 +13,7 @@
 // and per-device reconciliation overhead/added time (recon_*). The compute + recon
 // passes need an ExpertDevice per GPU; pass them alongside the DeviceBackends (paired
 // by GpuRef.position). When absent (transfer-only call), those fields stay at defaults.
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,30 @@ LoaderConstants load_or_calibrate(CalibrationMode mode, const std::string& path,
                                   const std::vector<compute::DeviceBackend*>& backends,
                                   memory::NumaManager& numa,
                                   const std::vector<compute::ExpertDevice*>& experts = {});
+
+// The measurement step of load_or_calibrate, as a value. It is invoked with the
+// mode the precedence rules RESOLVED TO — kLoaded escalates to kFull when the file
+// is missing, unreadable or rejected — so it is never called with kLoaded.
+using CalibrateFn = std::function<LoaderConstants(CalibrationMode)>;
+
+// Validity check applied to a file that PARSED, before it is accepted (kLoaded
+// only). Return false to treat the file as unusable — it is then recalibrated and
+// overwritten, exactly like an unreadable one. This is where a caller enforces that
+// the constants belong to THIS model and THIS machine (compute_dims_match,
+// INV-LOADER-CAL-4; device UUIDs, INV-LOADER-CAL-6). Empty ⇒ accept whatever parsed.
+using AcceptFn = std::function<bool(const LoaderConstants&)>;
+
+// THE self-heal control flow, with the measurement step (and the accept check)
+// injected: file missing / unreadable / rejected → escalate kLoaded to kFull →
+// measure → write the file → the next run loads it. This is the ONLY implementation
+// — the backends/numa overload above is a thin wrapper that supplies the real
+// `calibrate()`, and the engine's init hook calls this directly because it needs a
+// model-specific CalibrationConfig plus the identity check. Tests drive it with a
+// synthetic calibrator to cover the flow inside the Tier-1 budget (no CUDA, no
+// sysfs, no hardware probing — spec/TESTING.md).
+LoaderConstants load_or_calibrate_with(CalibrationMode mode, const std::string& path,
+                                       const CalibrateFn& calibrate_fn,
+                                       const AcceptFn& accept_fn = {});
 
 // Run the calibration across all devices × banks, returning a filled
 // LoaderConstants (source = "calibrated"). `backends[k]` is the DeviceBackend for

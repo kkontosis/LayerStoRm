@@ -7,6 +7,9 @@
 
 #include "compute/kernels/attention/tq_mla_attention.h"
 
+#include <stdexcept>
+#include <string>
+
 // TQ decode param + run_ declarations
 #include "sm120/decode/tq_dense/params.h"
 #include "sm120/decode/tq_sparse/params.h"
@@ -85,13 +88,33 @@ void launch_prefill_dense_tq(
     // kernel below handles s_kv == 0 (zero output, lse = +inf).
     if (dequant_params.num_fetch > 0)
         sm120::prep::run_tq_dequant_ckv_indexed(dequant_params, stream);
-    // Step 2: Standard BF16 absorbed dense prefill
-    // DET-REDUCE: pick the deterministic instantiation when requested.
+    // Step 2: Standard BF16 absorbed dense prefill.
+    // GEOMETRY: same (d_qk, d_v) key as the SnapMLA twin — <576> for the
+    // V3.2/GLM-5.2 absorbed geometry, <512> for GLM5N NoPE (which REQUIRES
+    // d_v == 512, since Traits<512> reads V over columns [0, 512) of the same
+    // dequanted rows). Anything else has no correct instantiation.
     using namespace sm120::prefill::dense::head64;
-    if (prefill_params.deterministic_reduce)
-        run_dense_fwd_phase1_kernel<576, true>(prefill_params);
-    else
-        run_dense_fwd_phase1_kernel<576, false>(prefill_params);
+    if (!(prefill_params.d_qk == 576 ||
+          (prefill_params.d_qk == 512 && prefill_params.d_v == 512))) {
+        throw std::runtime_error(
+            "launch_prefill_dense_tq: no dense prefill instantiation for d_qk=" +
+            std::to_string(prefill_params.d_qk) +
+            " d_v=" + std::to_string(prefill_params.d_v) +
+            " (have <576> for V3.2/GLM-5.2 and <512> for the GLM5N NoPE "
+            "geometry, which REQUIRES d_v == 512)");
+    }
+    // DET-REDUCE: pick the deterministic instantiation when requested.
+    if (prefill_params.deterministic_reduce) {
+        if (prefill_params.d_qk == 576)
+            run_dense_fwd_phase1_kernel<576, true>(prefill_params);
+        else
+            run_dense_fwd_phase1_kernel<512, true>(prefill_params);
+    } else {
+        if (prefill_params.d_qk == 576)
+            run_dense_fwd_phase1_kernel<576, false>(prefill_params);
+        else
+            run_dense_fwd_phase1_kernel<512, false>(prefill_params);
+    }
 }
 
 // ── TQ Prefill Sparse (composite) ──────────────────────────────────────────
@@ -107,6 +130,17 @@ void launch_prefill_sparse_tq(
     // DET-REDUCE (TD-SPARSE-PREFILL-DETREDUCE): pick the deterministic
     // instantiation when requested (same runtime gate as the dense twin).
     using namespace sm120::prefill::sparse::head64;
+    // GEOMETRY: <512> is the GLM5N NoPE geometry and REQUIRES d_v == 512 (see
+    // the SnapMLA twin in mla_attention.cu for the full argument).
+    if (!(prefill_params.d_qk == 576 ||
+          (prefill_params.d_qk == 512 && prefill_params.d_v == 512))) {
+        throw std::runtime_error(
+            "launch_prefill_sparse_tq: no sparse prefill instantiation for "
+            "d_qk=" + std::to_string(prefill_params.d_qk) +
+            " d_v=" + std::to_string(prefill_params.d_v) +
+            " (have <576> for V3.2/GLM-5.2 and <512> for the GLM5N NoPE "
+            "geometry, which REQUIRES d_v == 512)");
+    }
     if (prefill_params.deterministic_reduce) {
         if (prefill_params.d_qk == 576)
             run_fwd_phase1_kernel<576, true>(prefill_params);

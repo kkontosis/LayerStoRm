@@ -51,11 +51,21 @@ lc::Config small_config() {
         {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
                           {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
         {"hardware", {
-            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1}},
-                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1}}}},
+            // Pin an explicit expert-cache budget: the auto expert reserve
+            // shrank to the bare top-K minimum once the KV pool became
+            // demand-sized (see command_dispatcher_test.cpp small_config()).
+            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}},
+                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}}}},
             {"tp_array", {0, 1}},
             {"system_ram_gb", 64}}},
-        {"memory", {{"vram_safety_margin_gb", 0.1}}},
+        // prefill_scratch_preallocated_gb 0: Tier-1 scratch would otherwise
+        // cover the whole naive-prefill demand and the streaming SPILL
+        // sub-zone would size to zero — SpillModeSkipsLockedExperts needs a
+        // real spill slot to exercise the lock-vs-spill-mode interaction.
+        {"memory", {{"vram_safety_margin_gb", 0.1},
+                    {"kv_cache", {{"prefill_scratch_preallocated_gb", 0.0}}}}},
     };
     return lc::parse_config(j);
 }
@@ -208,7 +218,8 @@ TEST(ExpertCacheLock, SpillModeSkipsLockedExperts) {
 
     // Reserve one expert in the streaming zone (goes to spill sub-allocator).
     auto k0 = key(2, 0);
-    ctx.cache.reserve(k0, 0, lmem::CacheZone::kStreaming);
+    ASSERT_NE(ctx.cache.reserve(k0, 0, lmem::CacheZone::kStreaming), nullptr)
+        << "streaming-zone reserve failed — fixture expert budget too small";
     ctx.cache.mark_all_ready(k0, 0);
 
     // Verify it's in spill zone.

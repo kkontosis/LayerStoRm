@@ -45,6 +45,8 @@ from bridge.protocol import (
     CMD_SAMPLE_TOKENS,
     CMD_SEQ_CREATE,
     CMD_SEQ_FORK,
+    CMD_SEQ_FORK_FROZEN,
+    CMD_SEQ_HIBERNATE,
     CMD_SEQ_FREE,
     CMD_SLOT_BYTES,
     CMP_CHECKPOINT,
@@ -58,6 +60,10 @@ from bridge.protocol import (
     D_B_CMD_RUN_ATTENTION,
     D_B_CMD_RUN_MOE,
     D_CMD_RUN_DSPARK_STEP,
+    D_CMD_MTP_PROJECT,
+    D_CMD_KDA_SNAPSHOT,
+    D_CMD_KDA_RESTORE,
+    D_CMD_KDA_CKPT,
     E_CMD_FETCH_AND_RUN_MOE,
     E_CMD_FETCH_AND_RUN_MOE_BIG,
     E_CMD_REEF_ROUTE,
@@ -170,6 +176,16 @@ class Cmp:
     entropy: float = 0.0
     err_msg: str = ""
     err_category: int = 0    # CMP_ERROR only (CmpErrorCategory value)
+    # TD-MOE-PROGRESSIVE-DEGRADED-SILENT: 1 = this layer's progressive MoE
+    # finalized DEGRADED (router-selected experts left out for a capacity /
+    # deadline reason).  EngineBridge counts these into moe_degraded_layers.
+    moe_degraded: int = 0
+    # TD-INDEXER-NO-DENSE-FALLBACK witness: 1 = the attention step behind
+    # this completion ran (some row) DSA-DENSE because of dead indexer
+    # coverage.  With reserve-at-admission live this MUST stay 0 — the
+    # bridge counts any occurrence into indexer_dense_steps (a bug witness,
+    # never an accepted degradation).
+    indexer_dense: int = 0
 
 
 def _parse_completion(data: bytes) -> Cmp:
@@ -182,7 +198,9 @@ def _parse_completion(data: bytes) -> Cmp:
     p = c.payload.compute
     return Cmp(c.cmp_type, c.cmd_seq, c.gpu_idx, c.status,
                p.cmd_type, p.layer_idx, p.host_buf_offset, p.data_bytes,
-               p.top1_prob, p.entropy)
+               p.top1_prob, p.entropy,
+               moe_degraded=int(p.moe_degraded),
+               indexer_dense=int(p.indexer_dense))
 
 
 # ── 13c-2.0 test-side per-GPU LRU (GpuLru port, dsp52_test.cpp) ─────────────
@@ -285,6 +303,11 @@ class EngineBridge:
         self.num_layers = int(info.num_layers)
         self.num_experts = int(info.num_experts)
         self.moe_batch_capacity = int(info.moe_batch_capacity)
+        # P-30 step 1: realized single-shot MoE chunk bound (0 on engines
+        # predating the field). The EP-beyond-TP superchunk stride must
+        # clamp to this — TD-MOE-EP-XTP-WAVES.
+        self.moe_chunk_capacity = int(getattr(info, "moe_chunk_capacity", 0)
+                                      or 0)
         self.vocab_size = int(vocab_size)
         self.first_moe_layer = int(first_moe_layer)
         self.hidden_buf_id = int(hidden_buf_id)
@@ -318,6 +341,20 @@ class EngineBridge:
         # cmd_seq starts at 1 (C++ drivers reserve-ish 0).
         self._seq = 1
         self.fire_forget_seqs: set[int] = set()
+        # TD-MOE-PROGRESSIVE-DEGRADED-SILENT: monotonic count of DEGRADED
+        # progressive-MoE layer finalizes seen on the completion ring
+        # (Completion.compute.moe_degraded).  Every completion consumed by
+        # this bridge is counted, whatever wait() does with it.  The
+        # orchestrator snapshots it per request (delta = degraded layers in
+        # that request) so serving can retry and identity harnesses can
+        # discard the request instead of trusting a daemon log line.
+        self.moe_degraded_layers = 0
+        # TD-INDEXER-NO-DENSE-FALLBACK: monotonic count of attention-step
+        # completions flagged indexer_dense (a sequence served DSA-DENSE
+        # rows).  Snapshotted per request by the orchestrator; ANY nonzero
+        # delta is a bug witness (reserve-at-admission makes provisioning
+        # infallible; the remaining kDead sites have no live producer).
+        self.indexer_dense_steps = 0
         # DSP52_OVERLAP async draft stash (dspark_send_async/collect).
         self._dspark_pending_seq = 0
         self._dspark_cmp: Cmp | None = None
@@ -383,7 +420,12 @@ class EngineBridge:
                              self._cmp_mask, self._cmp_slot_bytes)
             if t is None:
                 return None
-            return Cmp(*t)
+            out = Cmp(*t)
+            if out.moe_degraded:
+                self.moe_degraded_layers += 1
+            if out.indexer_dense:
+                self.indexer_dense_steps += 1
+            return out
         hdr = RingHeader.from_address(self._cmp_hdr)
         cons = hdr.consumer_seq
         prod = ctypes.c_uint64.from_address(
@@ -393,7 +435,12 @@ class EngineBridge:
         src = self._cmp_slots + (cons & self._cmp_mask) * self._cmp_slot_bytes
         data = ctypes.string_at(src, self._cmp_slot_bytes)
         hdr.consumer_seq = cons + 1
-        return _parse_completion(data)
+        out = _parse_completion(data)
+        if out.moe_degraded:
+            self.moe_degraded_layers += 1
+        if out.indexer_dense:
+            self.indexer_dense_steps += 1
+        return out
 
     def wait(self, expected: int, timeout_s: float = 300.0,
              ctx: str = "") -> Cmp:
@@ -414,6 +461,15 @@ class EngineBridge:
                                  deadline - time.monotonic())
                 kind = r[0]
                 if kind == "ok":
+                    # ('ok', ..., top1, entropy[, moe_degraded[,
+                    # indexer_dense]]) — older _fastbridge builds return
+                    # shorter tuples (same degrade pattern as the 'err' arm).
+                    deg = int(r[9]) if len(r) > 9 else 0
+                    if deg:
+                        self.moe_degraded_layers += 1
+                    idense = int(r[10]) if len(r) > 10 else 0
+                    if idense:
+                        self.indexer_dense_steps += 1
                     # Fire-and-forget completions can share the expected
                     # TYPE — drop by cmd_seq first (C++ wait() order).
                     if (self.fire_forget_seqs
@@ -421,7 +477,8 @@ class EngineBridge:
                         self.fire_forget_seqs.discard(r[1])
                         continue
                     return Cmp(expected, r[1], 0, r[2], r[3], r[4], r[5],
-                               r[6], r[7], r[8])
+                               r[6], r[7], r[8], moe_degraded=deg,
+                               indexer_dense=idense)
                 if kind == "err":
                     seq, msg = r[1], r[2]
                     # r[3] = error_category (older _fastbridge builds
@@ -445,10 +502,19 @@ class EngineBridge:
                         category=cat)
                 if kind == "dspark":
                     self._dspark_cmp = Cmp(*r[1])
+                    if self._dspark_cmp.moe_degraded:
+                        self.moe_degraded_layers += 1
+                    if self._dspark_cmp.indexer_dense:
+                        self.indexer_dense_steps += 1
                     self._dspark_pending_seq = 0
                     continue
                 if kind == "other":
-                    seq = r[1][1]
+                    t = r[1]
+                    seq = t[1]
+                    if len(t) > 12 and t[12]:      # moe_degraded byte
+                        self.moe_degraded_layers += 1
+                    if len(t) > 13 and t[13]:      # indexer_dense byte
+                        self.indexer_dense_steps += 1
                     if self.fire_forget_seqs and seq in self.fire_forget_seqs:
                         self.fire_forget_seqs.discard(seq)
                     continue
@@ -595,20 +661,37 @@ class EngineBridge:
 
     # ── sequence lifecycle ───────────────────────────────────────────────
 
-    def create_sequence(self, seq_id: int, prompt_len: int) -> None:
-        if self._v2:
+    def create_sequence(self, seq_id: int, prompt_len: int,
+                        reserve_tokens: int = 0) -> int:
+        """CMD_SEQ_CREATE.  ``reserve_tokens`` (TD-INDEXER-NO-DENSE-
+        FALLBACK Route 1): total context this sequence may EVER reach —
+        prompt + generation budget + speculative-overshoot margin.  On DSA
+        paged-indexer models the engine commits the sequence's indexer-K
+        pages for min(reserve_tokens, max_sequence_length) at create, so
+        provisioning can never fail mid-request (the failure mode was a
+        SILENT permanent dense downgrade, ~10x slower).  A create that
+        cannot reserve raises the RETRYABLE pool-exhaustion error the
+        admission evict-retry seam already answers.  Returns the GRANTED
+        reservation in tokens (0 = none: legacy engine, non-DSA model, or
+        reserve_tokens=0) — the caller must cap generation so positions
+        stay inside it."""
+        if self._v2 and getattr(_fb, "API_VERSION", 2) >= 3:
             if not _fb.send_seq_create(*self._cargs, self._next_seq(),
-                                       seq_id, prompt_len):
+                                       seq_id, prompt_len, reserve_tokens):
                 raise BridgeError("command ring full")
         else:
             c = self._cmd(CMD_SEQ_CREATE)
             c.payload.seq_create.seq_id = seq_id
             c.payload.seq_create.prompt_len = prompt_len
             c.payload.seq_create.pool = 0
+            c.payload.seq_create.reserve_tokens = reserve_tokens
             self.send(c)
         out = self.wait(CMP_SEQ_OP_DONE, ctx=f"seq_create {seq_id}")
         if out.status != 0:
             raise BridgeError(f"seq_create {seq_id} status {out.status}")
+        # Granted reservation: seq_op.reserved_tokens ALIASES the generic
+        # completion view's data_bytes (documented union overlap).
+        return int(out.data_bytes)
 
     def free_sequence(self, seq_id: int) -> None:
         if self._v2:
@@ -624,11 +707,49 @@ class EngineBridge:
         except BridgeError as e:      # teardown best-effort (C++ parity)
             print(f"  [bridge] seq_free {seq_id}: {e}", flush=True)
 
-    def fork_sequence(self, src_seq_id: int, dst_seq_id: int) -> None:
+    def fork_sequence(self, src_seq_id: int, dst_seq_id: int,
+                      frozen: bool = False, prefix_len: int = 0,
+                      reserve_tokens: int = 0) -> int:
         """CMD_SEQ_FORK: CoW-fork src's KV (+ DSA indexer-K) pages into
         dst — the prefix-cache / speculative-fork primitive. Raises on
-        pool exhaustion (caller may evict and retry)."""
-        if self._v2:
+        pool exhaustion (caller may evict and retry).
+
+        ``frozen`` (R3, TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE): the dst
+        is a FROZEN prefix holder that never appends — the engine skips
+        both CoW frontier splits (kMain logical group + indexer-K group),
+        making registration a pure refcount share with zero page cost in
+        either pool; the next fork FROM the holder performs the CoW.
+        Sent via the generic ring path (not the fastbridge v2 hot path —
+        registration is once per request).
+
+        ``prefix_len`` (R4a truncating fork): 0 = full fork (legacy,
+        byte-identical); N > 0 = the child takes only the parent's first
+        N tokens (KV pages to ceil(N/page_size), straddling group CoW'd
+        for a live child; indexer-K + coverage clamped; fresh rewind
+        epoch).  Engine-REJECTED wherever the arch carries lossy
+        position-indexed state (in-place pos%capacity rings — V4 side
+        tiers; the AttentionArch property behind
+        EngineInfo.seq_fork_truncatable): such rings cannot be truncated
+        from live state, and the caller (R4c) must not offer mid-edge
+        reuse there.  Truncating forks ride
+        the generic ring path (mid-edge reuse is once per request, like
+        registration); the fastbridge v2 hot path stays full-fork-only
+        (its slot memset zeroes prefix_len — wire-compatible).
+
+        ``reserve_tokens`` (TD-INDEXER-NO-DENSE-FALLBACK Route 1): the
+        CHILD's indexer-K reservation target — same semantics as
+        create_sequence's.  A hit-child fork that cannot reserve raises
+        the retryable pool-exhaustion error (fork evict-retry seam);
+        ignored on frozen forks.  Returns the GRANTED reservation in
+        tokens (0 = none)."""
+        if frozen or prefix_len or reserve_tokens:
+            c = self._cmd(CMD_SEQ_FORK_FROZEN if frozen else CMD_SEQ_FORK)
+            c.payload.seq_fork.src_seq_id = src_seq_id
+            c.payload.seq_fork.dst_seq_id = dst_seq_id
+            c.payload.seq_fork.prefix_len = prefix_len
+            c.payload.seq_fork.reserve_tokens = 0 if frozen                 else reserve_tokens
+            self.send(c)
+        elif self._v2:
             if not _fb.send_seq_fork(*self._cargs, self._next_seq(),
                                      src_seq_id, dst_seq_id):
                 raise BridgeError("command ring full")
@@ -642,6 +763,49 @@ class EngineBridge:
         if out.status != 0:
             raise BridgeError(
                 f"seq_fork {src_seq_id}->{dst_seq_id} status {out.status}")
+        return int(out.data_bytes)  # seq_op.reserved_tokens (union alias)
+
+    def hibernate_sequence(self, seq_id: int, kv_len: int) -> None:
+        """CMD_SEQ_HIBERNATE (R3 holder hibernation): demote a FROZEN
+        holder's hot kMain pages to the tiering cold pool.  ``kv_len`` is
+        the holder's KV coverage in tokens — only pages strictly below
+        logical kv_len/page_size demote; the write-frontier page and the
+        parent's over-allocated pages (windowed admission) stay hot so a
+        hit-child's first chunk write stays on the hot path.  A frozen
+        holder never steps, so window demotion never reaches it — without
+        this, whatever was hot at fork time stays VRAM-pinned for the
+        holder's life (measured ~5,100 pages/rank per deep holder on the
+        GLM champion).  No-op success on arms without a tiering manager
+        (V4)."""
+        c = self._cmd(CMD_SEQ_HIBERNATE)
+        c.payload.seq_hibernate.seq_id = seq_id
+        c.payload.seq_hibernate.kv_len = kv_len
+        self.send(c)
+        out = self.wait(CMP_SEQ_OP_DONE, ctx=f"seq_hibernate {seq_id}")
+        if out.status != 0:
+            raise BridgeError(f"seq_hibernate {seq_id} status {out.status}")
+
+    def spill_sequence(self, seq_id: int, kv_len: int) -> tuple[int, int]:
+        """CMD_SEQ_HIBERNATE with spill=1 (TD-PREFIX-TIDY-COLD-SPILL):
+        take the SECOND tiering hop — hibernate the frozen holder (no-op
+        if already hibernated) and spill its settled COLD pages to one
+        file under the engine's configured spill directory, returning
+        their pinned cold-pool slots.  Returns ``(status, spilled_pages)``
+        — status 0 = ok (spilled_pages may be 0: nothing cold / spilling
+        disabled engine-side / V4 arm), status 2 = refused by the spill
+        byte cap (evict a spilled holder — deleting its file — and
+        retry).  Any other status raises."""
+        c = self._cmd(CMD_SEQ_HIBERNATE)
+        c.payload.seq_hibernate.seq_id = seq_id
+        c.payload.seq_hibernate.kv_len = kv_len
+        c.payload.seq_hibernate.spill = 1
+        self.send(c)
+        out = self.wait(CMP_SEQ_OP_DONE, ctx=f"seq_spill {seq_id}")
+        if out.status not in (0, 2):
+            raise BridgeError(f"seq_spill {seq_id} status {out.status}")
+        # Spilled page count rides the seq_op.reserved_tokens union alias
+        # (Cmp.data_bytes), same as seq_create's granted reservation.
+        return int(out.status), int(out.data_bytes or 0)
 
     # ── expert placement + 13c-2.0 LRU eviction map ──────────────────────
 
@@ -775,6 +939,10 @@ class EngineBridge:
                     f"routing-export mismatch in REEF_ROUTE (L{layer})")
             if n == -4:
                 raise BridgeError(f"no routed experts exported L{layer}")
+            if n == -5:
+                raise BridgeError(
+                    f"num_experts {self.num_experts} exceeds the fastbridge "
+                    f"512-expert bound (L{layer})")
             out = self.wait(CMP_COMPUTE_DONE, ctx=f"reef route L{layer}")
             if out.status != 0:
                 raise BridgeError(f"reef route L{layer} status {out.status}")
@@ -801,9 +969,10 @@ class EngineBridge:
 
     def _send_far_cmd(self, layer: int, num_seqs: int, *, is_prefill: int,
                       chunk_start: int, chunk_len: int,
-                      timeout_us: int) -> None:
+                      timeout_us: int, spec_verify: int = 0,
+                      kda_snap_mask: int = 0) -> None:
         mode = 1 if self.route_arm == "reef" else 0
-        if self._v2:
+        if self._v2 and not spec_verify:
             if not _fb.send_far_layer(*self._cargs, self._next_seq(),
                                       layer, num_seqs, chunk_start,
                                       chunk_len, timeout_us, is_prefill,
@@ -819,6 +988,8 @@ class EngineBridge:
             p.timeout_us = timeout_us
             p.is_prefill = is_prefill
             p.route_mode = mode
+            p.spec_verify = spec_verify        # P-29 step 13 phase B
+            p.kda_snap_mask = kda_snap_mask
             self.send(c)
 
     def _far_layer(self, layer: int, num_seqs: int, *, is_prefill: int,
@@ -837,7 +1008,8 @@ class EngineBridge:
 
     def _far_sweep_burst(self, num_seqs: int, *, is_prefill: int,
                          chunk_start: int, chunk_len: int, timeout_us: int,
-                         moe_ms: list | None = None) -> int:
+                         moe_ms: list | None = None, spec_verify: int = 0,
+                         kda_snap_mask: int = 0) -> int:
         """FAR-arm layer sweep with PIPELINED sends (sliding in-flight
         window): publish FAR commands for all layers back-to-back so the
         daemon executes the sweep in ring order with NO Python turnaround
@@ -896,7 +1068,9 @@ class EngineBridge:
                 break            # stop sending; drain what is already out
             self._send_far_cmd(layer, num_seqs, is_prefill=is_prefill,
                                chunk_start=chunk_start,
-                               chunk_len=chunk_len, timeout_us=timeout_us)
+                               chunk_len=chunk_len, timeout_us=timeout_us,
+                               spec_verify=spec_verify,
+                               kda_snap_mask=kda_snap_mask)
             pending.append(layer)
         while head < len(pending):
             collect_one()
@@ -931,6 +1105,10 @@ class EngineBridge:
                     f"routing-export mismatch in FETCH_AND_RUN (L{layer})")
             if n == -4:
                 raise BridgeError(f"no routed experts exported L{layer}")
+            if n == -5:
+                raise BridgeError(
+                    f"num_experts {self.num_experts} exceeds the fastbridge "
+                    f"512-expert bound (L{layer})")
             count = n
         else:
             topk = self.read_routing_union(layer, num_seqs)
@@ -1007,12 +1185,17 @@ class EngineBridge:
             raise BridgeError(f"moe-big L{layer} status {out.status}")
 
     def _output_head(self, num_tokens: int, *, readback: bool,
-                     readback_logits: bool = False) -> Cmp:
+                     readback_logits: bool = False,
+                     mtp_head: int = 0, norm_only: bool = False,
+                     input_row: int = 0) -> Cmp:
         # readback_logits (guided decoding) rides the ctypes packing even
         # when the v2 fast path is loaded: constrained steps are rare and
         # never wall-critical, so the .pyx stays untouched (the champion
         # fast path is byte-identical for unconstrained requests).
-        if self._v2 and not readback_logits:
+        # mtp_head (P-29 step 11 probe): shared_head.norm + shared lm_head — also
+        # ctypes-only (the probe always pairs it with readback_logits).
+        if self._v2 and not readback_logits and not mtp_head \
+                and not norm_only and not input_row:
             if not _fb.send_head(*self._cargs, self._next_seq(), num_tokens,
                                  self.hidden_buf_id, self.logits_buf_id,
                                  1 if readback else 0):
@@ -1026,8 +1209,10 @@ class EngineBridge:
             p.readback_to_host = 1 if readback else 0
             p.compute_confidence = 1
             p.num_logprobs = 0
-            p.mtp_head = 0
+            p.mtp_head = mtp_head
             p.readback_logits = 1 if readback_logits else 0
+            p.norm_only = 1 if norm_only else 0
+            p.input_row = input_row
             self.send(c)
         out = self.wait(CMP_COMPUTE_DONE, ctx="output_head")
         if out.status != 0:
@@ -1178,6 +1363,63 @@ class EngineBridge:
         r.timings.total_ms = (time.monotonic() - t_start) * 1e3
         return r
 
+    def mtp_probe_step(self, input_token: int, seq_id: int, token_pos: int,
+                       timeout_us: int) -> dict:
+        """P-29 step 11 / OQ-3 phase A: ONE forward-only MTP draft step, composed
+        from the production commands (ipc_protocol.h D_CMD_MTP_PROJECT doc):
+
+          MTP_PROJECT(prev_src=1: hnorm the post-final-norm collapsed hidden
+          the trunk step's OUTPUT_HEAD just produced — the vLLM glm5next
+          reference's previous_hidden_states) -> RUN_ATTENTION(mtp_layer,
+          emit/store gating) -> FETCH_AND_RUN_MOE(mtp_layer) ->
+          OUTPUT_HEAD(mtp_head=1, full-logits readback).
+
+        MUST be called immediately after a decode_step_fetch_and_run(...,
+        logits_readback=True) for (seq_id, token_pos): the projection reads
+        the head's norm scratch, and the lock-step completion waits make the
+        ordering safe. `input_token` is the NEXT position's token (the MTP
+        conditions on token t+1 to predict t+2). Layer-45 KV/indexer state
+        appends at token_pos, building the MTP layer's own context
+        incrementally as the caller walks the corpus. Requires a boot with
+        LS_MTP_PROBE=1 (layer-45 experts arena-resident); tp==1 only.
+        Returns per-phase host ms for the D_mtp estimate."""
+        t = {}
+        mtp_layer = self.num_layers
+        t0 = time.monotonic()
+        c = self._cmd(D_CMD_MTP_PROJECT)
+        p = c.payload.mtp_project
+        p.mtp_layer_idx = mtp_layer
+        p.input_token_id = input_token
+        p.step_idx = 0
+        p.hidden_row = 0
+        p.prev_src = 1
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="mtp_project")
+        if out.status != 0:
+            raise BridgeError(f"mtp_project status {out.status}")
+        t["project_ms"] = (time.monotonic() - t0) * 1e3
+
+        t0 = time.monotonic()
+        self.write_batch_descriptors(seq_id, token_pos, 1)
+        self._run_attention(mtp_layer, 1, is_prefill=0, chunk_start=0,
+                            chunk_len=0, is_moe=True)
+        t["attn_ms"] = (time.monotonic() - t0) * 1e3
+
+        t0 = time.monotonic()
+        topk = self.read_routing_union(mtp_layer, 1)
+        if not topk:
+            raise BridgeError("mtp_probe_step: no routed experts exported")
+        count = self.fill_moe_entries(mtp_layer, topk, None)
+        self._fetch_and_run_moe(mtp_layer, 1, count, False, timeout_us)
+        t["moe_ms"] = (time.monotonic() - t0) * 1e3
+
+        t0 = time.monotonic()
+        self._output_head(1, readback=False, readback_logits=True,
+                          mtp_head=1)
+        t["head_ms"] = (time.monotonic() - t0) * 1e3
+        t["experts"] = topk
+        return t
+
     def verify_step_fetch_and_run(self, toks: list[int], seq_id: int,
                                   pos0: int, lrus: list[GpuLru] | None,
                                   *, prefetch: bool = False,
@@ -1261,6 +1503,193 @@ class EngineBridge:
         r.timings.total_ms = (time.monotonic() - t_start) * 1e3
         return r
 
+    # ── P-29 step 13 phase B: MTP gamma=2 speculation primitives ────────────────
+
+    def kda_snapshot(self, seq_id: int, pos: int) -> int:
+        """D_CMD_KDA_SNAPSHOT: whole-slot KDA anchor at the uniform
+        frontier `pos` (INV-KDA-REWIND anchor-and-replay). Returns the
+        anchor slot index."""
+        c = self._cmd(D_CMD_KDA_SNAPSHOT)
+        p = c.payload.kda_anchor
+        p.seq_id = seq_id
+        p.pos = pos
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="kda_snapshot")
+        if out.status != 0:
+            raise BridgeError(f"kda_snapshot status {out.status}")
+        return out.data_bytes
+
+    def kda_restore(self, seq_id: int, pos: int) -> int:
+        """D_CMD_KDA_RESTORE: restore the anchor recorded at `pos` and roll
+        every linear layer's frontier there. Loud when no anchor matches."""
+        c = self._cmd(D_CMD_KDA_RESTORE)
+        p = c.payload.kda_anchor
+        p.seq_id = seq_id
+        p.pos = pos
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="kda_restore")
+        if out.status != 0:
+            raise BridgeError(f"kda_restore status {out.status}")
+        return out.data_bytes
+
+    # ── P-29 step 24: KDA prefix checkpoints (LS_KDA_PREFIX_CKPT) ────────────
+
+    def kda_ckpt(self, seq_id: int, pos: int) -> tuple[int, int]:
+        """D_CMD_KDA_CKPT: capture a position-keyed UNCOMPRESSED host-RAM
+        checkpoint of the sequence's whole KDA state slot at the uniform
+        frontier `pos` (must be a positive multiple of 64 — the
+        INV-KDA-CARRY grid). Returns (status, host_bytes): status 0 =
+        captured (host_bytes consumed; 0 = duplicate position, already
+        held), status 1 = skipped on host-allocation failure (capacity,
+        never correctness — serving continues without a reuse point).
+        Precondition violations (unknown seq, bad pos, non-uniform
+        frontier) raise BridgeError — the capture TRIPWIRE class; the
+        orchestrator counts them and they must read 0."""
+        c = self._cmd(D_CMD_KDA_CKPT)
+        p = c.payload.kda_anchor
+        p.seq_id = seq_id
+        p.pos = pos
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="kda_ckpt")
+        return out.status, out.data_bytes
+
+    def mtp_verify_pass(self, toks: list[int], seq_id: int, pos0: int,
+                        kda_snap_mask: int = 0,
+                        readback_logits: bool = False
+                        ) -> tuple[list[int], int]:
+        """P-29 step 13 phase B: R-row speculative verify through the target's
+        own kernels — the spec_verify FAR burst runs a daemon-side PER-ROW
+        decode-shaped attention loop (KDA legs = exact per-token decode
+        kernels; span graphs bypassed) + ONE cross-row routed union + ONE
+        M=R MoE per layer; the head norms/argmaxes all R rows engine-side.
+        kda_snap_mask bit j = pool-boundary anchor snapshot after row j.
+        Returns (per-row argmax ids, moe lookups)."""
+        R = len(toks)
+        self._embed(toks)
+        self.write_batch_descriptors(seq_id, pos0, R)
+        lookups = self._far_sweep_burst(
+            R, is_prefill=0, chunk_start=0, chunk_len=0,
+            timeout_us=self.decode_timeout_us, spec_verify=1,
+            kda_snap_mask=kda_snap_mask)
+        out = self._output_head(R, readback=True,
+                                readback_logits=readback_logits)
+        if out.host_buf_offset == 0 or out.data_bytes < 4 * R:
+            raise BridgeError(
+                f"mtp_verify_pass head readback missing: off="
+                f"{out.host_buf_offset} bytes={out.data_bytes}")
+        argmax = self.read_head_readback_ids(out.host_buf_offset, R)
+        for b, t in enumerate(argmax):
+            if t >= self.vocab_size:
+                raise BridgeError(
+                    f"mtp_verify_pass argmax row {b} out of vocab: {t}")
+        return argmax, lookups
+
+    def mtp_row(self, input_token: int, seq_id: int, pos: int,
+                prev_row: int, *, head: bool = False) -> int:
+        """One MTP layer row at position `pos` (probe semantics: input =
+        (token@pos+1, post-norm hidden@pos = verify scratch row prev_row);
+        appends layer-45 KV/indexer at pos; with head=True the MTP shared
+        head argmaxes the row → the draft token for pos+2). Returns the
+        draft token (head=True) or -1."""
+        mtp_layer = self.num_layers
+        c = self._cmd(D_CMD_MTP_PROJECT)
+        p = c.payload.mtp_project
+        p.mtp_layer_idx = mtp_layer
+        p.input_token_id = input_token
+        p.step_idx = 0
+        p.hidden_row = prev_row
+        p.prev_src = 1
+        p.dest_row = 0
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="mtp_project")
+        if out.status != 0:
+            raise BridgeError(f"mtp_project status {out.status}")
+        self.write_batch_descriptors(seq_id, pos, 1)
+        self._far_layer(mtp_layer, 1, is_prefill=0, chunk_start=0,
+                        chunk_len=0, timeout_us=self.decode_timeout_us)
+        if not head:
+            return -1
+        out = self._output_head(1, readback=True, mtp_head=1)
+        if out.host_buf_offset == 0 or out.data_bytes < 4:
+            raise BridgeError("mtp_row head readback missing")
+        tok = self.read_head_readback_ids(out.host_buf_offset, 1)[0]
+        if tok >= self.vocab_size:
+            raise BridgeError(f"mtp_row draft out of vocab: {tok}")
+        return tok
+
+    def mtp_chain_row(self, input_token: int, seq_id: int,
+                      pos: int) -> int:
+        """Chained (depth-2) MTP draft row: prev hidden = the PREVIOUS MTP
+        row's own block output (attn_buf row 0, single-stream — read by
+        hnorm BEFORE the embed staging overwrites it), input token = the
+        depth-1 draft. Appends layer-45 KV at pos (draft-polluted on
+        rejection; the next round's catch-up overwrites it). Returns the
+        depth-2 draft token."""
+        mtp_layer = self.num_layers
+        c = self._cmd(D_CMD_MTP_PROJECT)
+        p = c.payload.mtp_project
+        p.mtp_layer_idx = mtp_layer
+        p.input_token_id = input_token
+        p.step_idx = 1
+        p.hidden_row = 0
+        p.prev_src = 0
+        p.dest_row = 0
+        self.send(c)
+        out = self.wait(CMP_COMPUTE_DONE, ctx="mtp_chain_project")
+        if out.status != 0:
+            raise BridgeError(f"mtp_chain_project status {out.status}")
+        self.write_batch_descriptors(seq_id, pos, 1)
+        self._far_layer(mtp_layer, 1, is_prefill=0, chunk_start=0,
+                        chunk_len=0, timeout_us=self.decode_timeout_us)
+        out = self._output_head(1, readback=True, mtp_head=1)
+        if out.host_buf_offset == 0 or out.data_bytes < 4:
+            raise BridgeError("mtp_chain_row head readback missing")
+        tok = self.read_head_readback_ids(out.host_buf_offset, 1)[0]
+        if tok >= self.vocab_size:
+            raise BridgeError(f"mtp_chain_row draft out of vocab: {tok}")
+        return tok
+
+    def mtp_prefill_fill(self, toks: list[int], seq_id: int, pos0: int,
+                         prev_row0: int = 0) -> int:
+        """P-29 step 13: MTP prompt-fill for one prefill-chunk SLICE — the caller
+        has already run a norm_only head over the slice rows (post-norm
+        hiddens in scratch rows [prev_row0..prev_row0+L)). toks[i] =
+        token@(pos0+i)+1 (the NEXT token of each covered position). Serial
+        PROJECTs land attn_buf H-stride rows [0..L) (dest_row=i; the
+        embedding stages at a HIGH trunk row for i>0 and consumes its own
+        staging for i==0 before writing), then ONE prefill-shaped
+        ATTN(45)+MoE covers all rows. Returns moe lookups."""
+        L = len(toks)
+        if L == 0:
+            return 0
+        mtp_layer = self.num_layers
+        for i, tok in enumerate(toks):
+            c = self._cmd(D_CMD_MTP_PROJECT)
+            p = c.payload.mtp_project
+            p.mtp_layer_idx = mtp_layer
+            p.input_token_id = tok
+            p.step_idx = 0
+            p.hidden_row = prev_row0 + i
+            p.prev_src = 1
+            p.dest_row = i
+            self.send(c)
+            out = self.wait(CMP_COMPUTE_DONE, ctx="mtp_prefill_project")
+            if out.status != 0:
+                raise BridgeError(
+                    f"mtp_prefill_fill project {i} status {out.status}")
+        self.write_batch_descriptors(seq_id, pos0, L)
+        self._run_attention(mtp_layer, L, is_prefill=1, chunk_start=pos0,
+                            chunk_len=L, is_moe=True)
+        return self._routed_moe(mtp_layer, L, None,
+                                timeout_us=self.decode_timeout_us)
+
+    def norm_only_head(self, num_tokens: int, input_row: int = 0) -> None:
+        """P-29 step 13: collapse + final RMSNorm over hidden rows [input_row,
+        input_row+num_tokens) into output_norm_scratch rows [0..n) — the
+        MTP_PROJECT prev_src=1 feed for a prefill-chunk slice."""
+        self._output_head(num_tokens, readback=False, norm_only=True,
+                          input_row=input_row)
+
     def prefill_chunk_fetch_and_run(self, toks: list[int], seq_id: int,
                                     pos0: int,
                                     lrus: list[GpuLru] | None
@@ -1322,16 +1751,29 @@ class EngineBridge:
         sub = max(1, min(sub, MAX_BATCH_DESCRIPTORS))
         timeout_us = max(120_000_000, self.decode_timeout_us)
         lookups = 0
+        # R4c: sub-chunk boundaries sit on the ABSOLUTE `sub` grid, not
+        # relative to pos0 — a mid-edge truncating fork starts the delta
+        # off-grid, and phase-aligning the (single, leading) partial
+        # sub-chunk keeps every later sub-chunk shape identical to an
+        # uncached run's (the identity argument gated in R4b).  For a
+        # grid-aligned pos0 this is byte-identical to the legacy
+        # range(0, n, sub) slicing.  A leading partial sub-chunk is the
+        # same accepted shape class as the trailing one.
+        subchunks: list[tuple[int, int]] = []
+        off = 0
+        while off < n:
+            ln = min(sub - (pos0 + off) % sub, n - off)
+            subchunks.append((off, ln))
+            off += ln
         # 1. Embedding sub-chunks into hidden rows [off, off+len).
-        for off in range(0, n, sub):
-            self._embed(toks[off:off + sub], row_offset=off)
+        for off, ln in subchunks:
+            self._embed(toks[off:off + ln], row_offset=off)
         # 2. Layer sweep: K attention sub-launches + ONE MOE_BIG per layer.
         for layer in range(self.num_layers):
             is_moe = layer >= self.first_moe_layer
             seen: set[int] = set()
             union: list[int] = []
-            for off in range(0, n, sub):
-                ln = min(sub, n - off)
+            for off, ln in subchunks:
                 self.write_batch_descriptors(seq_id, pos0 + off, ln)
                 self._run_attention(layer, ln, is_prefill=1,
                                     chunk_start=pos0 + off, chunk_len=ln,
@@ -1589,6 +2031,8 @@ def _layout_selfcheck() -> None:
           16, "<Q", 0x1122334455667788)
     probe(lambda c, v: setattr(P(c).seq_fork, "dst_seq_id", v),
           24, "<Q", 0x1122334455667788)
+    probe(lambda c, v: setattr(P(c).seq_fork, "prefix_len", v),
+          32, "<I", 0xA1B2C3D4)   # R4a truncating fork
     ds = [("seq_id", 16, "<Q", 0x1122334455667788),
           ("anchor_token_id", 24, "<I", 0xA1B2C3D4),
           ("anchor_pos", 28, "<I", 0xA1B2C3D4),

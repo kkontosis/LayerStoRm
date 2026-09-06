@@ -281,7 +281,8 @@ void DcpCommunicator::allreduce_hidden_fused(void* const* buffers_a,
                                              int batch_size,
                                              void* const* streams,
                                              bool b_fp32,
-                                             int b_rows_per_token) {
+                                             int b_rows_per_token,
+                                             bool a_fp32) {
     if (batch_size > opts_.max_batch_size) {
         throw std::invalid_argument(
             "DcpCommunicator::allreduce_hidden_fused: batch_size="
@@ -295,13 +296,14 @@ void DcpCommunicator::allreduce_hidden_fused(void* const* buffers_a,
                          * static_cast<size_t>(b_rows_per_token)
                          * opts_.hidden_size;
     const auto dtype_b = b_fp32 ? kCollFloat32 : kCollBfloat16;
+    const auto dtype_a = a_fp32 ? kCollFloat32 : kCollBfloat16;
 
     opts_.collective->group_begin();
     for (int r = 0; r < opts_.dcp_size; ++r) {
         opts_.device_backends[r]->set_device();
         opts_.collective->allreduce(
             buffers_a[r], buffers_a[r], count_a,
-            kCollBfloat16, kCollSum, comms_[r], streams[r]);
+            dtype_a, kCollSum, comms_[r], streams[r]);
         opts_.collective->allreduce(
             buffers_b[r], buffers_b[r], count_b,
             dtype_b, kCollSum, comms_[r], streams[r]);

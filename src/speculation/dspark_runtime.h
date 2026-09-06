@@ -303,6 +303,22 @@ public:
     uint64_t ctx_seq_id() const { return ctx_seq_id_; }
     int ctx_len() const { return ctx_len_; }
     bool ctx_valid() const { return ctx_valid_; }
+    /// TD-DSPARK-CTX-POLICY (windowed drafting): absolute position of
+    /// context-KV arena row 0.  0 until the first rotation; run_step
+    /// attends positions [ctx_base, anchor_pos) -- rows below the base were
+    /// DISCARDED by rotation and are unreachable.  Always 0 with rotation
+    /// off (legacy) and on the V4 dflash arm.
+    int ctx_base() const { return ctx_base_; }
+    /// Number of arena rotations (compactions) performed (tests/telemetry).
+    int ctx_rotations() const { return rotations_; }
+    /// Rotation policy is armed (classic backbone +
+    /// speculation.dspark.ctx_rotate, env LS_DSPARK_CTX_ROTATE overriding
+    /// either way; always false on the V4 dflash arm).
+    bool ctx_rotation_enabled() const { return rotate_; }
+    /// Dormant post-epoch re-arm frontier is being tracked (an OVERSIZED
+    /// capture epoch -- more rows than the arena -- was skipped; drafting
+    /// re-arms with an EMPTY window at the epoch's end).
+    bool ctx_rearm_pending() const { return rearm_pending_; }
 
     /// TD-V4-SPEC-PREFILL-CTX: open capture epoch awaiting ONLY the final
     /// aux slot.  True iff the context is valid, every slot except the last
@@ -334,6 +350,11 @@ public:
 
     /// Aux staging view (tests): device ptr [aux_capture_max_rows, N_aux*H].
     const void* aux_stage() const { return aux_stage_; }
+
+    /// Test-only: rank-0 context-K arena base for layer `layer` (classic
+    /// layout: K rows then V rows, each [ctx_cap, kv_dim] BF16 — byte-
+    /// equality checks of the rotation compaction, TD-DSPARK-CTX-POLICY).
+    const void* debug_ctx_k(int layer) const { return k_base(0, layer); }
 
 private:
     DsparkRuntime() = default;
@@ -367,6 +388,20 @@ private:
     void finalize_context_chunked(int rows, uint32_t start_pos);
     void append_context_kv(const void* normed, int rows, uint32_t start_pos,
                            void* stream);
+
+    /// TD-DSPARK-CTX-POLICY: rotate (compact) the context-KV arena so the
+    /// append [start_pos, start_pos + rows) fits -- no-op unless rotation
+    /// is armed and the append would overflow.  Enqueues per-(rank, layer,
+    /// K/V) D2D copies of the surviving window rows onto each rank's draft
+    /// stream (program-order safe against earlier attention reads and the
+    /// appends that follow) and advances ctx_base_.
+    void maybe_rotate_arena(int rows, uint32_t start_pos);
+    /// Enter the dormant post-epoch re-arm state for an OVERSIZED epoch:
+    /// invalidates the context (loud) and starts tracking the epoch's
+    /// slot-0 / final-slot coverage so a fresh epoch at the frontier
+    /// re-arms an empty window there.
+    void enter_dormant(uint64_t seq, uint32_t slot0_end, uint32_t last_end,
+                       const char* why);
 
     // Weight-consuming GEMM seam (TD-DSPARK-DRAFT-QUANT): every projection
     // GEMM routes through weight_gemm, which dispatches on the device
@@ -575,6 +610,33 @@ private:
     uint64_t ctx_seq_id_ = ~0ULL;
     int ctx_len_ = 0;
     bool ctx_valid_ = false;
+    // TD-DSPARK-CTX-POLICY (windowed drafting; classic backbone only).
+    // rotate_ latches speculation.dspark.ctx_rotate at create() (default
+    // ON; env LS_DSPARK_CTX_ROTATE overrides either way when set, '0' =
+    // legacy fail-closed cap; forced OFF for V4 dflash -- its rope
+    // table and single-copy latent arena stay absolute-position keyed).
+    // ctx_base_ is the absolute position of arena row 0: arena row =
+    // abs_pos - ctx_base_, and run_step attends [ctx_base_, anchor_pos).
+    // Rotation (maybe_rotate_arena) DISCARDS rows below the new base via a
+    // per-(rank, layer, K/V) D2D compaction copy -- keep_post =
+    // max(ctx_cap_/2, incoming) makes src/dst provably disjoint (design:
+    // spec/plans/DSPARK_CTX_ROTATION.md) and leaves >= ctx_cap_/2 >> gamma
+    // rows of margin above the base for overwrite-rewinds.
+    bool rotate_ = false;
+    int ctx_base_ = 0;
+    int rotations_ = 0;
+    // Dormant post-epoch re-arm frontier: an OVERSIZED capture epoch
+    // (> ctx_cap_ rows -- e.g. a huge prefill superchunk) cannot be
+    // windowed row-by-row (later aux slots' contributions arrive after
+    // slot 0's full coverage, so the fc accumulator needs the whole
+    // epoch); the context is invalidated but the tracker follows the
+    // epoch's slot-0 / final-slot coverage so drafting re-arms with an
+    // EMPTY window at the epoch's end instead of staying dead until the
+    // next position-0 prefill.
+    bool rearm_pending_ = false;
+    uint64_t dorm_seq_ = ~0ULL;
+    uint32_t dorm_slot0_end_ = 0;
+    uint32_t dorm_last_end_ = 0;
     bool ingest_recorded_ = false;  ///< ev_ingest_done_ has been recorded
 
     // Per-step capture bookkeeping.  An "epoch" is the row window

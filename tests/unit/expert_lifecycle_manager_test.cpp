@@ -68,8 +68,13 @@ static lc::Config small_config() {
         {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
                           {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
         {"hardware", {
-            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1}},
-                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1}}}},
+            // Pin an explicit expert-cache budget: the auto expert reserve
+            // shrank to the bare top-K minimum once the KV pool became
+            // demand-sized (see command_dispatcher_test.cpp small_config()).
+            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}},
+                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}}}},
             {"tp_array", {0, 1}},
             {"system_ram_gb", 64}}},
         {"memory", {{"vram_safety_margin_gb", 0.1}}},
@@ -260,6 +265,49 @@ TEST_F(ExpertLifecycleManagerTest, EnsureResident_AlreadyHot) {
     EXPECT_EQ(completions[0].token, token2);
     EXPECT_EQ(completions[0].cmd_seq, 200u);
     EXPECT_TRUE(completions[0].success);
+}
+
+// INV-ELM-EVICT self-heal (TD-KVXP-RECLAIM-REGRANT-WEDGE): an eviction that
+// bypasses the ELM (ExpertCache::evict called directly — the 44z drain's
+// pre-fix behavior) leaves the ELM's (key,gpu) entry kHot for a key the cache
+// no longer holds. Pre-fix, ensure_resident then completed the interest
+// "already resident" WITHOUT re-fetching; the consumer polls the CACHE for
+// arrival, so it waited its full fetch deadline in silence — once per MoE
+// layer routing the key, the measured GPU-0% crawl. The healed path detects
+// the divergence, resets to ABSENT, and restarts the fetch chain for the very
+// interest in hand.
+TEST_F(ExpertLifecycleManagerTest, EnsureResident_HealsStaleHotAfterBypassEvict) {
+    auto elm = make_elm();
+    lmem::ExpertKey key{1, 3};
+
+    // Load to HOT through the normal chain.
+    elm->ensure_resident(key, 0, lmem::CacheZone::kStable, 100);
+    poll_elm(*elm);
+    ASSERT_EQ(elm->state(key, 0).gpu_tier, ldam::GpuTier::kHot);
+    ASSERT_TRUE(cache_->is_resident(key, 0));
+
+    // Evict BEHIND the ELM's back (the divergence this heals).
+    ASSERT_TRUE(cache_->evict(key, 0));
+    ASSERT_FALSE(cache_->is_resident(key, 0));
+    ASSERT_EQ(elm->state(key, 0).gpu_tier, ldam::GpuTier::kHot)
+        << "precondition: the ELM still believes the key is resident";
+
+    // ensure_resident must NOT short-circuit on the stale kHot — it heals
+    // and restarts the fetch chain for this interest.
+    auto token = elm->ensure_resident(key, 0, lmem::CacheZone::kStable, 200);
+    auto st = elm->state(key, 0);
+    EXPECT_NE(st.gpu_tier, ldam::GpuTier::kHot)
+        << "stale kHot must not survive the divergence check";
+    EXPECT_EQ(st.interest_count, 1u);
+
+    // The restarted chain completes like any fresh fetch, and the CACHE —
+    // the surface consumers actually poll — holds the entry again.
+    auto completions = poll_elm(*elm).lifecycle;
+    ASSERT_EQ(completions.size(), 1u);
+    EXPECT_EQ(completions[0].token, token);
+    EXPECT_TRUE(completions[0].success);
+    EXPECT_EQ(elm->state(key, 0).gpu_tier, ldam::GpuTier::kHot);
+    EXPECT_TRUE(cache_->is_resident(key, 0));
 }
 
 TEST_F(ExpertLifecycleManagerTest, EnsureResident_AlreadyTransferring) {
@@ -1049,6 +1097,8 @@ TEST_F(ExpertLifecycleManagerTest, Snapshot_HostNumaTierWithNvmeTier) {
     EXPECT_TRUE(r2.lifecycle[0].success);
 
     // Expert is now in host via NvmeTier (mmap-backed, WP-5).
+    // NvmeTier writes are async (io_uring): quiesce before asserting tier state.
+    nvme->drain();
     EXPECT_TRUE(nvme->is_in_host_ram(key));
     int host_numa = nvme->host_numa_node(key);
     // WP-5: mmap pages are OS-managed — NUMA node is -1.
@@ -1137,6 +1187,8 @@ TEST_F(ExpertLifecycleManagerTest, RequestDrain_HotToAbsent) {
     // Expert evicted from VRAM, now in host warm cache.
     EXPECT_EQ(elm->state(key, 0).gpu_tier, ldam::GpuTier::kAbsent);
     EXPECT_EQ(cache_->lookup(key, 0), nullptr);
+    // NvmeTier writes are async (io_uring): quiesce before asserting tier state.
+    nvme->drain();
     EXPECT_TRUE(nvme->is_in_host_ram(key));
 
     std::error_code ec;

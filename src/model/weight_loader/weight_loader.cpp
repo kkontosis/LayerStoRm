@@ -1,5 +1,7 @@
 #include "model/weight_loader/weight_loader.h"
 
+#include "model/weight_loader/quant_skip_list.h"
+
 #include "core/parallel_for.h"
 
 #include <algorithm>
@@ -237,6 +239,79 @@ void place_bundle(LoadedModel& model, WeightBundle&& bundle,
     }
 }
 
+// ── glm5_next per-layer completeness (GF3.3) ────────────────────────────────
+// The two layer anatomies of the hybrid stack (MODELINFO §3a/§3b/§3c). A KDA
+// linear layer must carry the full unfused 16-component set and NOTHING of the
+// MLA/indexer anatomy; a sparse-MLA layer must carry the MLA set plus the
+// full indexer (kpool compressor included when index_kpool > 1). The MTP
+// block layer (45) is sparse-MLA by checkpoint (MODELINFO §5).
+void validate_glm5_next_layer(const LoadedModel::LayerWeights& layer,
+                              int layer_idx, bool is_linear, bool has_kpool,
+                              std::vector<std::string>& errors) {
+    auto has = [&](const std::vector<WeightBundle>& v, TensorComponent c) {
+        for (const auto& b : v)
+            if (b.id.component == c) return true;
+        return false;
+    };
+    auto require = [&](const std::vector<WeightBundle>& v, TensorComponent c,
+                       const char* where) {
+        if (!has(v, c))
+            errors.push_back(std::format(
+                "glm5_next layer {} ({}) missing {} tensor '{}'", layer_idx,
+                is_linear ? "linear_attention" : "sparse_attention", where,
+                tensor_component_name(c)));
+    };
+    auto forbid = [&](const std::vector<WeightBundle>& v, TensorComponent c) {
+        if (has(v, c))
+            errors.push_back(std::format(
+                "glm5_next layer {} ({}) carries unexpected tensor '{}'",
+                layer_idx, is_linear ? "linear_attention" : "sparse_attention",
+                tensor_component_name(c)));
+    };
+
+    if (is_linear) {
+        for (auto c : {TensorComponent::kda_q_proj, TensorComponent::kda_k_proj,
+                       TensorComponent::kda_v_proj, TensorComponent::kda_b_proj,
+                       TensorComponent::kda_f_a_proj, TensorComponent::kda_f_b_proj,
+                       TensorComponent::kda_g_a_proj, TensorComponent::kda_g_b_proj,
+                       TensorComponent::kda_q_conv1d, TensorComponent::kda_k_conv1d,
+                       TensorComponent::kda_v_conv1d, TensorComponent::kda_a_log,
+                       TensorComponent::kda_dt_bias, TensorComponent::kda_o_norm,
+                       TensorComponent::o_proj})
+            require(layer.attention, c, "KDA");
+        for (auto c : {TensorComponent::q_a_proj, TensorComponent::q_b_proj,
+                       TensorComponent::kv_a_proj_with_mqa,
+                       TensorComponent::kv_b_proj})
+            forbid(layer.attention, c);
+        if (!layer.indexer.empty())
+            errors.push_back(std::format(
+                "glm5_next layer {} (linear_attention) carries {} indexer "
+                "tensors — KDA layers have no indexer",
+                layer_idx, layer.indexer.size()));
+    } else {
+        for (auto c : {TensorComponent::q_a_proj, TensorComponent::q_a_norm,
+                       TensorComponent::q_b_proj,
+                       TensorComponent::kv_a_proj_with_mqa,
+                       TensorComponent::kv_a_norm, TensorComponent::kv_b_proj,
+                       TensorComponent::o_proj})
+            require(layer.attention, c, "MLA");
+        for (auto c : {TensorComponent::kda_q_proj, TensorComponent::kda_b_proj,
+                       TensorComponent::kda_a_log, TensorComponent::kda_dt_bias})
+            forbid(layer.attention, c);
+        for (auto c : {TensorComponent::indexer_wq_b, TensorComponent::indexer_wk,
+                       TensorComponent::indexer_k_norm_weight,
+                       TensorComponent::indexer_k_norm_bias,
+                       TensorComponent::indexer_weights_proj})
+            require(layer.indexer, c, "indexer");
+        if (has_kpool) {
+            require(layer.indexer, TensorComponent::indexer_compressor_wgate,
+                    "IndexPool compressor");
+            require(layer.indexer, TensorComponent::indexer_compressor_ape,
+                    "IndexPool compressor");
+        }
+    }
+}
+
 // Validate that all expected tensors are present.
 std::vector<std::string> validate_completeness(const LoadedModel& model,
                                                const ModelConfig& model_cfg,
@@ -265,6 +340,13 @@ std::vector<std::string> validate_completeness(const LoadedModel& model,
             errors.push_back(std::format("Layer {} missing layer norms", l));
         }
 
+        // GF3.3: glm5_next hybrid anatomy — exact per-layer component sets.
+        if (model_cfg.is_glm5_next()) {
+            validate_glm5_next_layer(layer, l,
+                                     model_cfg.is_linear_attention_layer(l),
+                                     model_cfg.has_index_pool(), errors);
+        }
+
         bool is_moe = model_cfg.is_moe_layer(l);
         if (is_moe) {
             if (layer.gating.empty()) {
@@ -284,6 +366,14 @@ std::vector<std::string> validate_completeness(const LoadedModel& model,
             if (layer.dense_ffn.empty()) {
                 errors.push_back(std::format("Dense layer {} missing FFN weights", l));
             }
+        }
+    }
+
+    // GF3.3: the glm5_next MTP block layer is sparse MLA (MODELINFO §5).
+    if (model_cfg.is_glm5_next() && model.mtp) {
+        for (const auto& blk : model.mtp->block_layers) {
+            validate_glm5_next_layer(blk, blk.layer_idx, /*is_linear=*/false,
+                                     model_cfg.has_index_pool(), errors);
         }
     }
 
@@ -1528,6 +1618,56 @@ LoadedModel load_weights_gguf(const config::Config& cfg,
         }
     }
 
+    // GF3.9 (SURVEY_BOOT R3): the recipe JSON — not the GGUF — is the config
+    // authority for glm5_next, but a `layer_types` that disagrees with the
+    // checkpoint silently loads a KDA anatomy into an MLA layer (or vice
+    // versa). The glm5next writer records the per-block KV-head count
+    // (0 = KDA linear layer, >0 = MLA), one entry per block INCLUDING the MTP
+    // block, so cross-check it loudly and cheaply. The array is 46 entries on
+    // GLM-5.3-Flash — well under GgufReader::kSmallArrayCap — so it survives
+    // the reader's large-array skip. Absent key: warn and continue (other
+    // exporters may drop it).
+    if (model_cfg.is_glm5_next()) {
+        constexpr const char* kHeadCountKvKey = "glm5next.attention.head_count_kv";
+        std::optional<std::vector<int64_t>> head_count_kv;
+        for (const auto& shard : model.gguf_shards) {
+            head_count_kv = shard.metadata_array_i64(kHeadCountKvKey);
+            if (head_count_kv) break;
+        }
+        if (!head_count_kv) {
+            spdlog::warn(
+                "glm5_next GGUF carries no '{}' metadata array — the recipe's "
+                "layer_types is UNVERIFIED against this checkpoint", kHeadCountKvKey);
+        } else {
+            const int nh = model_cfg.raw().num_hidden_layers;
+            const int expect_len = nh + model_cfg.raw().num_nextn_predict_layers;
+            if (static_cast<int>(head_count_kv->size()) != expect_len) {
+                throw std::runtime_error(std::format(
+                    "glm5_next GGUF '{}' has {} entries but the config declares "
+                    "{} blocks (num_hidden_layers={} + num_nextn_predict_layers={}) "
+                    "— recipe and checkpoint describe different models",
+                    kHeadCountKvKey, head_count_kv->size(), expect_len, nh,
+                    model_cfg.raw().num_nextn_predict_layers));
+            }
+            for (int l = 0; l < nh; ++l) {
+                const bool gguf_linear = ((*head_count_kv)[static_cast<size_t>(l)] == 0);
+                const bool cfg_linear = model_cfg.is_linear_attention_layer(l);
+                if (gguf_linear != cfg_linear) {
+                    throw std::runtime_error(std::format(
+                        "glm5_next layer_types disagrees with the GGUF at layer {}: "
+                        "checkpoint says {} ({}[{}]={}), recipe says {} — loading "
+                        "would put the wrong layer anatomy on this block",
+                        l, gguf_linear ? "linear_attention (KDA)" : "sparse MLA",
+                        kHeadCountKvKey, l, (*head_count_kv)[static_cast<size_t>(l)],
+                        cfg_linear ? "linear_attention (KDA)" : "sparse MLA"));
+                }
+            }
+            spdlog::info("glm5_next: layer_types cross-checked against GGUF '{}' "
+                         "({} blocks, {} linear-attention)", kHeadCountKvKey,
+                         head_count_kv->size(), model_cfg.num_linear_attention_layers());
+        }
+    }
+
     const int num_layers = model_cfg.raw().num_hidden_layers;
     const int n_routed = model_cfg.raw().n_routed_experts;
     model.layers.resize(num_layers);
@@ -1649,6 +1789,138 @@ LoadedModel load_weights_gguf(const config::Config& cfg,
                          " to Q8_0 (TD-GG9-F16-ATTN-PROJ-FP8-OOB)", n_requant);
     }
 
+    // GF3.9 (SURVEY_BOOT §4.5 / R7): the glm5next GGUF ships the IndexPool
+    // compressor GATE (`blk.N.indexer_compressor_gate.weight`) as Q8_0, but the
+    // executor consumes it with a plain BF16 GEMM (arch_mla.cpp) and nothing
+    // tags it as a GGUF operand (no `*_is_gguf` field, no case in the engine's
+    // GGUF-type threading switch). Dequant it once here — 12 sparse layers x
+    // [128, 4096] ≈ 6 MiB BF16 in total — instead of opening a new GGUF GEMM
+    // route for one tiny tensor. glm5_next ONLY: V4 loads the same component
+    // name on this path and its artifact ships it float already; leave V4 (and
+    // every other architecture) byte-identical.
+    if (model_cfg.is_glm5_next()) {
+        int n_gate_dequant = 0;
+        auto dequant_gates = [&](std::vector<WeightBundle>& indexer, int layer_idx) {
+            for (auto& b : indexer) {
+                if (b.id.component != TensorComponent::indexer_compressor_wgate)
+                    continue;
+                if (!b.weight.gguf_type.has_value()) continue;  // already float
+                const std::string what = std::format(
+                    "layer {} indexer_compressor_wgate", layer_idx);
+                dequant_bundle_to_bf16(b, what.c_str());
+                ++n_gate_dequant;
+            }
+        };
+        for (auto& layer : model.layers) dequant_gates(layer.indexer, layer.layer_idx);
+        if (model.mtp)
+            for (auto& blk : model.mtp->block_layers)
+                dequant_gates(blk.indexer, blk.layer_idx);
+        if (n_gate_dequant > 0)
+            spdlog::info("GF3.9: dequantized {} IndexPool compressor gate(s) to "
+                         "BF16 (executor GEMM is BF16-only)", n_gate_dequant);
+
+        // GF3.9: launch_mhc_pre's contract is F32 row-major fn (mhc.h) —
+        // V4's artifacts ship hc_*_fn F32, but GLM-5.3-Flash ships it BF16
+        // (FP8 checkpoint, §3e) and the unsloth GGUF Q8_0. Widen every
+        // hc_{attn,ffn}_fn bundle to F32 at load (45 layers x 2 x
+        // [24, 16384] ≈ 141 MiB F32 total); base/scale are F32 already in
+        // both artifacts. Without this the mHC mix consumes garbage on
+        // EVERY layer and the whole stack goes NaN (first-boot finding).
+        int n_hc_widen = 0;
+        auto widen_hc_fn = [&](std::vector<WeightBundle>& attention,
+                               int layer_idx) {
+            for (auto& b : attention) {
+                if (b.id.component != TensorComponent::hc_attn_fn
+                    && b.id.component != TensorComponent::hc_ffn_fn)
+                    continue;
+                if (!b.weight.gguf_type.has_value()
+                    && b.weight.dtype == SafetensorsDtype::F32)
+                    continue;  // already the kernel dtype
+                const std::string what = std::format(
+                    "layer {} {}", layer_idx,
+                    b.id.component == TensorComponent::hc_attn_fn
+                        ? "hc_attn_fn" : "hc_ffn_fn");
+                std::vector<float> f;
+                if (b.weight.gguf_type.has_value()) {
+                    f = dequant_split_to_f32(b.weight, what.c_str());
+                } else if (b.weight.dtype == SafetensorsDtype::BF16) {
+                    const auto* src = reinterpret_cast<const uint16_t*>(
+                        b.weight.data.data());
+                    const size_t n = b.weight.data.size() / 2;
+                    f.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        const uint32_t u = static_cast<uint32_t>(src[i]) << 16;
+                        std::memcpy(&f[i], &u, sizeof(float));
+                    }
+                } else {
+                    throw std::runtime_error(
+                        "glm5_next hc_fn: unsupported source dtype for the "
+                        "F32 widening (" + what + ")");
+                }
+                auto buf = std::make_shared<std::vector<std::byte>>(
+                    f.size() * sizeof(float));
+                std::memcpy(buf->data(), f.data(), buf->size());
+                b.owned_buf = buf;
+                b.weight.data =
+                    std::span<const std::byte>(buf->data(), buf->size());
+                b.weight.dtype = SafetensorsDtype::F32;
+                b.weight.gguf_type = std::nullopt;
+                ++n_hc_widen;
+            }
+        };
+        for (auto& layer : model.layers)
+            widen_hc_fn(layer.attention, layer.layer_idx);
+        // The MTP block is non-mHC (no hc_* tensors) — nothing to widen.
+        if (n_hc_widen > 0)
+            spdlog::info("GF3.9: widened {} hc_*_fn tensor(s) to F32 "
+                         "(launch_mhc_pre contract)", n_hc_widen);
+
+        // GF3.9 (first-boot finding): the GGUF exporter stores the KDA
+        // decay base in the llama.cpp/mamba convention `ssm_a = -exp(A_log)`
+        // (measured: blk.0.ssm_a == -exp(HF A_log) elementwise), while the
+        // kernels take A_LOG and exponentiate internally (kda_scan.h safe
+        // gate: -lb * sigmoid(exp(a_log) * (raw_g + dt_bias))). Convert
+        // A = -exp(A_log) back to A_log = ln(-A) here — this pass is
+        // GGUF-only (load_weights_gguf), the HF safetensors path ships
+        // A_log directly. Fail loudly on a non-negative A: that would mean
+        // the exporter convention changed and silent log(-A) would NaN.
+        int n_alog = 0;
+        auto fix_a_log = [&](std::vector<WeightBundle>& attention,
+                             int layer_idx) {
+            for (auto& b : attention) {
+                if (b.id.component != TensorComponent::kda_a_log) continue;
+                if (b.weight.dtype != SafetensorsDtype::F32)
+                    throw std::runtime_error(
+                        "glm5_next GGUF ssm_a: expected F32 (layer "
+                        + std::to_string(layer_idx) + ")");
+                const size_t n = b.weight.data.size() / sizeof(float);
+                auto buf = std::make_shared<std::vector<std::byte>>(
+                    b.weight.data.size());
+                auto* out = reinterpret_cast<float*>(buf->data());
+                const auto* in = reinterpret_cast<const float*>(
+                    b.weight.data.data());
+                for (size_t i = 0; i < n; ++i) {
+                    if (!(in[i] < 0.0f))
+                        throw std::runtime_error(
+                            "glm5_next GGUF ssm_a: value >= 0 at layer "
+                            + std::to_string(layer_idx)
+                            + " — not the -exp(A_log) convention; refusing "
+                              "to convert");
+                    out[i] = std::log(-in[i]);
+                }
+                b.owned_buf = buf;
+                b.weight.data =
+                    std::span<const std::byte>(buf->data(), buf->size());
+                ++n_alog;
+            }
+        };
+        for (auto& layer : model.layers)
+            fix_a_log(layer.attention, layer.layer_idx);
+        if (n_alog > 0)
+            spdlog::info("GF3.9: converted {} ssm_a tensor(s) from "
+                         "-exp(A_log) to A_log (kernel convention)", n_alog);
+    }
+
     spdlog::info("Assembled GGUF bundles: {} tensors ({:.1f} GB), {} warnings",
                  model.total_tensors_loaded,
                  model.total_weight_bytes / (1024.0 * 1024.0 * 1024.0),
@@ -1724,20 +1996,72 @@ LoadedModel load_weights(const config::Config& cfg,
         }
     }
 
+    // GF3.3: FP8 mixed-precision skip list (modules_to_not_convert) — see
+    // quant_skip_list.h for the namespace trap this guards against. Loaded
+    // from the checkpoint's own config.json; absent for plain BF16 / GGUF /
+    // prepacked artifacts.
+    auto skip_list = QuantSkipList::load_from_model_dir(model_dir);
+    const bool fp8_checkpoint =
+        cfg.quantization.weights == config::WeightQuant::fp8_e4m3 ||
+        cfg.quantization.weights == config::WeightQuant::fp8_e5m2;
+    const bool check_skip_list = fp8_checkpoint && skip_list.has_value();
+    size_t skip_matches = 0;
+    std::vector<std::string> precision_errors;
+
     // Accumulate all tensors
     TensorAccumulator accumulator;
     int total_entries = 0;
     int unrecognized = 0;
+    int vision_skipped = 0;
 
     for (auto& shard : model.shards) {
         for (auto& entry : shard.entries()) {
             ++total_entries;
+
+            // GF3.14 is deferred: the vision tower (`model.visual.*`) is
+            // recognized and deliberately not loaded — text-only serving.
+            // Silent per-tensor (a 24-layer ViT is ~347 tensors); one
+            // summary line below.
+            if (entry.name.rfind("model.visual.", 0) == 0 ||
+                entry.name.rfind("visual.", 0) == 0) {
+                ++vision_skipped;
+                continue;
+            }
 
             auto id_opt = parse_hf_name(entry.name);
             if (!id_opt) {
                 spdlog::warn("Unrecognized tensor name: {}", entry.name);
                 ++unrecognized;
                 continue;
+            }
+
+            // GF3.3: cross-check every recognized tensor's storage dtype
+            // against the skip list. In an FP8 checkpoint a >=2-D main
+            // weight must be FP8 exactly when its module is NOT in
+            // modules_to_not_convert. Any disagreement is load-stopping —
+            // it means the checkpoint layout and our reading of it diverge
+            // (the failure a silent skip-list mismatch would otherwise
+            // convert into plausible-but-wrong numerics).
+            if (check_skip_list) {
+                const bool skipped = skip_list->matches(entry.name);
+                if (skipped) ++skip_matches;
+                const bool is_fp8 =
+                    entry.dtype == SafetensorsDtype::F8_E4M3 ||
+                    entry.dtype == SafetensorsDtype::F8_E5M2;
+                if (id_opt->role == TensorRole::weight &&
+                    entry.shape.size() >= 2) {
+                    if (is_fp8 && skipped) {
+                        precision_errors.push_back(std::format(
+                            "'{}' is FP8 but modules_to_not_convert lists "
+                            "its module (expected BF16/F32)",
+                            entry.name));
+                    } else if (!is_fp8 && !skipped) {
+                        precision_errors.push_back(std::format(
+                            "'{}' is {} but its module is NOT in "
+                            "modules_to_not_convert (expected FP8)",
+                            entry.name, dtype_name(entry.dtype)));
+                    }
+                }
             }
 
             // TD-97a: skip routed expert entries early — avoid accumulate,
@@ -1757,7 +2081,37 @@ LoadedModel load_weights(const config::Config& cfg,
         }
     }
 
-    spdlog::info("Scanned {} tensor entries, {} unrecognized", total_entries, unrecognized);
+    spdlog::info("Scanned {} tensor entries, {} unrecognized{}", total_entries,
+                 unrecognized,
+                 vision_skipped
+                     ? std::format(", {} vision tensors skipped (GF3.14 "
+                                   "deferred — text-only)",
+                                   vision_skipped)
+                     : std::string{});
+
+    // GF3.3: a present, non-empty skip list that matched NOTHING is the
+    // namespace trap itself (module-path vs tensor-path namespaces) — fail
+    // loudly instead of letting every mixed-precision expectation drift.
+    if (check_skip_list && skip_list->entry_count() > 0 && skip_matches == 0) {
+        throw std::runtime_error(std::format(
+            "FP8 skip list: {} modules_to_not_convert entries matched ZERO "
+            "of {} tensors — namespace mismatch between the skip list and "
+            "the checkpoint tensor names (see quant_skip_list.h). Refusing "
+            "to load with unverifiable mixed precision.",
+            skip_list->entry_count(), total_entries));
+    }
+    if (!precision_errors.empty()) {
+        std::string msg = std::format(
+            "FP8 skip-list precision mismatches ({} total):\n",
+            precision_errors.size());
+        const size_t show = std::min<size_t>(precision_errors.size(), 20);
+        for (size_t i = 0; i < show; ++i) {
+            msg += "  - " + precision_errors[i] + "\n";
+            spdlog::error("Skip-list mismatch: {}", precision_errors[i]);
+        }
+        if (precision_errors.size() > show) msg += "  ... (truncated)\n";
+        throw std::runtime_error(msg);
+    }
 
     // Assemble bundles and place into model
     int validation_warnings = 0;
@@ -1886,6 +2240,33 @@ GgufModelExpertTypes gguf_expert_types_from_path(const std::string& weights_path
     return GgufModelExpertTypes{*gate, *up, *down};
 }
 
+GgufNonExpertWidths gguf_non_expert_widths_from_path(
+    const std::string& weights_path, bool use_mmap) {
+    GgufNonExpertWidths w;
+    std::vector<std::filesystem::path> files;
+    try {
+        files = resolve_gguf_files(weights_path);
+    } catch (const std::exception&) {
+        return w;  // not a GGUF path — callers keep their upper-bound sizing
+    }
+    auto rank = [](GgufKQuantType t) { return gguf::gguf_packed_bytes(1, 256, t); };
+    for (const auto& f : files) {
+        GgufReader r = GgufReader::open(f, use_mmap);
+        for (const auto& e : r.entries()) {
+            if (!e.is_kquant()) continue;          // plain float — caller's bound stands
+            auto id = parse_gguf_name(e.name);
+            if (!id) continue;
+            if (id->owner == TensorOwner::routed_expert) continue;  // expert cache, not pinned
+            if (id->role != TensorRole::weight) continue;
+            const int64_t k = GgufNonExpertWidths::key(id->layer_idx, id->component);
+            const GgufKQuantType t = e.kquant_type();
+            auto it = w.packed.find(k);
+            if (it == w.packed.end() || rank(t) > rank(it->second)) w.packed[k] = t;
+        }
+    }
+    return w;
+}
+
 // ── TD-VOCAB-AUTODETECT: weights-derived vocab width + config resolve ────────
 
 namespace {
@@ -1898,8 +2279,12 @@ int64_t vocab_rows_from_safetensors(const config::Config& cfg) {
     fs::path model_dir(cfg.model.weights_path);
     auto index = read_shard_index(model_dir);
 
-    static constexpr const char* kNames[] = {"model.embed_tokens.weight",
-                                             "lm_head.weight"};
+    // GF3.3: glm5_next multimodal checkpoints wrap the text model —
+    // model.language_model.embed_tokens (namespace note, MODELINFO §1).
+    static constexpr const char* kNames[] = {
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "lm_head.weight"};
     for (const char* name : kNames) {
         std::vector<std::string> candidates;
         if (!index.tensor_to_shard.empty()) {

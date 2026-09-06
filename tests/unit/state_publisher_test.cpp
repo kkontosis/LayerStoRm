@@ -230,6 +230,50 @@ TEST_F(StatePublisherTest, ExpertStatsReflected) {
                      static_cast<float>(expert_stats_->routing_weight({first_moe_layer_, 0})));
 }
 
+// P-29 step 21 (TD-STATE-PUBLISH-DEAD-EXPERT-STATS): while the expert-stats
+// feed is dead (ExpertStats never updated — the only update() site is behind
+// opt-in LS_FEED_EXPERTSTATS), the group is published as zeros ONCE and then
+// SKIPPED, not rewritten every cycle. Fails on the pre-step-21 code, which
+// rewrote the zeros (and would clobber the sentinel) on every publish.
+TEST_F(StatePublisherTest, DeadExpertStatsFeedPublishedOnceThenSkipped) {
+    auto pub = make_publisher();
+
+    // First publish with a never-updated ExpertStats: zeros written.
+    pub.publish(snap_, tx_);
+    size_t active = static_cast<size_t>(num_moe_layers_) * lipc::kMaxExperts;
+    for (size_t idx : {size_t{0}, active / 2, active - 1}) {
+        EXPECT_FLOAT_EQ(snap_.expert_frequency[idx], 0.0f);
+        EXPECT_FLOAT_EQ(snap_.expert_recency[idx], 0.0f);
+        EXPECT_FLOAT_EQ(snap_.expert_routing_weight[idx], 0.0f);
+        EXPECT_FLOAT_EQ(snap_.expert_temporal_autocorr[idx], 0.0f);
+    }
+
+    // Poison one cell, publish again: the dead group must be SKIPPED — the
+    // sentinel survives (the old code memset it back to zero every cycle).
+    snap_.expert_frequency[0] = 42.0f;
+    pub.publish(snap_, tx_);
+    EXPECT_FLOAT_EQ(snap_.expert_frequency[0], 42.0f)
+        << "dead expert-stats group was rewritten on a later publish";
+
+    // Feed goes live: the group resumes publishing real values (and the
+    // sentinel is overwritten by the true value).
+    std::vector<lstats::GatingResult> results;
+    lstats::GatingResult gr;
+    gr.token_id  = 1;
+    gr.layer_idx = first_moe_layer_;
+    gr.activations.push_back({{first_moe_layer_, 1}, 0.9f});
+    results.push_back(std::move(gr));
+    expert_stats_->update(results);
+    ASSERT_GT(expert_stats_->total_tokens_processed(), 0u);
+
+    pub.publish(snap_, tx_);
+    EXPECT_FLOAT_EQ(snap_.expert_frequency[0],
+                    static_cast<float>(
+                        expert_stats_->frequency({first_moe_layer_, 0})));
+    size_t idx1 = 0 * lipc::kMaxExperts + 1;
+    EXPECT_GT(snap_.expert_frequency[idx1], 0.0f);
+}
+
 // Note: ResidencyBitmapCorrect test removed — residency_bitmap is now
 // ELM-owned (tested in expert_lifecycle_manager_test.cpp).
 

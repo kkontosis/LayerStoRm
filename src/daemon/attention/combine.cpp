@@ -209,12 +209,14 @@ void DcpAttentionWrapper::correct_output(
 void DcpAttentionWrapper::reduce_hidden(
     void* const* hiddens,
     int batch_size,
-    void* const* streams) {
+    void* const* streams,
+    bool fp32) {
 
     if (!is_active()) return;
 
-    // Step 14: allreduce o_proj hidden (TP reduction)
-    comm_->allreduce_hidden(hiddens, batch_size, streams);
+    // Step 14: allreduce o_proj hidden (TP reduction). fp32 = the
+    // TD-GLM5-TP-COMBINE-PRECISION partial combine (FP32 buffers, FP32 sum).
+    comm_->allreduce_hidden(hiddens, batch_size, streams, fp32);
 }
 
 // -- queries -----------------------------------------------------------------

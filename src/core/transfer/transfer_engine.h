@@ -127,6 +127,21 @@ public:
     // whose start_delay_us hasn't elapsed. Called each daemon cycle.
     void flush_staged();
 
+    // P-29 step 19 (LS_FAR_GATE_DISPATCH consumer): force-dispatch every
+    // staged transfer on this GPU whose priority is >= min_priority,
+    // IGNORING max_inflight_per_gpu. Returns the number dispatched.
+    // Rationale: the inflight cap counts completion bookkeeping, not live
+    // DMA — under the gated-final decode path the daemon reaps ~4 ms late,
+    // so the 8-slot window fills with physically-complete copies and blocks
+    // the layer's own demand fetch (measured: 100% of gated-final fallbacks,
+    // blocking window 100% stale). Demand fetches (priority = +inf) are
+    // serialized on the same per-GPU h2d stream either way; dispatch order
+    // is IDENTICAL to what flush_staged would do (same priority-queue pop
+    // order), only earlier — so behavior differs solely in enqueue time.
+    // Items whose start_delay has not elapsed stop the sweep (same contract
+    // as flush_staged); lower-priority items are never touched.
+    int dispatch_staged_at_least(int gpu_idx, float min_priority);
+
     // ── Completion polling (non-blocking, INV-3.4.1) ────────────────────
     // Polls events, fires callbacks, removes from in-flight map.
     // After completions, auto-promotes from staging queue to maintain

@@ -331,6 +331,27 @@ void TransferEngine::flush_staged() {
     }
 }
 
+// P-29 step 19: force-dispatch staged transfers at/above min_priority past
+// the inflight cap (see header for the contract and the measured rationale).
+int TransferEngine::dispatch_staged_at_least(int gpu_idx, float min_priority) {
+    if (gpu_idx < 0 || gpu_idx >= static_cast<int>(staged_.size())) return 0;
+    auto& q = staged_[gpu_idx];
+    const int64_t current = now_us();
+    int dispatched = 0;
+    while (!q.empty() && q.top().priority >= min_priority) {
+        auto st = std::move(const_cast<StagedTransfer&>(q.top()));
+        q.pop();
+        if (st.delay_us > 0
+            && current - st.enqueue_time_us < st.delay_us) {
+            q.push(std::move(st));  // same stop contract as flush_staged
+            break;
+        }
+        dispatch_staged(st);
+        ++dispatched;
+    }
+    return dispatched;
+}
+
 // ── Completion polling ──────────────────────────────────────────────────────
 
 std::vector<TransferCompletion> TransferEngine::poll_completions() {

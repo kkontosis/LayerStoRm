@@ -1,0 +1,696 @@
+{
+  "description": "CPU golden fixtures for Kimi Delta Attention (KDA), the linear-attention layer of GLM-5.3-Flash. Float32 NumPy transcription of the RECURRENT (step-by-step) path.",
+  "reference": {
+    "repo": "vllm",
+    "tag": "pr-53906-head",
+    "kernel": "vllm/third_party/flash_linear_attention/ops/fused_recurrent.py :: fused_recurrent_gated_delta_rule_fwd_kernel (IS_KDA=True, COMPUTE_GATE=True, SIGMOID_BETA=True, USE_QK_L2NORM_IN_KERNEL=True, SAFE_GATE)",
+    "wiring": "vllm/models/glm5next/nvidia/kda.py",
+    "o_norm": "FusedRMSNormGated(hidden=128, activation='sigmoid', eps=1e-5)"
+  },
+  "geometry": {
+    "heads": 4,
+    "head_dim": 128,
+    "K": 128,
+    "V": 128,
+    "T_total": 152,
+    "T_prefill": 144,
+    "T_decode": 8,
+    "conv_width": 4,
+    "conv_channels": 512,
+    "scale": 0.0883883461356163,
+    "scale_hex_u32": "0x3DB504F3",
+    "lower_bound": -5.0,
+    "l2norm_eps": 1e-06,
+    "l2norm_eps_position": "inside the sqrt: x / sqrt(sum(x*x) + eps)",
+    "rmsnorm_eps": 1e-05
+  },
+  "math": {
+    "order": [
+      "depthwise causal conv1d (width 4, no bias) over the RAW q/k/v, then SiLU",
+      "L2 normalise q and k (eps inside sqrt); q *= scale",
+      "a = exp(A_log[h]); g_log = LOWER_BOUND / (1 + exp(-(a*(raw_g + dt_bias))))",
+      "decay = exp(g_log); S[v][c] *= decay[c]  (decay FIRST)",
+      "err[v] = v_conv[v] - sum_c S[v][c]*k[c]",
+      "err *= sigmoid(beta_raw)",
+      "S[v][c] += err[v]*k[c]",
+      "core_out[v] = sum_c S[v][c]*q[c]   (read AFTER the write)",
+      "rms = sqrt(mean(core_out^2) + 1e-5); onorm[v] = (core_out[v]/rms) * o_norm_w[v] * sigmoid(g2_raw[v])"
+    ],
+    "state_layout": "S[h][v][c], v = value/output channel, c = key channel",
+    "conv_state_layout": "[channel][3], oldest-first: x[t-3], x[t-2], x[t-1] (RAW, pre-conv, pre-SiLU)",
+    "conv_channel_index": "ch = head*128 + dim",
+    "accumulation": "plain float32. The two 128-wide reductions are done as an elementwise product followed by a summation (numpy pairwise), mirroring the Triton kernel's tl.sum(b_h * b_k[None, :], 1); no BLAS gemv is used, so the goldens do not depend on the host BLAS build. The conv accumulates j=0..3 in order. A C++ reference summing sequentially will agree to a few ULP, not bit-for-bit: compare with a relative tolerance around 1e-5.",
+    "conv_output_not_bf16_rounded": true,
+    "prefill_decode_split": "one continuous recurrence over 152 tokens; tokens 0..143 land in the prefill files, tokens 144..151 in the decode files"
+  },
+  "caveats": [
+    "The o_norm RMS is eps-dominated in both cases: mean(core_out^2) has a median of ~2.8e-7 (synth) and ~4.7e-9 (real) against rmsnorm_eps=1e-5, so the 1/sqrt(.) is clamped by eps for most tokens. The onorm goldens therefore exercise the gate and the per-channel weight strongly, but the normalisation division only weakly. Use *_core.bin (pre-o_norm) as the primary check of the recurrence, and prefer the state_after_* tensors for end-to-end drift.",
+    "core_out is small because q is L2-normalised and then scaled by 1/sqrt(128), and because the real conv weights are small (std ~0.02) while the synthetic pre-conv activations are unit-scale; the real engine feeds larger pre-conv activations out of q/k/v_proj.",
+    "The generator is BLAS-free by construction, so regenerating on another host reproduces these bytes exactly given the same numpy. A C++ reference that sums sequentially instead of pairwise will differ by a few ULP; compare with a relative tolerance of about 1e-5, not bit-for-bit.",
+    "Conv output is NOT bf16-rounded before entering the recurrence, matching the spec this fixture pins; the engine's causal_conv1d writes bf16."
+  ],
+  "prng": {
+    "algorithm": "splitmix64",
+    "step": "s += 0x9E3779B97F4A7C15; z=s; z=(z^(z>>30))*0xBF58476D1CE4E5B9; z=(z^(z>>27))*0x94D049BB133111EB; z^=z>>31",
+    "u01": "float32((r >> 40) * (1.0/16777216.0))  # 24-bit, exact in f32",
+    "uniform": "float32(lo + (hi-lo)*u01), (hi-lo)*u01 evaluated in float64",
+    "fill_order": "flat row-major, one independent stream per tensor",
+    "bf16_round": "u = f32 bits; r = (u + 0x7FFF + ((u>>16)&1)) & 0xFFFFFFFF; r &= 0xFFFF0000; reinterpret as f32 (round-to-nearest-even)"
+  },
+  "prng_check": {
+    "splitmix64_seed101_first4_u64_decimal": [
+      "15060681878671775511",
+      "317125338075985571",
+      "4955761374856264282",
+      "10230203001953340975"
+    ],
+    "synth_q_raw_seed101_first4_f32_hex_u32": [
+      "0x3F220000",
+      "0xBF770000",
+      "0xBEED0000",
+      "0x3DE00000"
+    ],
+    "synth_q_raw_seed101_first4_f32_decimal": [
+      0.6328125,
+      -0.96484375,
+      -0.462890625,
+      0.109375
+    ],
+    "note": "q_raw values are AFTER bf16 rounding"
+  },
+  "case_A_synth": {
+    "prefix": "synth_",
+    "all_synthetic": true,
+    "initial_recurrent_state": "seed 113, non-zero",
+    "initial_conv_state": "seeds 114/115/116, non-zero",
+    "streams": [
+      {
+        "seed": 101,
+        "tensor": "q_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 102,
+        "tensor": "k_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 103,
+        "tensor": "v_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 104,
+        "tensor": "raw_g",
+        "range": [
+          -3.0,
+          3.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 105,
+        "tensor": "g2_raw",
+        "range": [
+          -2.0,
+          2.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 106,
+        "tensor": "beta_raw",
+        "range": [
+          -2.0,
+          2.0
+        ],
+        "shape": [
+          152,
+          4
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 107,
+        "tensor": "A_log",
+        "range": [
+          -1.0,
+          1.5
+        ],
+        "shape": [
+          4
+        ],
+        "bf16": false
+      },
+      {
+        "seed": 108,
+        "tensor": "dt_bias",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          4,
+          128
+        ],
+        "bf16": false
+      },
+      {
+        "seed": 109,
+        "tensor": "q_conv_weight",
+        "range": [
+          -0.5,
+          0.5
+        ],
+        "shape": [
+          512,
+          4
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 110,
+        "tensor": "k_conv_weight",
+        "range": [
+          -0.5,
+          0.5
+        ],
+        "shape": [
+          512,
+          4
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 111,
+        "tensor": "v_conv_weight",
+        "range": [
+          -0.5,
+          0.5
+        ],
+        "shape": [
+          512,
+          4
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 112,
+        "tensor": "o_norm_weight",
+        "range": [
+          0.5,
+          1.5
+        ],
+        "shape": [
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 113,
+        "tensor": "initial recurrent state S0 [h][v][c]",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          4,
+          128,
+          128
+        ],
+        "bf16": false
+      },
+      {
+        "seed": 114,
+        "tensor": "initial conv state q",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          512,
+          3
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 115,
+        "tensor": "initial conv state k",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          512,
+          3
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 116,
+        "tensor": "initial conv state v",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          512,
+          3
+        ],
+        "bf16": true
+      }
+    ]
+  },
+  "case_B_real": {
+    "prefix": "real_",
+    "real_fixture_dir": "test-data/GLM-5.3-Flash/kda-layer0",
+    "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+    "real_heads": [
+      0,
+      17,
+      42,
+      63
+    ],
+    "head_mapping": "golden head g <- real head REAL_HEADS[g]",
+    "initial_recurrent_state": "ZERO",
+    "initial_conv_state": "ZERO",
+    "real_params": {
+      "A_log": "A_log[REAL_HEADS[g]] (f32)",
+      "dt_bias": "dt_bias[rh*128:(rh+1)*128] (f32)",
+      "conv_weights": "{q,k,v}_conv1d.weight rows [rh*128,(rh+1)*128), BF16 -> f32",
+      "o_norm_weight": "o_norm.weight [128], BF16 -> f32, shared by all heads"
+    },
+    "gating_through_real_lowrank": {
+      "raw_g": "bf16_round(f_a_act[t] @ f_b_real^T)  then rows [rh*128,(rh+1)*128)",
+      "g2_raw": "bf16_round(g_a_act[t] @ g_b_real^T)  then rows [rh*128,(rh+1)*128)",
+      "gemm_dtype": "float32 accumulation; result rounded to bf16 to mirror the engine dataflow (vLLM's GEMM output is the model dtype). Each output element is an elementwise product plus a numpy pairwise sum, not a BLAS sgemm, so the fixture is reproducible independently of the host BLAS."
+    },
+    "streams": [
+      {
+        "seed": 301,
+        "tensor": "f_a_act",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 302,
+        "tensor": "g_a_act",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 303,
+        "tensor": "q_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 304,
+        "tensor": "k_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 305,
+        "tensor": "v_raw (conv input)",
+        "range": [
+          -1.0,
+          1.0
+        ],
+        "shape": [
+          152,
+          4,
+          128
+        ],
+        "bf16": true
+      },
+      {
+        "seed": 306,
+        "tensor": "beta_raw",
+        "range": [
+          -2.0,
+          2.0
+        ],
+        "shape": [
+          152,
+          4
+        ],
+        "bf16": true
+      }
+    ],
+    "notes": "Activations are injected POST-projection by design: no real b_proj / f_a_proj / g_a_proj / q_proj / k_proj / v_proj GEMMs from hidden states are exercised here. b_proj, f_a_proj and g_a_proj are still fetched into the layer-0 fixture for completeness but are unused by this generator; only f_b_proj, g_b_proj, the three conv1d weights, A_log, dt_bias and o_norm.weight feed the goldens."
+  },
+  "cases": {
+    "synth": {
+      "prefix": "synth_",
+      "label": "A (synthetic params + activations)",
+      "gate_log_min": -4.993381977081299,
+      "gate_log_max": -0.006548851728439331,
+      "gate_values_at_lower_bound": 0,
+      "gate_values_at_zero": 0,
+      "files": [
+        {
+          "file": "synth_prefill_core.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            144,
+            4,
+            128
+          ],
+          "byte_size": 294912,
+          "sha256": "c6514fb7d50d75ba76776829619097fdf29a36e7ffba411c959bcca9df9aaaf2",
+          "min": -0.0586751326918602,
+          "max": 0.07131453603506088,
+          "mean": 4.7875134197998856e-05
+        },
+        {
+          "file": "synth_prefill_onorm.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            144,
+            4,
+            128
+          ],
+          "byte_size": 294912,
+          "sha256": "8c69792d83a9e87454d70ac832e6f67873350c6c5175c0dd3f4afd390afa9eaa",
+          "min": -2.3280029296875,
+          "max": 2.750575542449951,
+          "mean": 0.004644579056920068
+        },
+        {
+          "file": "synth_state_after_prefill.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            4,
+            128,
+            128
+          ],
+          "byte_size": 262144,
+          "sha256": "dc623a9627ea06dd47e349ac12da5267fb1dfb559f25c376dd4e6ffc84406f27",
+          "min": -0.07826005667448044,
+          "max": 0.19165503978729248,
+          "mean": 0.00030718563538602826
+        },
+        {
+          "file": "synth_conv_state_q.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "d4d8958412ae8fe4688f1a5cba60c80041131847f6a3e5317aeda1ebfb3a90d6",
+          "min": -0.9921875,
+          "max": 1.0,
+          "mean": 0.010377208391825357
+        },
+        {
+          "file": "synth_conv_state_k.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "1d5295bc95a88a4cad4c54d907457528a147592641c2efe226bf85d04b2252f8",
+          "min": -1.0,
+          "max": 0.99609375,
+          "mean": 0.010514294107755026
+        },
+        {
+          "file": "synth_conv_state_v.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "7cff166661796c1c870107d9ec11a507944d5f8746ef6f15d537e552ac44d235",
+          "min": -0.99609375,
+          "max": 0.99609375,
+          "mean": 0.007057299216588338
+        },
+        {
+          "file": "synth_decode_core.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            8,
+            4,
+            128
+          ],
+          "byte_size": 16384,
+          "sha256": "b8d70e1b96a532d755458b211225a9ba10d5ef072d766d75648b01e7f1b46773",
+          "min": -0.008094810880720615,
+          "max": 0.014173274859786034,
+          "mean": 4.244302296718683e-05
+        },
+        {
+          "file": "synth_decode_onorm.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            8,
+            4,
+            128
+          ],
+          "byte_size": 16384,
+          "sha256": "f2eff517ee59d74ac801c0b5a4dbbbc352586176f1bea6c1d7e15a62939ca2d8",
+          "min": -1.5154794454574585,
+          "max": 2.44820237159729,
+          "mean": 0.005703878583008137
+        },
+        {
+          "file": "synth_state_after_decode.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            4,
+            128,
+            128
+          ],
+          "byte_size": 262144,
+          "sha256": "b05691e08d473eb8044fcaa9df2a46d983641dd4a11d134e6fd69b5cde53ec54",
+          "min": -0.12157577276229858,
+          "max": 0.29048964381217957,
+          "mean": 0.00017345802702622623
+        }
+      ]
+    },
+    "real": {
+      "prefix": "real_",
+      "label": "B (real GLM-5.3-Flash layer-0 params)",
+      "gate_log_min": -4.811202049255371,
+      "gate_log_max": -2.7481485176394926e-06,
+      "gate_values_at_lower_bound": 0,
+      "gate_values_at_zero": 0,
+      "files": [
+        {
+          "file": "real_prefill_core.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            144,
+            4,
+            128
+          ],
+          "byte_size": 294912,
+          "sha256": "9c3575172452032ff3e08658da7420ce1f2929f0ea3f1875322e771af9cf569e",
+          "min": -0.0011166944168508053,
+          "max": 0.0013817069120705128,
+          "mean": -2.947691091515659e-07
+        },
+        {
+          "file": "real_prefill_onorm.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            144,
+            4,
+            128
+          ],
+          "byte_size": 294912,
+          "sha256": "0f53281f0428f530ff6999a8190d20ff057f6a9c37ea97bab48754eb13205a0b",
+          "min": -0.02122662216424942,
+          "max": 0.025399113073945045,
+          "mean": -6.859267357406671e-06
+        },
+        {
+          "file": "real_state_after_prefill.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            4,
+            128,
+            128
+          ],
+          "byte_size": 262144,
+          "sha256": "6ef6733e7482e7c2b8b75a458a9b96a1f2cdd26632a82392d0ffba45dd214532",
+          "min": -0.025749526917934418,
+          "max": 0.03618010878562927,
+          "mean": 6.829272556130089e-06
+        },
+        {
+          "file": "real_conv_state_q.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "ec0074961ee01a6a1d449f080f29e1017cf0ef29565c600b678714ca7be6869b",
+          "min": -1.0,
+          "max": 0.99609375,
+          "mean": -0.01071972850089272
+        },
+        {
+          "file": "real_conv_state_k.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "0c38150f291bb90b5bff4ee35801504da89de0c1799021ee50fca9ae3f07862b",
+          "min": -0.99609375,
+          "max": 1.0,
+          "mean": -0.0030828441182772317
+        },
+        {
+          "file": "real_conv_state_v.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            512,
+            3
+          ],
+          "byte_size": 6144,
+          "sha256": "e8ca71260b69236da87dce0016c96deb4fb04de0ff581fe66f5d50283e497dcd",
+          "min": -0.99609375,
+          "max": 1.0,
+          "mean": 0.0031997266535957656
+        },
+        {
+          "file": "real_decode_core.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            8,
+            4,
+            128
+          ],
+          "byte_size": 16384,
+          "sha256": "7522c48a7b0e2a6e5568d5c591d469f22dec563020f54e66722f60b029bb4f43",
+          "min": -0.0005643457407131791,
+          "max": 0.0014514237409457564,
+          "mean": -2.0191370973809963e-06
+        },
+        {
+          "file": "real_decode_onorm.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            8,
+            4,
+            128
+          ],
+          "byte_size": 16384,
+          "sha256": "4d14a81cc310b346e41145f8a4720fd1c7bb414f3a97794ca5dd7b2e772a63d6",
+          "min": -0.011437938548624516,
+          "max": 0.026557574048638344,
+          "mean": -6.068353386840322e-05
+        },
+        {
+          "file": "real_state_after_decode.bin",
+          "dtype": "float32",
+          "byte_order": "little-endian",
+          "shape": [
+            4,
+            128,
+            128
+          ],
+          "byte_size": 262144,
+          "sha256": "db3e7c2d80cd086c3ce802342d6e309c31c5e46b0160e4d6d04d13afdcfd4610",
+          "min": -0.027261467650532722,
+          "max": 0.03850739449262619,
+          "mean": -1.2779313594664865e-06
+        }
+      ]
+    }
+  }
+}

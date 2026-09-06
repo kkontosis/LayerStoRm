@@ -88,6 +88,10 @@ public:
     void gguf_mmvq(const GgufGemmParams& p, void* ws, void* s) override {
         device_.gguf_mmvq(p, ws, s);
     }
+    void gguf_mmvq_multi(const GgufGemmMultiParams& p, void* ws,
+                         void* s) override {
+        device_.gguf_mmvq_multi(p, ws, s);
+    }
     void gguf_mmq(const GgufGemmParams& p, void* ws, void* s) override {
         device_.gguf_mmq(p, ws, s);
     }
@@ -118,6 +122,10 @@ public:
     void batched_gemm_bf16(const StridedBatchedGemmBf16Params& p,
                            void* s) override {
         device_.batched_gemm_bf16(p, s);
+    }
+    void cast_f32_to_bf16(void* d, const void* src, int64_t n,
+                          void* s) override {
+        device_.cast_f32_to_bf16(d, src, n, s);
     }
     void rope_rotate(const RopeRotateParams& p, void* s) override {
         device_.rope_rotate(p, s);
@@ -154,6 +162,45 @@ public:
     }
     void indexer_topk_merge(const IndexerTopkMergeArgs& a, void* s) override {
         device_.indexer_topk_merge(a, s);
+    }
+    void indexer_kpool_append(const IndexerKpoolAppendArgs& a,
+                              void* s) override {
+        device_.indexer_kpool_append(a, s);
+    }
+    void indexer_kpool_chunk_append(const IndexerKpoolChunkAppendArgs& a,
+                                    void* s) override {
+        device_.indexer_kpool_chunk_append(a, s);
+    }
+    void indexer_kpool_expand(const IndexerKpoolExpandArgs& a,
+                              void* s) override {
+        device_.indexer_kpool_expand(a, s);
+    }
+    void indexer_kpool_merge(const IndexerKpoolMergeArgs& a,
+                             void* s) override {
+        device_.indexer_kpool_merge(a, s);
+    }
+
+    // GF3.9 KDA linear attention (glm5_next) — forwarded verbatim, like the
+    // kpool ops: the backend translates the CUDA-free PODs and launches the
+    // GF3.7 wrappers on the caller's (kAttention) stream.
+    void kda_conv_prefill(const KdaConvPrefillArgs& a, void* s) override {
+        device_.kda_conv_prefill(a, s);
+    }
+    void kda_conv_decode(const KdaConvDecodeArgs& a, void* s) override {
+        device_.kda_conv_decode(a, s);
+    }
+    void kda_chunked_scan(const KdaChunkedScanArgs& a, void* s) override {
+        device_.kda_chunked_scan(a, s);
+    }
+    void kda_gated_rmsnorm(const KdaGatedRmsNormArgs& a, void* s) override {
+        device_.kda_gated_rmsnorm(a, s);
+    }
+    void kda_decode_step(const KdaDecodeStepArgs& a, void* s) override {
+        device_.kda_decode_step(a, s);
+    }
+    size_t kda_prefill_workspace_bytes(int t_len,
+                                       int num_heads) const override {
+        return device_.kda_prefill_workspace_bytes(t_len, num_heads);
     }
 
     void* device_alloc(size_t bytes) override {

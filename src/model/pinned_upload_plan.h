@@ -70,6 +70,7 @@ struct PinnedUploadPlan {
 };
 
 struct GgufModelExpertTypes;  // weight_loader.h
+struct GgufNonExpertWidths;   // weight_loader.h (GF3.15)
 
 PinnedUploadPlan build_upload_plan(
     const ModelConfig& model_cfg,
@@ -82,7 +83,12 @@ PinnedUploadPlan build_upload_plan(
     // Q8_0, dense Q5_K/Q6_K, routed a per-layer mix), not the routed `expert_quant`.
     // nullptr → size them via expert_quant (uniform GGUF / non-GGUF, unchanged).
     const GgufModelExpertTypes* gguf_shared_types = nullptr,
-    const GgufModelExpertTypes* gguf_dense_types = nullptr);
+    const GgufModelExpertTypes* gguf_dense_types = nullptr,
+    // GF3.15 (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): the checkpoint's real
+    // per-tensor GGUF widths from a header pre-scan, so the glm5_next attention
+    // slots are sized at what the upload actually writes instead of a BF16
+    // upper bound. nullptr → the pre-load upper-bound sizing, unchanged.
+    const GgufNonExpertWidths* gguf_widths = nullptr);
 
 struct LoadedModel;
 

@@ -6,6 +6,7 @@
 // quant_mode==2 dispatch builds carries the expected fields/defaults.
 
 #include "core/expert_device.h"
+#include "model/quantization/gguf_compute_cast.h"
 #include "model/quantization/gguf_kquant.h"
 
 #include <gtest/gtest.h>
@@ -15,7 +16,8 @@
 namespace lc = layerstorm::compute;
 namespace lm = layerstorm::model;
 
-// Canonical ordinals: {Q2_K=0, Q3_K=1, Q4_K=2, Q5_K=3, Q6_K=4, Q8_0=5}.
+// Canonical ordinals: {Q2_K=0, Q3_K=1, Q4_K=2, Q5_K=3, Q6_K=4, Q8_0=5,
+// MXFP4=6}.
 TEST(GgufEnumReconciliation, CanonicalOrdinals) {
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q2_K), 0);
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q3_K), 1);
@@ -23,10 +25,19 @@ TEST(GgufEnumReconciliation, CanonicalOrdinals) {
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q5_K), 3);
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q6_K), 4);
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q8_0), 5);
+    EXPECT_EQ(static_cast<int>(lc::GgufQuantType::MXFP4), 6);
 }
 
 // The engine quant enum and the model quant enum share the same value order, so
 // the dispatch can map p.gguf_type (a model::GgufKQuantType ordinal) by cast.
+// TD-GGUF-ENUM-MXFP4-DIVERGENCE resolved: compute::GgufQuantType gained MXFP4
+// (=6, the V4 QAT routed-expert type) and the contract is now ALSO statically
+// enforced — gguf_compute_cast.h pins every enumerator + the enum length at
+// compile time (this TU includes it, so a divergence fails the BUILD before it
+// can fail this test), and the model->engine conversion goes through
+// lm::gguf::to_compute_gguf everywhere. This test remains as the runtime
+// mirror of that contract, including the tail/length checks that caught the
+// original divergence.
 TEST(GgufEnumReconciliation, MatchesModelEnum) {
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q2_K),
               static_cast<int>(lm::GgufKQuantType::Q2_K));
@@ -40,8 +51,18 @@ TEST(GgufEnumReconciliation, MatchesModelEnum) {
               static_cast<int>(lm::GgufKQuantType::Q6_K));
     EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q8_0),
               static_cast<int>(lm::GgufKQuantType::Q8_0));
-    EXPECT_EQ(static_cast<int>(lc::GgufQuantType::Q8_0),
+    EXPECT_EQ(static_cast<int>(lc::GgufQuantType::MXFP4),
+              static_cast<int>(lm::GgufKQuantType::MXFP4));
+    // Length lock: the two enums must end together. MXFP4 is the shared tail.
+    EXPECT_EQ(static_cast<int>(lc::GgufQuantType::MXFP4),
               lm::kNumGgufKQuantTypes - 1);
+    EXPECT_EQ(lc::kNumGgufQuantTypes, lm::kNumGgufKQuantTypes);
+    // The sanctioned bridge is value-preserving for every enumerator.
+    for (int i = 0; i < lm::kNumGgufKQuantTypes; ++i) {
+        EXPECT_EQ(static_cast<int>(lm::gguf::to_compute_gguf(
+                      static_cast<lm::GgufKQuantType>(i))),
+                  i);
+    }
 }
 
 // The strategy enum exists and defaults to int_strategy on the params struct,

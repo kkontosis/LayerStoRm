@@ -886,3 +886,320 @@ TEST(TpWeightSharder, GgufTpDegree1Noop) {
         EXPECT_EQ(s0.weight.size_bytes(), packed_total);     // packed, not out*in
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// glm5_next KDA linear attention (GF3.3; spec/GLM-5.3-FLASH-MODELINFO.md §3a)
+//
+// Real GLM-5.3-Flash dims: H = kda heads = 64, D = head_dim = 128,
+// K = short_conv_kernel_size = 4, h = hidden = 4096 ⇒ H*D = 8192.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static lc::Config glm53_flash_config_tp2() {
+    nlohmann::json layer_types = nlohmann::json::array();
+    for (int l = 0; l < 45; ++l) {
+        const bool sparse = (l % 4 == 3);
+        layer_types.push_back(sparse ? "deepseek_sparse_attention"
+                                     : "linear_attention");
+    }
+    auto j = nlohmann::json{
+        {"model", {
+            {"architecture",           "glm5_next"},
+            {"weights_path",           "/data/models/glm-5.3-flash/"},
+            {"weights_format",         "safetensors"},
+            {"num_hidden_layers",      45},
+            {"hidden_size",            4096},
+            {"num_attention_heads",    64},
+            {"num_key_value_heads",    64},
+            {"intermediate_size",      12288},
+            {"n_routed_experts",       288},
+            {"n_shared_experts",       1},
+            {"num_experts_per_tok",    8},
+            {"n_group",                1},
+            {"topk_group",             1},
+            {"vocab_size",             154880},
+            {"max_position_embeddings", 1048576},
+            {"kv_lora_rank",           512},
+            {"q_lora_rank",            1536},
+            {"qk_rope_head_dim",       0},
+            {"qk_nope_head_dim",       256},
+            {"v_head_dim",             256},
+            {"first_k_dense_replace",  3},
+            {"moe_layer_freq",         1},
+            {"index_topk",             2048},
+            {"index_n_heads",          32},
+            {"index_head_dim",         128},
+            {"index_kpool",            4},
+            {"index_kpool_compress",   true},
+            {"index_kpool_always_select_tail", true},
+            {"mla_use_nope",           true},
+            {"layer_types",            layer_types},
+            {"linear_attn_config", {
+                {"num_heads", 64}, {"head_dim", 128},
+                {"short_conv_kernel_size", 4},
+                {"gate_lower_bound", -5.0}}},
+            {"hc_mult",                4},
+            {"hc_sinkhorn_iters",      20},
+            {"hc_eps",                 1e-6},
+            {"swiglu_limit",           10.0},
+            {"num_nextn_predict_layers", 1},
+            {"rms_norm_eps",           1e-5},
+            {"routed_scaling_factor",  2.5},
+            {"moe_intermediate_size",  2048},
+        }},
+        {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
+                          {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
+        {"hardware", {{"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 32}},
+                                {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 32}}}},
+                      {"system_ram_gb", 256},
+                      {"tp_array", {0, 1}}}},
+        {"parallelism", {{"tensor_parallelism", 2}}},
+    };
+    return lc::parse_config(j);
+}
+
+// ── Mode classification: the head-axis split vs the replicated bottlenecks ──
+
+TEST(TpWeightSharder, Glm5NextKdaShardModes) {
+    // Column-parallel = split on the HEAD axis (axis 0 in every case).
+    for (auto c : {TensorComponent::kda_q_proj, TensorComponent::kda_k_proj,
+                   TensorComponent::kda_v_proj, TensorComponent::kda_b_proj,
+                   TensorComponent::kda_f_b_proj, TensorComponent::kda_g_b_proj,
+                   TensorComponent::kda_q_conv1d, TensorComponent::kda_k_conv1d,
+                   TensorComponent::kda_v_conv1d, TensorComponent::kda_a_log,
+                   TensorComponent::kda_dt_bias}) {
+        EXPECT_EQ(shard_mode_for(c), ShardMode::kColumnParallel)
+            << layerstorm::model::tensor_component_name(c);
+    }
+    // Rank-D bottlenecks + per-head-dim norm stay whole on every rank.
+    for (auto c : {TensorComponent::kda_f_a_proj, TensorComponent::kda_g_a_proj,
+                   TensorComponent::kda_o_norm}) {
+        EXPECT_EQ(shard_mode_for(c), ShardMode::kReplicated)
+            << layerstorm::model::tensor_component_name(c);
+    }
+    // KDA o_proj reuses the shared MLA component and its row-parallel rule.
+    EXPECT_EQ(shard_mode_for(TensorComponent::o_proj), ShardMode::kRowParallel);
+}
+
+// ── Column-parallel head split at the real shapes, tp=2 ────────────────────
+// Covers rank-2 ([H*D, h] and [H, h]), rank-3 ([H*D, 1, K] depthwise conv) and
+// rank-1 ([H] A_log, [H*D] dt_bias) tensors — all split on axis 0, all
+// zero-copy contiguous sub-spans.
+
+TEST(TpWeightSharder, Glm5NextKdaColumnParallelRealShapes) {
+    auto cfg = glm53_flash_config_tp2();
+    ModelConfig model_cfg{cfg};
+    TpWeightSharder sharder(model_cfg, 2);
+
+    // q_proj [8192, 4096] BF16 — 64 heads × 128 dim rows.
+    auto q_buf = make_synthetic_data(8192ULL * 4096 * 2);
+    auto q_bundle = make_bundle(q_buf, {8192, 4096}, SafetensorsDtype::BF16,
+                                TensorComponent::kda_q_proj);
+    auto q0 = sharder.shard_attention(q_bundle, 0);
+    auto q1 = sharder.shard_attention(q_bundle, 1);
+    EXPECT_EQ(q0.weight.shape, (std::vector<int64_t>{4096, 4096}));
+    EXPECT_EQ(q1.weight.shape, (std::vector<int64_t>{4096, 4096}));
+    EXPECT_EQ(q0.weight.size_bytes(), 4096LL * 4096 * 2);
+    EXPECT_FALSE(q0.weight.is_owned());
+    EXPECT_EQ(q0.weight.data.data(), q_buf.data());
+    EXPECT_EQ(q1.weight.data.data(), q_buf.data() + 4096LL * 4096 * 2);
+
+    // b_proj [64, 4096] BF16 — one row PER HEAD, so the head split is a 32-row
+    // split (this is the tensor that makes "tp must divide H" load-bearing).
+    auto b_buf = make_synthetic_data(64ULL * 4096 * 2);
+    auto b_bundle = make_bundle(b_buf, {64, 4096}, SafetensorsDtype::BF16,
+                                TensorComponent::kda_b_proj);
+    auto b0 = sharder.shard_attention(b_bundle, 0);
+    auto b1 = sharder.shard_attention(b_bundle, 1);
+    EXPECT_EQ(b0.weight.shape, (std::vector<int64_t>{32, 4096}));
+    EXPECT_EQ(b0.weight.size_bytes(), 32LL * 4096 * 2);
+    EXPECT_EQ(b1.weight.data.data(), b_buf.data() + 32LL * 4096 * 2);
+
+    // f_b_proj [8192, 128] BF16 — decay-gate up-projection, head-major rows.
+    auto fb_buf = make_synthetic_data(8192ULL * 128 * 2);
+    auto fb_bundle = make_bundle(fb_buf, {8192, 128}, SafetensorsDtype::BF16,
+                                 TensorComponent::kda_f_b_proj);
+    auto fb1 = sharder.shard_attention(fb_bundle, 1);
+    EXPECT_EQ(fb1.weight.shape, (std::vector<int64_t>{4096, 128}));
+    EXPECT_EQ(fb1.weight.size_bytes(), 4096LL * 128 * 2);
+    EXPECT_EQ(fb1.weight.data.data(), fb_buf.data() + 4096LL * 128 * 2);
+
+    // q_conv1d [8192, 1, 4] BF16 — RANK 3. A "row" is 1*4 elements = 8 bytes,
+    // NOT shape[1]*elem (which the old rank-2 formula would have used).
+    auto c_buf = make_synthetic_data(8192ULL * 1 * 4 * 2);
+    auto c_bundle = make_bundle(c_buf, {8192, 1, 4}, SafetensorsDtype::BF16,
+                                TensorComponent::kda_q_conv1d);
+    auto c0 = sharder.shard_attention(c_bundle, 0);
+    auto c1 = sharder.shard_attention(c_bundle, 1);
+    EXPECT_EQ(c0.weight.shape, (std::vector<int64_t>{4096, 1, 4}));
+    EXPECT_EQ(c0.weight.size_bytes(), 4096LL * 4 * 2);
+    EXPECT_EQ(c0.weight.data.size(), 4096ULL * 4 * 2);
+    EXPECT_FALSE(c0.weight.is_owned());
+    EXPECT_EQ(c0.weight.data.data(), c_buf.data());
+    EXPECT_EQ(c1.weight.data.data(), c_buf.data() + 4096LL * 4 * 2);
+    // Byte-exact content of the channel the two ranks straddle.
+    for (size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(c1.weight.data[i], c_buf[4096ULL * 4 * 2 + i]);
+    }
+
+    // A_log [64] F32 — RANK 1, one value per head.
+    auto a_buf = make_synthetic_data(64ULL * 4);
+    auto a_bundle = make_bundle(a_buf, {64}, SafetensorsDtype::F32,
+                                TensorComponent::kda_a_log);
+    auto a0 = sharder.shard_attention(a_bundle, 0);
+    auto a1 = sharder.shard_attention(a_bundle, 1);
+    EXPECT_EQ(a0.weight.shape, (std::vector<int64_t>{32}));
+    EXPECT_EQ(a0.weight.size_bytes(), 32LL * 4);
+    EXPECT_FALSE(a0.weight.is_owned());
+    EXPECT_EQ(a0.weight.data.data(), a_buf.data());
+    EXPECT_EQ(a1.weight.data.data(), a_buf.data() + 32LL * 4);
+    for (size_t i = 0; i < 128; ++i) {
+        EXPECT_EQ(a1.weight.data[i], a_buf[128 + i]);
+    }
+
+    // dt_bias [8192] F32 — RANK 1, one value per CHANNEL (head*head_dim).
+    auto dt_buf = make_synthetic_data(8192ULL * 4);
+    auto dt_bundle = make_bundle(dt_buf, {8192}, SafetensorsDtype::F32,
+                                 TensorComponent::kda_dt_bias);
+    auto dt0 = sharder.shard_attention(dt_bundle, 0);
+    auto dt1 = sharder.shard_attention(dt_bundle, 1);
+    EXPECT_EQ(dt0.weight.shape, (std::vector<int64_t>{4096}));
+    EXPECT_EQ(dt0.weight.size_bytes(), 4096LL * 4);
+    EXPECT_EQ(dt1.weight.data.data(), dt_buf.data() + 4096LL * 4);
+}
+
+// ── Replicated KDA tensors + the row-parallel o_proj ───────────────────────
+
+TEST(TpWeightSharder, Glm5NextKdaReplicatedAndOProj) {
+    auto cfg = glm53_flash_config_tp2();
+    ModelConfig model_cfg{cfg};
+    TpWeightSharder sharder(model_cfg, 2);
+
+    // f_a_proj / g_a_proj [128, 4096] BF16 — the rank-128 bottleneck is shared
+    // across heads, so both ranks must see the WHOLE tensor, zero-copy.
+    auto fa_buf = make_synthetic_data(128ULL * 4096 * 2);
+    for (auto comp : {TensorComponent::kda_f_a_proj,
+                      TensorComponent::kda_g_a_proj}) {
+        auto bundle = make_bundle(fa_buf, {128, 4096}, SafetensorsDtype::BF16, comp);
+        for (int r = 0; r < 2; ++r) {
+            auto s = sharder.shard_attention(bundle, r);
+            EXPECT_EQ(s.weight.shape, (std::vector<int64_t>{128, 4096}));
+            EXPECT_EQ(s.weight.size_bytes(), 128LL * 4096 * 2);
+            EXPECT_FALSE(s.weight.is_owned());
+            EXPECT_EQ(s.weight.data.data(), fa_buf.data());
+        }
+    }
+
+    // o_norm [128] BF16 — per-head-dim RMSNorm gain, replicated.
+    auto on_buf = make_synthetic_data(128ULL * 2);
+    auto on_bundle = make_bundle(on_buf, {128}, SafetensorsDtype::BF16,
+                                 TensorComponent::kda_o_norm);
+    for (int r = 0; r < 2; ++r) {
+        auto s = sharder.shard_attention(on_bundle, r);
+        EXPECT_EQ(s.weight.shape, (std::vector<int64_t>{128}));
+        EXPECT_EQ(s.weight.size_bytes(), 256);
+        EXPECT_EQ(s.weight.data.data(), on_buf.data());
+    }
+
+    // o_proj [4096, 8192] BF16 — row-parallel on the HEAD axis (its K dim),
+    // packed copy, one allreduce afterwards.
+    auto o_buf = make_synthetic_data(4096ULL * 8192 * 2);
+    auto o_bundle = make_bundle(o_buf, {4096, 8192}, SafetensorsDtype::BF16,
+                                TensorComponent::o_proj);
+    auto o1 = sharder.shard_attention(o_bundle, 1);
+    EXPECT_EQ(o1.weight.shape, (std::vector<int64_t>{4096, 4096}));
+    EXPECT_EQ(o1.weight.size_bytes(), 4096LL * 4096 * 2);
+    EXPECT_TRUE(o1.weight.is_owned());
+    // Row r of rank 1 = source row r, columns [4096, 8192).
+    const size_t src_row_bytes = 8192 * 2;
+    const size_t dst_row_bytes = 4096 * 2;
+    for (int64_t r : {int64_t{0}, int64_t{1}, int64_t{4095}}) {
+        EXPECT_EQ(std::memcmp(o1.weight.data.data() + r * dst_row_bytes,
+                              o_buf.data() + r * src_row_bytes + dst_row_bytes,
+                              dst_row_bytes), 0) << "row " << r;
+    }
+}
+
+// ── A full KDA layer at tp=1 and tp=2: bundle count + per-rank byte totals ──
+
+TEST(TpWeightSharder, Glm5NextKdaLayerTotals) {
+    auto cfg = glm53_flash_config_tp2();
+    ModelConfig model_cfg{cfg};
+
+    // Buffers for the 15-tensor KDA attention set (MODELINFO §3a).
+    auto qkv_buf   = make_synthetic_data(8192ULL * 4096 * 2);   // q/k/v_proj
+    auto b_buf     = make_synthetic_data(64ULL * 4096 * 2);     // b_proj
+    auto fga_buf   = make_synthetic_data(128ULL * 4096 * 2);    // f_a/g_a
+    auto fgb_buf   = make_synthetic_data(8192ULL * 128 * 2);    // f_b/g_b
+    auto conv_buf  = make_synthetic_data(8192ULL * 4 * 2);      // q/k/v_conv1d
+    auto alog_buf  = make_synthetic_data(64ULL * 4);            // A_log
+    auto dt_buf    = make_synthetic_data(8192ULL * 4);          // dt_bias
+    auto onorm_buf = make_synthetic_data(128ULL * 2);           // o_norm
+    auto o_buf     = make_synthetic_data(4096ULL * 8192 * 2);   // o_proj
+
+    std::vector<WeightBundle> attention;
+    for (auto c : {TensorComponent::kda_q_proj, TensorComponent::kda_k_proj,
+                   TensorComponent::kda_v_proj})
+        attention.push_back(make_bundle(qkv_buf, {8192, 4096},
+                                        SafetensorsDtype::BF16, c));
+    attention.push_back(make_bundle(b_buf, {64, 4096}, SafetensorsDtype::BF16,
+                                    TensorComponent::kda_b_proj));
+    for (auto c : {TensorComponent::kda_f_a_proj, TensorComponent::kda_g_a_proj})
+        attention.push_back(make_bundle(fga_buf, {128, 4096},
+                                        SafetensorsDtype::BF16, c));
+    for (auto c : {TensorComponent::kda_f_b_proj, TensorComponent::kda_g_b_proj})
+        attention.push_back(make_bundle(fgb_buf, {8192, 128},
+                                        SafetensorsDtype::BF16, c));
+    for (auto c : {TensorComponent::kda_q_conv1d, TensorComponent::kda_k_conv1d,
+                   TensorComponent::kda_v_conv1d})
+        attention.push_back(make_bundle(conv_buf, {8192, 1, 4},
+                                        SafetensorsDtype::BF16, c));
+    attention.push_back(make_bundle(alog_buf, {64}, SafetensorsDtype::F32,
+                                    TensorComponent::kda_a_log));
+    attention.push_back(make_bundle(dt_buf, {8192}, SafetensorsDtype::F32,
+                                    TensorComponent::kda_dt_bias));
+    attention.push_back(make_bundle(onorm_buf, {128}, SafetensorsDtype::BF16,
+                                    TensorComponent::kda_o_norm));
+    attention.push_back(make_bundle(o_buf, {4096, 8192}, SafetensorsDtype::BF16,
+                                    TensorComponent::o_proj));
+
+    // A KDA layer carries NO indexer (MODELINFO §3a).
+    const std::vector<WeightBundle> no_indexer;
+
+    // Hand-summed from the tensor table (no hc set here — that lives in the
+    // sizing formula, not the attention bundle list).
+    const int64_t full =
+        3LL * 8192 * 4096 * 2      // q/k/v_proj
+        + 64LL * 4096 * 2          // b_proj
+        + 2LL * 128 * 4096 * 2     // f_a/g_a
+        + 2LL * 8192 * 128 * 2     // f_b/g_b
+        + 3LL * 8192 * 4 * 2       // convs
+        + 64LL * 4                 // A_log
+        + 8192LL * 4               // dt_bias
+        + 128LL * 2                // o_norm
+        + 4096LL * 8192 * 2;       // o_proj
+    EXPECT_EQ(full, 275'481'088LL);
+
+    {
+        TpWeightSharder sharder(model_cfg, 1);
+        auto sharded = sharder.shard_attention_layer(attention, no_indexer, 0);
+        EXPECT_EQ(sharded.size(), 15u);
+        int64_t total = 0;
+        for (const auto& sb : sharded) total += sb.total_bytes();
+        EXPECT_EQ(total, full);
+    }
+    {
+        TpWeightSharder sharder(model_cfg, 2);
+        // Replicated share: f_a + g_a + o_norm.
+        const int64_t replicated = 2LL * 128 * 4096 * 2 + 128LL * 2;
+        const int64_t expected = replicated + (full - replicated) / 2;
+        EXPECT_EQ(expected, 138'789'248LL);
+        for (int rank = 0; rank < 2; ++rank) {
+            auto sharded = sharder.shard_attention_layer(attention, no_indexer,
+                                                         rank);
+            EXPECT_EQ(sharded.size(), 15u);
+            int64_t total = 0;
+            for (const auto& sb : sharded) total += sb.total_bytes();
+            EXPECT_EQ(total, expected) << "rank " << rank;
+        }
+    }
+}

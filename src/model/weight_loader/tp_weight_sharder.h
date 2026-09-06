@@ -12,6 +12,11 @@
 //   RowParallel    (split axis 1): o_proj               — packed copy
 //   Replicated     (no split):     q_a_proj, kv_a_proj, norms, DSA indexer
 //
+// glm5_next KDA linear attention (GF3.3): the column-parallel split is the
+// HEAD split — q/k/v/b/f_b/g_b/{q,k,v}_conv1d/A_log/dt_bias all carry the head
+// axis as axis 0 (ranks 1, 2 and 3 alike), while the rank-128 bottlenecks
+// f_a/g_a and the per-head-dim o_norm are replicated.  See shard_mode_for().
+//
 // Scale tensors follow their parent weight's sharding axis.
 // Scalar scales (weight_scale_2, input_scale) are always replicated.
 //==============================================================================

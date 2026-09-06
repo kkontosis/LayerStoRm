@@ -24,6 +24,10 @@
 #include "model/weight_pipeline/manifest.h"
 #include "model/weight_pipeline/prepacked_format.h"
 
+#include <unistd.h>
+
+#include <nlohmann/json.hpp>
+
 using namespace layerstorm::model;
 using namespace layerstorm;
 
@@ -41,6 +45,8 @@ constexpr int32_t kGGML_Q6_K = 14;
 
 // GGUF KV scalar types (ref gguf.h).
 constexpr int32_t kKV_UINT32 = 4;
+constexpr int32_t kKV_INT32  = 5;
+constexpr int32_t kKV_ARRAY  = 9;
 
 struct PlannedTensor {
     std::string name;
@@ -54,6 +60,13 @@ public:
 
     void add_tensor(std::string name, int32_t ggml_type, std::vector<int64_t> dims) {
         planned_.push_back({std::move(name), ggml_type, std::move(dims)});
+    }
+
+    // A small INT32 metadata ARRAY (GGUF kv type 9, element type 5) — the shape
+    // `glm5next.attention.head_count_kv` uses. GgufReader retains numeric
+    // arrays up to kSmallArrayCap elements.
+    void add_kv_i32_array(std::string key, std::vector<int32_t> values) {
+        i32_arrays_.push_back({std::move(key), std::move(values)});
     }
 
     // Build the full blob; fills each tensor's data region with a per-tensor
@@ -78,12 +91,21 @@ public:
         put(magic, 4);
         put_u32(3);
         put_i64(static_cast<int64_t>(planned_.size()));
-        put_i64(1);  // one KV: general.alignment
+        put_i64(1 + static_cast<int64_t>(i32_arrays_.size()));  // general.alignment + arrays
 
         // KV: general.alignment (uint32).
         put_str("general.alignment");
         put_i32(kKV_UINT32);
         put_u32(static_cast<uint32_t>(alignment_));
+
+        // KV: numeric INT32 arrays.
+        for (const auto& [key, vals] : i32_arrays_) {
+            put_str(key);
+            put_i32(kKV_ARRAY);
+            put_i32(kKV_INT32);
+            put_u64(vals.size());
+            for (int32_t v : vals) put_i32(v);
+        }
 
         // Tensor infos + compute per-tensor sizes/offsets within the blob.
         std::vector<uint64_t> sizes;
@@ -119,6 +141,19 @@ public:
             for (uint64_t b = 0; b < sizes[i]; ++b) {
                 dst[b] = static_cast<uint8_t>((i * 31 + b) & 0xFF);
             }
+            // GF3.9: ssm_a must model the REAL checkpoint convention
+            // A = -exp(A_log) < 0 (measured on the unsloth GGUF; the
+            // GF3.6 goldens' safe gate exponentiates A_log, so exp > 0
+            // always). The loader's convention guard REFUSES a
+            // non-negative value — index-pattern garbage bytes here would
+            // be a fixture that never matched any artifact.
+            if (planned_[i].name.size() >= 5
+                && planned_[i].name.compare(planned_[i].name.size() - 5, 5,
+                                            "ssm_a") == 0) {
+                auto* f = reinterpret_cast<float*>(dst);
+                for (uint64_t e = 0; e < sizes[i] / 4; ++e)
+                    f[e] = -1.5f - 0.01f * static_cast<float>(e % 64);
+            }
         }
         return out;
     }
@@ -140,6 +175,7 @@ private:
     static uint64_t align_up(uint64_t x, uint64_t a) { return (x + a - 1) / a * a; }
     uint64_t alignment_;
     std::vector<PlannedTensor> planned_;
+    std::vector<std::pair<std::string, std::vector<int32_t>>> i32_arrays_;
 };
 
 }  // namespace
@@ -1052,4 +1088,622 @@ TEST(GgufLoader, Mxfp4ExpertEntriesParseAndSize) {
         gguf::gguf_packed_bytes(inter, hidden, GgufKQuantType::MXFP4);
     EXPECT_EQ(per_expert, static_cast<int64_t>(inter) * (hidden / 32) * 17);
     EXPECT_EQ(per_expert * n_exp, static_cast<int64_t>(data.size()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// glm5_next (GLM-5.3-Flash) GGUF surface — GF3.9
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The COMPLETE measured tensor-name surface of the real GLM-5.3-Flash
+// UD-Q4_K_XL GGUF (unsloth, 1412 tensors over 6 shards, dumped 2026-08-29 —
+// scratchpad/gf39/SURVEY_BOOT.md §3.7): blk.0 = KDA linear layer with dense
+// FFN (26 tensors), blk.3 = sparse MLA + IndexPool indexer + MoE (31), blk.45 =
+// MTP/nextn block (29), plus the 3 non-blk tensors. Every name must map, and to
+// the RIGHT component — an unmapped name is silently dropped at load
+// (weight_loader.cpp "Unrecognized GGUF tensor name") and a mis-mapped one
+// loads the wrong anatomy.
+TEST(GgufLoader, ParseNameCoversGlm53GgufSurface) {
+    struct Case {
+        const char* name;
+        TensorComponent comp;
+        TensorOwner owner;
+        int layer;
+        TensorRole role = TensorRole::weight;
+    };
+    const Case cases[] = {
+        // ── blk.0 — KDA linear-attention layer, dense FFN ──
+        {"blk.0.attn_norm.weight", TensorComponent::input_layernorm,
+         TensorOwner::attention, 0},
+        {"blk.0.attn_q.weight", TensorComponent::kda_q_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.attn_k.weight", TensorComponent::kda_k_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.attn_v.weight", TensorComponent::kda_v_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.attn_output.weight", TensorComponent::o_proj,
+         TensorOwner::attention, 0},
+        // NO role suffix in the file — the narrow escape in parse_gguf_name.
+        {"blk.0.ssm_a", TensorComponent::kda_a_log, TensorOwner::attention, 0},
+        {"blk.0.ssm_beta.weight", TensorComponent::kda_b_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_conv1d_q.weight", TensorComponent::kda_q_conv1d,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_conv1d_k.weight", TensorComponent::kda_k_conv1d,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_conv1d_v.weight", TensorComponent::kda_v_conv1d,
+         TensorOwner::attention, 0},
+        // `.bias` suffix, but it IS the main tensor: role normalized to weight.
+        {"blk.0.ssm_dt.bias", TensorComponent::kda_dt_bias,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_f_a.weight", TensorComponent::kda_f_a_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_f_b.weight", TensorComponent::kda_f_b_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_g_a.weight", TensorComponent::kda_g_a_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_g_b.weight", TensorComponent::kda_g_b_proj,
+         TensorOwner::attention, 0},
+        {"blk.0.ssm_norm.weight", TensorComponent::kda_o_norm,
+         TensorOwner::attention, 0},
+        {"blk.0.ffn_norm.weight", TensorComponent::post_attention_layernorm,
+         TensorOwner::attention, 0},
+        {"blk.0.ffn_gate.weight", TensorComponent::gate_proj,
+         TensorOwner::dense_ffn, 0},
+        {"blk.0.ffn_up.weight", TensorComponent::up_proj,
+         TensorOwner::dense_ffn, 0},
+        {"blk.0.ffn_down.weight", TensorComponent::down_proj,
+         TensorOwner::dense_ffn, 0},
+        {"blk.0.hc_attn_base.weight", TensorComponent::hc_attn_base,
+         TensorOwner::attention, 0},
+        {"blk.0.hc_attn_fn.weight", TensorComponent::hc_attn_fn,
+         TensorOwner::attention, 0},
+        {"blk.0.hc_attn_scale.weight", TensorComponent::hc_attn_scale,
+         TensorOwner::attention, 0},
+        {"blk.0.hc_ffn_base.weight", TensorComponent::hc_ffn_base,
+         TensorOwner::attention, 0},
+        {"blk.0.hc_ffn_fn.weight", TensorComponent::hc_ffn_fn,
+         TensorOwner::attention, 0},
+        {"blk.0.hc_ffn_scale.weight", TensorComponent::hc_ffn_scale,
+         TensorOwner::attention, 0},
+
+        // ── blk.3 — sparse MLA + IndexPool indexer + MoE ──
+        {"blk.3.attn_norm.weight", TensorComponent::input_layernorm,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_q_a.weight", TensorComponent::q_a_proj,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_q_a_norm.weight", TensorComponent::q_a_norm,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_q_b.weight", TensorComponent::q_b_proj,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_kv_a_mqa.weight", TensorComponent::kv_a_proj_with_mqa,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_kv_a_norm.weight", TensorComponent::kv_a_norm,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_k_b.weight", TensorComponent::mla_k_b_split,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_v_b.weight", TensorComponent::mla_v_b_split,
+         TensorOwner::attention, 3},
+        {"blk.3.attn_output.weight", TensorComponent::o_proj,
+         TensorOwner::attention, 3},
+        {"blk.3.indexer.attn_q_b.weight", TensorComponent::indexer_wq_b,
+         TensorOwner::attention, 3},
+        {"blk.3.indexer.attn_k.weight", TensorComponent::indexer_wk,
+         TensorOwner::attention, 3},
+        {"blk.3.indexer.k_norm.weight", TensorComponent::indexer_k_norm_weight,
+         TensorOwner::attention, 3},
+        {"blk.3.indexer.k_norm.bias", TensorComponent::indexer_k_norm_bias,
+         TensorOwner::attention, 3, TensorRole::bias},
+        {"blk.3.indexer.proj.weight", TensorComponent::indexer_weights_proj,
+         TensorOwner::attention, 3},
+        {"blk.3.indexer_compressor_ape.weight",
+         TensorComponent::indexer_compressor_ape, TensorOwner::attention, 3},
+        {"blk.3.indexer_compressor_gate.weight",
+         TensorComponent::indexer_compressor_wgate, TensorOwner::attention, 3},
+        {"blk.3.ffn_norm.weight", TensorComponent::post_attention_layernorm,
+         TensorOwner::attention, 3},
+        {"blk.3.ffn_gate_inp.weight", TensorComponent::gate_weight,
+         TensorOwner::gating, 3},
+        {"blk.3.exp_probs_b.bias",
+         TensorComponent::gate_e_score_correction_bias, TensorOwner::gating, 3,
+         TensorRole::bias},
+        {"blk.3.ffn_gate_exps.weight", TensorComponent::gate_proj,
+         TensorOwner::routed_expert, 3},
+        {"blk.3.ffn_up_exps.weight", TensorComponent::up_proj,
+         TensorOwner::routed_expert, 3},
+        {"blk.3.ffn_down_exps.weight", TensorComponent::down_proj,
+         TensorOwner::routed_expert, 3},
+        {"blk.3.ffn_gate_shexp.weight", TensorComponent::gate_proj,
+         TensorOwner::shared_expert, 3},
+        {"blk.3.ffn_up_shexp.weight", TensorComponent::up_proj,
+         TensorOwner::shared_expert, 3},
+        {"blk.3.ffn_down_shexp.weight", TensorComponent::down_proj,
+         TensorOwner::shared_expert, 3},
+        {"blk.3.hc_attn_base.weight", TensorComponent::hc_attn_base,
+         TensorOwner::attention, 3},
+        {"blk.3.hc_attn_fn.weight", TensorComponent::hc_attn_fn,
+         TensorOwner::attention, 3},
+        {"blk.3.hc_attn_scale.weight", TensorComponent::hc_attn_scale,
+         TensorOwner::attention, 3},
+        {"blk.3.hc_ffn_base.weight", TensorComponent::hc_ffn_base,
+         TensorOwner::attention, 3},
+        {"blk.3.hc_ffn_fn.weight", TensorComponent::hc_ffn_fn,
+         TensorOwner::attention, 3},
+        {"blk.3.hc_ffn_scale.weight", TensorComponent::hc_ffn_scale,
+         TensorOwner::attention, 3},
+
+        // ── blk.45 — MTP / nextn block (no hc_*, no embed/head extras) ──
+        {"blk.45.attn_norm.weight", TensorComponent::input_layernorm,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_q_a.weight", TensorComponent::q_a_proj,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_q_a_norm.weight", TensorComponent::q_a_norm,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_q_b.weight", TensorComponent::q_b_proj,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_kv_a_mqa.weight", TensorComponent::kv_a_proj_with_mqa,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_kv_a_norm.weight", TensorComponent::kv_a_norm,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_k_b.weight", TensorComponent::mla_k_b_split,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_v_b.weight", TensorComponent::mla_v_b_split,
+         TensorOwner::attention, 45},
+        {"blk.45.attn_output.weight", TensorComponent::o_proj,
+         TensorOwner::attention, 45},
+        {"blk.45.exp_probs_b.bias",
+         TensorComponent::gate_e_score_correction_bias, TensorOwner::gating, 45,
+         TensorRole::bias},
+        {"blk.45.ffn_down_exps.weight", TensorComponent::down_proj,
+         TensorOwner::routed_expert, 45},
+        {"blk.45.ffn_down_shexp.weight", TensorComponent::down_proj,
+         TensorOwner::shared_expert, 45},
+        {"blk.45.ffn_gate_exps.weight", TensorComponent::gate_proj,
+         TensorOwner::routed_expert, 45},
+        {"blk.45.ffn_up_exps.weight", TensorComponent::up_proj,
+         TensorOwner::routed_expert, 45},
+        {"blk.45.ffn_gate_inp.weight", TensorComponent::gate_weight,
+         TensorOwner::gating, 45},
+        {"blk.45.ffn_norm.weight", TensorComponent::post_attention_layernorm,
+         TensorOwner::attention, 45},
+        {"blk.45.ffn_gate_shexp.weight", TensorComponent::gate_proj,
+         TensorOwner::shared_expert, 45},
+        {"blk.45.ffn_up_shexp.weight", TensorComponent::up_proj,
+         TensorOwner::shared_expert, 45},
+        {"blk.45.indexer.attn_k.weight", TensorComponent::indexer_wk,
+         TensorOwner::attention, 45},
+        {"blk.45.indexer.attn_q_b.weight", TensorComponent::indexer_wq_b,
+         TensorOwner::attention, 45},
+        {"blk.45.indexer.k_norm.weight", TensorComponent::indexer_k_norm_weight,
+         TensorOwner::attention, 45},
+        {"blk.45.indexer.k_norm.bias", TensorComponent::indexer_k_norm_bias,
+         TensorOwner::attention, 45, TensorRole::bias},
+        {"blk.45.indexer.proj.weight", TensorComponent::indexer_weights_proj,
+         TensorOwner::attention, 45},
+        {"blk.45.indexer_compressor_ape.weight",
+         TensorComponent::indexer_compressor_ape, TensorOwner::attention, 45},
+        {"blk.45.indexer_compressor_gate.weight",
+         TensorComponent::indexer_compressor_wgate, TensorOwner::attention, 45},
+        {"blk.45.nextn.eh_proj.weight", TensorComponent::mtp_eh_proj,
+         TensorOwner::mtp, 45},
+        {"blk.45.nextn.enorm.weight", TensorComponent::mtp_enorm,
+         TensorOwner::mtp, 45},
+        {"blk.45.nextn.hnorm.weight", TensorComponent::mtp_hnorm,
+         TensorOwner::mtp, 45},
+        {"blk.45.nextn.shared_head_norm.weight",
+         TensorComponent::mtp_shared_head_norm, TensorOwner::mtp, 45},
+
+        // ── the 3 non-blk tensors ──
+        {"token_embd.weight", TensorComponent::embedding,
+         TensorOwner::model_level, -1},
+        {"output.weight", TensorComponent::output_head,
+         TensorOwner::model_level, -1},
+        {"output_norm.weight", TensorComponent::final_norm,
+         TensorOwner::model_level, -1},
+    };
+    for (const auto& c : cases) {
+        auto id = parse_gguf_name(c.name);
+        ASSERT_TRUE(id.has_value()) << "unmapped: " << c.name;
+        EXPECT_EQ(id->component, c.comp) << c.name;
+        EXPECT_EQ(id->owner, c.owner) << c.name;
+        EXPECT_EQ(id->layer_idx, c.layer) << c.name;
+        EXPECT_EQ(id->role, c.role) << c.name;
+    }
+
+    // The suffix-less escape is NARROW: only `ssm_a`.
+    EXPECT_FALSE(parse_gguf_name("blk.0.ssm_b").has_value());
+    EXPECT_FALSE(parse_gguf_name("blk.0.ssm_xyz.weight").has_value());
+    EXPECT_FALSE(parse_gguf_name("blk.0.ssm_conv1d_x.weight").has_value());
+    EXPECT_FALSE(parse_gguf_name("ssm_a").has_value());
+    EXPECT_FALSE(parse_gguf_name("blk.x.ssm_a").has_value());
+}
+
+// ── End-to-end mini-glm5_next GGUF load ─────────────────────────────────────
+// Geometry mirrors GLM-5.3-Flash scaled down: 2 hidden layers (0 = KDA linear
+// with dense FFN, 1 = sparse MLA + IndexPool indexer + MoE) plus one MTP block,
+// in the REAL measured GGUF naming + dtype scheme (Q8_0 projections, F32 norms/
+// A_log/dt_bias/ape, Q4_K stacked experts).
+
+namespace {
+
+constexpr int64_t kG5Hidden = 256;
+constexpr int64_t kG5KdaHeads = 4;
+constexpr int64_t kG5KdaDim = 64;   // heads*dim == hidden
+constexpr int64_t kG5ConvK = 4;
+constexpr int64_t kG5Heads = 4;
+constexpr int64_t kG5QLora = 128;
+constexpr int64_t kG5KvLora = 128;
+constexpr int64_t kG5QkNope = 64;
+constexpr int64_t kG5VHead = 64;
+constexpr int64_t kG5IdxDim = 64;
+constexpr int64_t kG5IdxHeads = 4;
+constexpr int64_t kG5Kpool = 4;
+constexpr int64_t kG5Vocab = 512;
+constexpr int64_t kG5Experts = 4;
+constexpr int64_t kG5MoeInter = 256;  // Q4_K needs in_features % 256 == 0
+constexpr int64_t kG5Inter = 256;
+constexpr int64_t kG5HcMult = 4;
+constexpr int kG5Layers = 2;       // hidden layers
+constexpr int kG5SparseLayer = 1;
+constexpr int kG5MtpLayer = 2;     // blk index of the MTP block
+
+/// One synthetic GLM-5.3-Flash-shaped GGUF. `head_count_kv` is written as the
+/// `glm5next.attention.head_count_kv` array when non-empty (0 = KDA layer).
+std::vector<std::byte> build_glm53_mini_gguf(
+    const std::vector<int32_t>& head_count_kv) {
+    constexpr int32_t F32 = 0, Q4_K = 12, Q8_0 = 8;
+    GgufBlobBuilder b;
+    if (!head_count_kv.empty())
+        b.add_kv_i32_array("glm5next.attention.head_count_kv", head_count_kv);
+
+    // Model level (both Q8_0 and untied, as measured).
+    b.add_tensor("token_embd.weight", Q8_0, {kG5Hidden, kG5Vocab});
+    b.add_tensor("output.weight", Q8_0, {kG5Hidden, kG5Vocab});
+    b.add_tensor("output_norm.weight", F32, {kG5Hidden});
+
+    auto add_hc = [&](const std::string& blk) {
+        for (const char* w : {"attn", "ffn"}) {
+            b.add_tensor(blk + ".hc_" + w + "_base.weight", F32,
+                         {(2 + kG5HcMult) * kG5HcMult});
+            b.add_tensor(blk + ".hc_" + w + "_fn.weight", Q8_0,
+                         {kG5HcMult * kG5Hidden, (2 + kG5HcMult) * kG5HcMult});
+            b.add_tensor(blk + ".hc_" + w + "_scale.weight", F32, {3});
+        }
+    };
+
+    // ── blk.0: KDA linear attention + dense FFN ──
+    b.add_tensor("blk.0.attn_norm.weight", F32, {kG5Hidden});
+    for (const char* p : {"attn_q", "attn_k", "attn_v"})
+        b.add_tensor(std::string("blk.0.") + p + ".weight", Q8_0,
+                     {kG5Hidden, kG5KdaHeads * kG5KdaDim});
+    b.add_tensor("blk.0.attn_output.weight", Q8_0,
+                 {kG5KdaHeads * kG5KdaDim, kG5Hidden});
+    b.add_tensor("blk.0.ssm_a", F32, {kG5KdaHeads});              // no suffix
+    b.add_tensor("blk.0.ssm_beta.weight", Q8_0, {kG5Hidden, kG5KdaHeads});
+    for (const char* c : {"q", "k", "v"})
+        b.add_tensor(std::string("blk.0.ssm_conv1d_") + c + ".weight", F32,
+                     {kG5ConvK, 1, kG5KdaHeads * kG5KdaDim});
+    b.add_tensor("blk.0.ssm_dt.bias", F32, {kG5KdaHeads * kG5KdaDim});
+    b.add_tensor("blk.0.ssm_f_a.weight", Q8_0, {kG5Hidden, kG5KdaDim});
+    b.add_tensor("blk.0.ssm_f_b.weight", Q8_0,
+                 {kG5KdaDim, kG5KdaHeads * kG5KdaDim});
+    b.add_tensor("blk.0.ssm_g_a.weight", Q8_0, {kG5Hidden, kG5KdaDim});
+    b.add_tensor("blk.0.ssm_g_b.weight", Q8_0,
+                 {kG5KdaDim, kG5KdaHeads * kG5KdaDim});
+    b.add_tensor("blk.0.ssm_norm.weight", F32, {kG5KdaDim});
+    b.add_tensor("blk.0.ffn_norm.weight", F32, {kG5Hidden});
+    b.add_tensor("blk.0.ffn_gate.weight", Q8_0, {kG5Hidden, kG5Inter});
+    b.add_tensor("blk.0.ffn_up.weight", Q8_0, {kG5Hidden, kG5Inter});
+    b.add_tensor("blk.0.ffn_down.weight", Q8_0, {kG5Inter, kG5Hidden});
+    add_hc("blk.0");
+
+    // ── sparse MLA + indexer + MoE, shared by blk.1 and the MTP blk.2 ──
+    auto add_sparse = [&](const std::string& blk, bool with_moe) {
+        b.add_tensor(blk + ".attn_norm.weight", F32, {kG5Hidden});
+        b.add_tensor(blk + ".attn_q_a.weight", Q8_0, {kG5Hidden, kG5QLora});
+        b.add_tensor(blk + ".attn_q_a_norm.weight", F32, {kG5QLora});
+        b.add_tensor(blk + ".attn_q_b.weight", Q8_0,
+                     {kG5QLora, kG5Heads * kG5QkNope});
+        b.add_tensor(blk + ".attn_kv_a_mqa.weight", Q8_0,
+                     {kG5Hidden, kG5KvLora});
+        b.add_tensor(blk + ".attn_kv_a_norm.weight", F32, {kG5KvLora});
+        // Split MLA up-projection: file order {P,L,H} / {L,V,H}.
+        b.add_tensor(blk + ".attn_k_b.weight", Q8_0,
+                     {kG5QkNope, kG5KvLora, kG5Heads});
+        b.add_tensor(blk + ".attn_v_b.weight", Q8_0,
+                     {kG5KvLora, kG5VHead, kG5Heads});
+        b.add_tensor(blk + ".attn_output.weight", Q8_0,
+                     {kG5Heads * kG5VHead, kG5Hidden});
+        b.add_tensor(blk + ".indexer.attn_q_b.weight", Q8_0,
+                     {kG5QLora, kG5IdxHeads * kG5IdxDim});
+        b.add_tensor(blk + ".indexer.attn_k.weight", Q8_0,
+                     {kG5Hidden, kG5IdxDim});
+        b.add_tensor(blk + ".indexer.k_norm.weight", F32, {kG5IdxDim});
+        b.add_tensor(blk + ".indexer.k_norm.bias", F32, {kG5IdxDim});
+        b.add_tensor(blk + ".indexer.proj.weight", F32,
+                     {kG5Hidden, kG5IdxHeads});
+        // IndexPool compressor: ape ships F32, gate ships Q8_0 (the GF3.9
+        // load-time dequant target).
+        b.add_tensor(blk + ".indexer_compressor_ape.weight", F32,
+                     {kG5IdxDim, kG5Kpool});
+        b.add_tensor(blk + ".indexer_compressor_gate.weight", Q8_0,
+                     {kG5Hidden, kG5IdxDim});
+        b.add_tensor(blk + ".ffn_norm.weight", F32, {kG5Hidden});
+        if (!with_moe) return;
+        b.add_tensor(blk + ".ffn_gate_inp.weight", F32, {kG5Hidden, kG5Experts});
+        b.add_tensor(blk + ".exp_probs_b.bias", F32, {kG5Experts});
+        b.add_tensor(blk + ".ffn_gate_exps.weight", Q4_K,
+                     {kG5Hidden, kG5MoeInter, kG5Experts});
+        b.add_tensor(blk + ".ffn_up_exps.weight", Q4_K,
+                     {kG5Hidden, kG5MoeInter, kG5Experts});
+        b.add_tensor(blk + ".ffn_down_exps.weight", Q4_K,
+                     {kG5MoeInter, kG5Hidden, kG5Experts});
+        b.add_tensor(blk + ".ffn_gate_shexp.weight", Q8_0,
+                     {kG5Hidden, kG5MoeInter});
+        b.add_tensor(blk + ".ffn_up_shexp.weight", Q8_0,
+                     {kG5Hidden, kG5MoeInter});
+        b.add_tensor(blk + ".ffn_down_shexp.weight", Q8_0,
+                     {kG5MoeInter, kG5Hidden});
+    };
+    add_sparse("blk.1", /*with_moe=*/true);
+    add_hc("blk.1");
+
+    // ── blk.2: MTP block — sparse MLA, NO hc_*, 4 nextn extras ──
+    add_sparse("blk.2", /*with_moe=*/false);
+    b.add_tensor("blk.2.nextn.eh_proj.weight", Q8_0,
+                 {2 * kG5Hidden, kG5Hidden});
+    b.add_tensor("blk.2.nextn.enorm.weight", F32, {kG5Hidden});
+    b.add_tensor("blk.2.nextn.hnorm.weight", F32, {kG5Hidden});
+    b.add_tensor("blk.2.nextn.shared_head_norm.weight", F32, {kG5Hidden});
+
+    return b.build();
+}
+
+/// The engine-side recipe for the mini GGUF (GLM-5.3-Flash shape, shrunk).
+/// `layer_types` deliberately mirrors the head_count_kv the test writes — the
+/// mismatch tests perturb one or the other.
+layerstorm::config::Config glm53_mini_config(
+    const std::filesystem::path& gguf_file, bool layer0_linear = true) {
+    nlohmann::json layer_types = nlohmann::json::array();
+    for (int l = 0; l < kG5Layers; ++l) {
+        const bool linear = (l == 0) ? layer0_linear : (l != kG5SparseLayer);
+        layer_types.push_back(linear ? "linear_attention"
+                                     : "deepseek_sparse_attention");
+    }
+    nlohmann::json j = {
+        {"model",
+         {{"architecture", "glm5_next"},
+          {"weights_path", gguf_file.string()},
+          {"weights_format", "gguf"},
+          {"num_hidden_layers", kG5Layers},
+          {"hidden_size", kG5Hidden},
+          {"num_attention_heads", kG5Heads},
+          {"num_key_value_heads", kG5Heads},
+          {"intermediate_size", kG5Inter},
+          {"n_routed_experts", kG5Experts},
+          {"n_shared_experts", 1},
+          {"num_experts_per_tok", 2},
+          {"n_group", 1},
+          {"topk_group", 1},
+          {"vocab_size", kG5Vocab},
+          {"max_position_embeddings", 4096},
+          {"kv_lora_rank", kG5KvLora},
+          {"q_lora_rank", kG5QLora},
+          {"qk_rope_head_dim", 0},
+          {"qk_nope_head_dim", kG5QkNope},
+          {"v_head_dim", kG5VHead},
+          {"first_k_dense_replace", kG5SparseLayer},
+          {"moe_layer_freq", 1},
+          {"index_topk", 16},
+          {"index_n_heads", kG5IdxHeads},
+          {"index_head_dim", kG5IdxDim},
+          {"index_kpool", kG5Kpool},
+          {"index_kpool_compress", true},
+          {"index_kpool_always_select_tail", true},
+          {"mla_use_nope", true},
+          {"layer_types", layer_types},
+          {"linear_attn_config",
+           {{"num_heads", kG5KdaHeads},
+            {"head_dim", kG5KdaDim},
+            {"short_conv_kernel_size", kG5ConvK},
+            {"gate_lower_bound", -5.0}}},
+          {"hc_mult", kG5HcMult},
+          {"hc_sinkhorn_iters", 20},
+          {"hc_eps", 1e-6},
+          {"swiglu_limit", 10.0},
+          {"num_nextn_predict_layers", 1},
+          {"rms_norm_eps", 1e-5},
+          {"routed_scaling_factor", 2.5},
+          {"moe_intermediate_size", kG5MoeInter}}},
+        {"quantization",
+         {{"weights", "fp8_e4m3"},
+          {"attention_compute", "fp8_e4m3"},
+          {"kv_cache", "fp8_e4m3"},
+          {"gating_compute", "fp32"}}},
+        {"hardware",
+         {{"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 32}}}},
+          {"system_ram_gb", 256}}},
+    };
+    return layerstorm::config::parse_config(j);
+}
+
+/// Writes one mini GGUF into a fresh temp dir; removes it on destruction.
+class Glm53MiniGgufFixture {
+public:
+    explicit Glm53MiniGgufFixture(const std::string& tag,
+                                  const std::vector<int32_t>& head_count_kv) {
+        namespace fs = std::filesystem;
+        dir_ = fs::temp_directory_path() /
+               ("ls3_glm53_mini_" + tag + "_" + std::to_string(::getpid()));
+        std::error_code ec;
+        fs::remove_all(dir_, ec);
+        fs::create_directories(dir_);
+        file_ = dir_ / "glm53-mini.gguf";
+        const auto blob = build_glm53_mini_gguf(head_count_kv);
+        std::ofstream f(file_, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(blob.data()),
+                static_cast<std::streamsize>(blob.size()));
+    }
+    ~Glm53MiniGgufFixture() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+    const std::filesystem::path& file() const { return file_; }
+
+private:
+    std::filesystem::path dir_, file_;
+};
+
+const WeightBundle* find_in(const std::vector<WeightBundle>& v,
+                            TensorComponent c) {
+    for (const auto& b : v)
+        if (b.id.component == c) return &b;
+    return nullptr;
+}
+
+}  // namespace
+
+// The Q8_0 IndexPool compressor gate must arrive at the executor as BF16 (the
+// executor's kpool GEMM is BF16-only and nothing tags this component as a GGUF
+// operand — SURVEY_BOOT.md §4.5 / R7). Everything else keeps its shipped dtype.
+TEST(GgufLoader, Glm53MiniGgufLoadDequantsCompressorGate) {
+    Glm53MiniGgufFixture fx("gate", {0, 1, 1});
+    auto cfg = glm53_mini_config(fx.file());
+    ModelConfig mcfg(cfg);
+    ASSERT_TRUE(mcfg.is_glm5_next());
+    ASSERT_TRUE(mcfg.has_index_pool());
+    layerstorm::model::Fp8E4M3 quant;
+    LayerRegistry registry(mcfg, cfg, quant);
+
+    LoadedModel model;
+    ASSERT_NO_THROW(model = load_weights(cfg, mcfg, registry));
+    ASSERT_EQ(model.layers.size(), static_cast<size_t>(kG5Layers));
+
+    // ── layer 0: the full KDA anatomy parsed and placed ──
+    const auto& l0 = model.layers[0];
+    for (auto c : {TensorComponent::kda_q_proj, TensorComponent::kda_k_proj,
+                   TensorComponent::kda_v_proj, TensorComponent::kda_b_proj,
+                   TensorComponent::kda_f_a_proj, TensorComponent::kda_f_b_proj,
+                   TensorComponent::kda_g_a_proj, TensorComponent::kda_g_b_proj,
+                   TensorComponent::kda_q_conv1d, TensorComponent::kda_k_conv1d,
+                   TensorComponent::kda_v_conv1d, TensorComponent::kda_a_log,
+                   TensorComponent::kda_dt_bias, TensorComponent::kda_o_norm,
+                   TensorComponent::o_proj}) {
+        EXPECT_NE(find_in(l0.attention, c), nullptr)
+            << "layer 0 missing " << tensor_component_name(c);
+    }
+    EXPECT_TRUE(l0.indexer.empty());
+    EXPECT_FALSE(l0.dense_ffn.empty());
+
+    const auto* a_log = find_in(l0.attention, TensorComponent::kda_a_log);
+    ASSERT_NE(a_log, nullptr);
+    EXPECT_EQ(a_log->weight.dtype, SafetensorsDtype::F32);
+    EXPECT_EQ(a_log->id.role, TensorRole::weight);
+    EXPECT_EQ(a_log->weight.shape, (std::vector<int64_t>{kG5KdaHeads}));
+
+    const auto* dt = find_in(l0.attention, TensorComponent::kda_dt_bias);
+    ASSERT_NE(dt, nullptr);
+    EXPECT_EQ(dt->id.role, TensorRole::weight);  // `.bias` normalized to weight
+    EXPECT_EQ(dt->weight.dtype, SafetensorsDtype::F32);
+    EXPECT_TRUE(dt->aux.empty());
+
+    const auto* conv = find_in(l0.attention, TensorComponent::kda_q_conv1d);
+    ASSERT_NE(conv, nullptr);
+    EXPECT_EQ(conv->weight.shape,
+              (std::vector<int64_t>{kG5KdaHeads * kG5KdaDim, 1, kG5ConvK}));
+
+    const auto* kq = find_in(l0.attention, TensorComponent::kda_q_proj);
+    ASSERT_NE(kq, nullptr);
+    ASSERT_TRUE(kq->weight.gguf_type.has_value());  // Q8_0 stays packed
+    EXPECT_EQ(*kq->weight.gguf_type, GgufKQuantType::Q8_0);
+
+    // ── layer 1: the compressor gate is BF16, the ape untouched F32 ──
+    const auto& l1 = model.layers[kG5SparseLayer];
+    const auto* gate = find_in(l1.indexer, TensorComponent::indexer_compressor_wgate);
+    ASSERT_NE(gate, nullptr);
+    EXPECT_FALSE(gate->weight.gguf_type.has_value());
+    EXPECT_EQ(gate->weight.dtype, SafetensorsDtype::BF16);
+    EXPECT_EQ(gate->weight.shape, (std::vector<int64_t>{kG5IdxDim, kG5Hidden}));
+    EXPECT_EQ(static_cast<int64_t>(gate->weight.data.size()),
+              kG5IdxDim * kG5Hidden * 2);
+
+    const auto* ape = find_in(l1.indexer, TensorComponent::indexer_compressor_ape);
+    ASSERT_NE(ape, nullptr);
+    EXPECT_FALSE(ape->weight.gguf_type.has_value());
+    EXPECT_EQ(ape->weight.dtype, SafetensorsDtype::F32);
+    EXPECT_EQ(ape->weight.shape, (std::vector<int64_t>{kG5Kpool, kG5IdxDim}));
+
+    // Other Q8_0 indexer weights are NOT dequanted (only the gate is).
+    const auto* iwk = find_in(l1.indexer, TensorComponent::indexer_wk);
+    ASSERT_NE(iwk, nullptr);
+    EXPECT_TRUE(iwk->weight.gguf_type.has_value());
+
+    // Split kv_b assembled to BF16 on both sparse blocks.
+    const auto* kvb = find_in(l1.attention, TensorComponent::kv_b_proj);
+    ASSERT_NE(kvb, nullptr);
+    EXPECT_EQ(kvb->weight.dtype, SafetensorsDtype::BF16);
+
+    // ── the MTP block's gate is dequanted too ──
+    ASSERT_TRUE(model.mtp.has_value());
+    ASSERT_EQ(model.mtp->block_layers.size(), 1u);
+    const auto& mtp_blk = model.mtp->block_layers[0];
+    EXPECT_EQ(mtp_blk.layer_idx, kG5MtpLayer);
+    const auto* mtp_gate =
+        find_in(mtp_blk.indexer, TensorComponent::indexer_compressor_wgate);
+    ASSERT_NE(mtp_gate, nullptr);
+    EXPECT_FALSE(mtp_gate->weight.gguf_type.has_value());
+    EXPECT_EQ(mtp_gate->weight.dtype, SafetensorsDtype::BF16);
+}
+
+// A recipe whose layer_types disagrees with the checkpoint's head_count_kv
+// would load the wrong anatomy into a layer, silently. It must throw, naming
+// the first mismatching layer (SURVEY_BOOT.md R3).
+TEST(GgufLoader, Glm53MiniGgufRejectsLayerTypesMismatch) {
+    // Checkpoint says blk.0 is MLA (head_count_kv[0] != 0); the recipe says KDA.
+    Glm53MiniGgufFixture fx("mismatch", {1, 1, 1});
+    auto cfg = glm53_mini_config(fx.file());
+    ModelConfig mcfg(cfg);
+    layerstorm::model::Fp8E4M3 quant;
+    LayerRegistry registry(mcfg, cfg, quant);
+
+    try {
+        (void)load_weights(cfg, mcfg, registry);
+        FAIL() << "expected a layer_types/head_count_kv mismatch throw";
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("layer_types"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("layer 0"), std::string::npos) << msg;
+    }
+}
+
+TEST(GgufLoader, Glm53MiniGgufRejectsHeadCountKvLengthMismatch) {
+    // 2 entries for a 2 + 1 (hidden + MTP) block model.
+    Glm53MiniGgufFixture fx("len", {0, 1});
+    auto cfg = glm53_mini_config(fx.file());
+    ModelConfig mcfg(cfg);
+    layerstorm::model::Fp8E4M3 quant;
+    LayerRegistry registry(mcfg, cfg, quant);
+
+    try {
+        (void)load_weights(cfg, mcfg, registry);
+        FAIL() << "expected a head_count_kv length throw";
+    } catch (const std::runtime_error& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("head_count_kv"), std::string::npos) << msg;
+    }
+}
+
+// Exporters that drop the key must still load (warn-and-continue).
+TEST(GgufLoader, Glm53MiniGgufLoadsWithoutHeadCountKvMetadata) {
+    Glm53MiniGgufFixture fx("nokey", {});
+    auto cfg = glm53_mini_config(fx.file());
+    ModelConfig mcfg(cfg);
+    layerstorm::model::Fp8E4M3 quant;
+    LayerRegistry registry(mcfg, cfg, quant);
+
+    LoadedModel model;
+    ASSERT_NO_THROW(model = load_weights(cfg, mcfg, registry));
+    const auto* gate = find_in(model.layers[kG5SparseLayer].indexer,
+                               TensorComponent::indexer_compressor_wgate);
+    ASSERT_NE(gate, nullptr);
+    EXPECT_EQ(gate->weight.dtype, SafetensorsDtype::BF16);
 }

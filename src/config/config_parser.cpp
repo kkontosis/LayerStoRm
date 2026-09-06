@@ -60,6 +60,7 @@ static Architecture parse_architecture(const std::string& s) {
     if (s == "glm_moe_dsa") return Architecture::glm_moe_dsa;
     if (s == "kimi_k25") return Architecture::kimi_k25;
     if (s == "deepseek_v4") return Architecture::deepseek_v4;
+    if (s == "glm5_next") return Architecture::glm5_next;
     throw std::runtime_error("Unknown architecture: " + s);
 }
 
@@ -69,6 +70,7 @@ static std::string to_string(Architecture v) {
         case Architecture::glm_moe_dsa: return "glm_moe_dsa";
         case Architecture::kimi_k25: return "kimi_k25";
         case Architecture::deepseek_v4: return "deepseek_v4";
+        case Architecture::glm5_next: return "glm5_next";
     }
     return {};
 }
@@ -99,6 +101,20 @@ static std::string to_string(GatingScoreFn v) {
         case GatingScoreFn::sigmoid: return "sigmoid";
         case GatingScoreFn::softmax: return "softmax";
         case GatingScoreFn::sqrtsoftplus: return "sqrtsoftplus";
+    }
+    return {};
+}
+
+static LayerAttentionType parse_layer_attention_type(const std::string& s) {
+    if (s == "linear_attention") return LayerAttentionType::linear_attention;
+    if (s == "deepseek_sparse_attention") return LayerAttentionType::deepseek_sparse_attention;
+    throw std::runtime_error("Unknown layer_attention_type: " + s);
+}
+
+static std::string to_string(LayerAttentionType v) {
+    switch (v) {
+        case LayerAttentionType::linear_attention: return "linear_attention";
+        case LayerAttentionType::deepseek_sparse_attention: return "deepseek_sparse_attention";
     }
     return {};
 }
@@ -522,6 +538,40 @@ static std::string to_string(HostCacheMode v) {
     return {};
 }
 
+static Prefer parse_prefer(const std::string& s) {
+    if (s == "speed") return Prefer::speed;
+    if (s == "balanced") return Prefer::balanced;
+    if (s == "capacity") return Prefer::capacity;
+    throw std::runtime_error("Unknown prefer: " + s);
+}
+
+static std::string to_string(Prefer v) {
+    switch (v) {
+        case Prefer::speed: return "speed";
+        case Prefer::balanced: return "balanced";
+        case Prefer::capacity: return "capacity";
+    }
+    return {};
+}
+
+static Accuracy parse_accuracy(const std::string& s) {
+    if (s == "compact") return Accuracy::compact;
+    if (s == "standard") return Accuracy::standard;
+    if (s == "high") return Accuracy::high;
+    if (s == "superior") return Accuracy::superior;
+    throw std::runtime_error("Unknown accuracy: " + s);
+}
+
+static std::string to_string(Accuracy v) {
+    switch (v) {
+        case Accuracy::compact: return "compact";
+        case Accuracy::standard: return "standard";
+        case Accuracy::high: return "high";
+        case Accuracy::superior: return "superior";
+    }
+    return {};
+}
+
 static CalibrationMode parse_calibration_mode(const std::string& s) {
     if (s == "loaded") return CalibrationMode::loaded;
     if (s == "quick") return CalibrationMode::quick;
@@ -679,6 +729,24 @@ static nlohmann::json rope_scaling_to_json(const RopeScalingConfig& r) {
     return j;
 }
 
+static LinearAttnConfig parse_linear_attn(const nlohmann::json& j) {
+    LinearAttnConfig r;
+    r.num_heads = get_or(j, "num_heads", 64);
+    r.head_dim = get_or(j, "head_dim", 128);
+    r.short_conv_kernel_size = get_or(j, "short_conv_kernel_size", 4);
+    r.gate_lower_bound = get_or(j, "gate_lower_bound", -5.0);
+    return r;
+}
+
+static nlohmann::json linear_attn_to_json(const LinearAttnConfig& r) {
+    nlohmann::json j;
+    j["num_heads"] = r.num_heads;
+    j["head_dim"] = r.head_dim;
+    j["short_conv_kernel_size"] = r.short_conv_kernel_size;
+    j["gate_lower_bound"] = r.gate_lower_bound;
+    return j;
+}
+
 static VisionConfig parse_vision(const nlohmann::json& j) {
     VisionConfig r;
     r.enabled = get_or(j, "enabled", false);
@@ -732,6 +800,9 @@ static ModelConfig parse_model(const nlohmann::json& j) {
     r.index_head_dim = get_or(j, "index_head_dim", 128);
     r.index_topk_freq = get_or(j, "index_topk_freq", 0);
     r.index_skip_topk_offset = get_or(j, "index_skip_topk_offset", 0);
+    r.index_kpool = get_or(j, "index_kpool", 1);
+    r.index_kpool_compress = get_or(j, "index_kpool_compress", false);
+    r.index_kpool_always_select_tail = get_or(j, "index_kpool_always_select_tail", false);
     if (j.contains("rope_scaling") && !j.at("rope_scaling").is_null()) r.rope_scaling = parse_rope_scaling(j.at("rope_scaling"));
     r.rope_interleave = get_or(j, "rope_interleave", false);
     r.indexer_rope_interleave = get_or(j, "indexer_rope_interleave", false);
@@ -755,6 +826,12 @@ static ModelConfig parse_model(const nlohmann::json& j) {
     r.hc_mult = get_or(j, "hc_mult", 1);
     r.hc_sinkhorn_iters = get_or(j, "hc_sinkhorn_iters", 20);
     r.hc_eps = get_or(j, "hc_eps", 0.000001);
+    if (j.contains("layer_types") && !j.at("layer_types").is_null()) {
+        r.layer_types.clear();
+        for (const auto& el : j.at("layer_types")) r.layer_types.push_back(parse_layer_attention_type(el.get<std::string>()));
+    }
+    if (j.contains("linear_attn_config") && !j.at("linear_attn_config").is_null()) r.linear_attn_config = parse_linear_attn(j.at("linear_attn_config"));
+    r.mla_use_nope = get_or(j, "mla_use_nope", false);
     if (j.contains("vision") && !j.at("vision").is_null()) r.vision = parse_vision(j.at("vision"));
     return r;
 }
@@ -790,6 +867,9 @@ static nlohmann::json model_to_json(const ModelConfig& r) {
     j["index_head_dim"] = r.index_head_dim;
     j["index_topk_freq"] = r.index_topk_freq;
     j["index_skip_topk_offset"] = r.index_skip_topk_offset;
+    j["index_kpool"] = r.index_kpool;
+    j["index_kpool_compress"] = r.index_kpool_compress;
+    j["index_kpool_always_select_tail"] = r.index_kpool_always_select_tail;
     if (r.rope_scaling) j["rope_scaling"] = rope_scaling_to_json(*r.rope_scaling); else j["rope_scaling"] = nullptr;
     j["rope_interleave"] = r.rope_interleave;
     j["indexer_rope_interleave"] = r.indexer_rope_interleave;
@@ -810,6 +890,9 @@ static nlohmann::json model_to_json(const ModelConfig& r) {
     j["hc_mult"] = r.hc_mult;
     j["hc_sinkhorn_iters"] = r.hc_sinkhorn_iters;
     j["hc_eps"] = r.hc_eps;
+    { nlohmann::json arr = nlohmann::json::array(); for (const auto& el : r.layer_types) arr.push_back(to_string(el)); j["layer_types"] = arr; }
+    if (r.linear_attn_config) j["linear_attn_config"] = linear_attn_to_json(*r.linear_attn_config); else j["linear_attn_config"] = nullptr;
+    j["mla_use_nope"] = r.mla_use_nope;
     if (r.vision) j["vision"] = vision_to_json(*r.vision); else j["vision"] = nullptr;
     return j;
 }
@@ -1518,6 +1601,7 @@ static DsparkConfig parse_dspark(const nlohmann::json& j) {
     r.aux_capture_max_rows = get_or(j, "aux_capture_max_rows", 2048);
     r.epm_dump_dir = get_or(j, "epm_dump_dir", std::string{""});
     r.verify_chunk_prefetch = get_or(j, "verify_chunk_prefetch", false);
+    r.ctx_rotate = get_or(j, "ctx_rotate", true);
     return r;
 }
 
@@ -1542,6 +1626,7 @@ static nlohmann::json dspark_to_json(const DsparkConfig& r) {
     j["aux_capture_max_rows"] = r.aux_capture_max_rows;
     j["epm_dump_dir"] = r.epm_dump_dir;
     j["verify_chunk_prefetch"] = r.verify_chunk_prefetch;
+    j["ctx_rotate"] = r.ctx_rotate;
     return j;
 }
 
@@ -1971,8 +2056,12 @@ static ComputeConfig parse_compute(const nlohmann::json& j) {
     r.prefill_superchunk_tokens = get_or(j, "prefill_superchunk_tokens", 0);
     r.prefill_moe_big = get_or(j, "prefill_moe_big", true);
     r.moe_big_chunk_tokens = get_or(j, "moe_big_chunk_tokens", 512);
+    r.moe_big_fit_headroom_mb = get_or(j, "moe_big_fit_headroom_mb", 1024);
+    r.moe_big_fit_headroom_expert_only_mb = get_or(j, "moe_big_fit_headroom_expert_only_mb", 256);
     r.dsa_sparse_prefill = get_or(j, "dsa_sparse_prefill", false);
     r.dsa_indexer_rewind = get_or(j, "dsa_indexer_rewind", true);
+    r.deterministic = get_or(j, "deterministic", false);
+    r.reference_trajectory_identity = get_or(j, "reference_trajectory_identity", false);
     r.deterministic_reduce = get_or(j, "deterministic_reduce", true);
     r.deterministic_ep_combine = get_or(j, "deterministic_ep_combine", false);
     if (j.contains("deterministic_ep_combine_precision")) r.deterministic_ep_combine_precision = parse_deterministic_ep_combine_precision(j.at("deterministic_ep_combine_precision").get<std::string>());
@@ -1988,12 +2077,32 @@ static nlohmann::json compute_to_json(const ComputeConfig& r) {
     j["prefill_superchunk_tokens"] = r.prefill_superchunk_tokens;
     j["prefill_moe_big"] = r.prefill_moe_big;
     j["moe_big_chunk_tokens"] = r.moe_big_chunk_tokens;
+    j["moe_big_fit_headroom_mb"] = r.moe_big_fit_headroom_mb;
+    j["moe_big_fit_headroom_expert_only_mb"] = r.moe_big_fit_headroom_expert_only_mb;
     j["dsa_sparse_prefill"] = r.dsa_sparse_prefill;
     j["dsa_indexer_rewind"] = r.dsa_indexer_rewind;
+    j["deterministic"] = r.deterministic;
+    j["reference_trajectory_identity"] = r.reference_trajectory_identity;
     j["deterministic_reduce"] = r.deterministic_reduce;
     j["deterministic_ep_combine"] = r.deterministic_ep_combine;
     j["deterministic_ep_combine_precision"] = to_string(r.deterministic_ep_combine_precision);
     j["ipc_pin"] = r.ipc_pin;
+    return j;
+}
+
+static KdaCheckpointsConfig parse_kda_checkpoints(const nlohmann::json& j) {
+    KdaCheckpointsConfig r;
+    r.enabled = get_or(j, "enabled", true);
+    r.interval_tokens = get_or(j, "interval_tokens", 2048);
+    r.budget_mib = get_or(j, "budget_mib", 32768);
+    return r;
+}
+
+static nlohmann::json kda_checkpoints_to_json(const KdaCheckpointsConfig& r) {
+    nlohmann::json j;
+    j["enabled"] = r.enabled;
+    j["interval_tokens"] = r.interval_tokens;
+    j["budget_mib"] = r.budget_mib;
     return j;
 }
 
@@ -2002,6 +2111,7 @@ static PrefixCacheConfig parse_prefix_cache(const nlohmann::json& j) {
     r.enabled = get_or(j, "enabled", true);
     r.max_cached_tokens = get_or(j, "max_cached_tokens", 131072);
     r.max_entries = get_or(j, "max_entries", 8);
+    if (j.contains("kda_checkpoints")) r.kda_checkpoints = parse_kda_checkpoints(j.at("kda_checkpoints"));
     return r;
 }
 
@@ -2010,6 +2120,7 @@ static nlohmann::json prefix_cache_to_json(const PrefixCacheConfig& r) {
     j["enabled"] = r.enabled;
     j["max_cached_tokens"] = r.max_cached_tokens;
     j["max_entries"] = r.max_entries;
+    j["kda_checkpoints"] = kda_checkpoints_to_json(r.kda_checkpoints);
     return j;
 }
 
@@ -2074,12 +2185,34 @@ static nlohmann::json preprocessing_to_json(const PreprocessingConfig& r) {
 static PrefixCacheInternalConfig parse_prefix_cache_internal(const nlohmann::json& j) {
     PrefixCacheInternalConfig r;
     r.max_entry_tokens = get_or(j, "max_entry_tokens", 0);
+    r.subgrid_mid_edge = get_or(j, "subgrid_mid_edge", false);
+    r.hibernate_holders = get_or(j, "hibernate_holders", true);
     return r;
 }
 
 static nlohmann::json prefix_cache_internal_to_json(const PrefixCacheInternalConfig& r) {
     nlohmann::json j;
     j["max_entry_tokens"] = r.max_entry_tokens;
+    j["subgrid_mid_edge"] = r.subgrid_mid_edge;
+    j["hibernate_holders"] = r.hibernate_holders;
+    return j;
+}
+
+static PrefixSpillInternalConfig parse_prefix_spill_internal(const nlohmann::json& j) {
+    PrefixSpillInternalConfig r;
+    r.enabled = get_or(j, "enabled", true);
+    r.path = get_or(j, "path", std::string{"~/.layerstorm/prefix-cache"});
+    r.max_mib = get_or(j, "max_mib", 32768);
+    r.idle_seconds = get_or(j, "idle_seconds", 300.0);
+    return r;
+}
+
+static nlohmann::json prefix_spill_internal_to_json(const PrefixSpillInternalConfig& r) {
+    nlohmann::json j;
+    j["enabled"] = r.enabled;
+    j["path"] = r.path;
+    j["max_mib"] = r.max_mib;
+    j["idle_seconds"] = r.idle_seconds;
     return j;
 }
 
@@ -2407,6 +2540,10 @@ static OrchestratorInternalConfig parse_orchestrator_internal(const nlohmann::js
     }
     r.prefill_sc_min_tokens = get_or(j, "prefill_sc_min_tokens", 256);
     r.prefill_sc_small_chunk_tokens = get_or(j, "prefill_sc_small_chunk_tokens", 64);
+    r.degraded_retry_enabled = get_or(j, "degraded_retry_enabled", true);
+    r.degraded_retry_max = get_or(j, "degraded_retry_max", 1);
+    r.kvxp_large_prefill_tokens = get_or(j, "kvxp_large_prefill_tokens", 8192);
+    r.kvxp_large_prefill_wait_ms = get_or(j, "kvxp_large_prefill_wait_ms", 2000);
     return r;
 }
 
@@ -2415,6 +2552,114 @@ static nlohmann::json orchestrator_internal_to_json(const OrchestratorInternalCo
     j["ep_gpu_indices"] = r.ep_gpu_indices;
     j["prefill_sc_min_tokens"] = r.prefill_sc_min_tokens;
     j["prefill_sc_small_chunk_tokens"] = r.prefill_sc_small_chunk_tokens;
+    j["degraded_retry_enabled"] = r.degraded_retry_enabled;
+    j["degraded_retry_max"] = r.degraded_retry_max;
+    j["kvxp_large_prefill_tokens"] = r.kvxp_large_prefill_tokens;
+    j["kvxp_large_prefill_wait_ms"] = r.kvxp_large_prefill_wait_ms;
+    return j;
+}
+
+static AutoconfigConfig parse_autoconfig(const nlohmann::json& j) {
+    AutoconfigConfig r;
+    r.enabled = get_or(j, "enabled", false);
+    if (j.contains("vram_expert_ratio") && !j.at("vram_expert_ratio").is_null()) r.vram_expert_ratio = j.at("vram_expert_ratio").get<double>();
+    if (j.contains("total_active_context_tokens") && !j.at("total_active_context_tokens").is_null()) r.total_active_context_tokens = j.at("total_active_context_tokens").get<int>();
+    r.output_path = get_or(j, "output_path", std::string{""});
+    r.fingerprint = get_or(j, "fingerprint", std::string{""});
+    if (j.contains("prefer")) r.prefer = parse_prefer(j.at("prefer").get<std::string>());
+    if (j.contains("accuracy")) r.accuracy = parse_accuracy(j.at("accuracy").get<std::string>());
+    return r;
+}
+
+static nlohmann::json autoconfig_to_json(const AutoconfigConfig& r) {
+    nlohmann::json j;
+    j["enabled"] = r.enabled;
+    j["vram_expert_ratio"] = r.vram_expert_ratio ? nlohmann::json(*r.vram_expert_ratio) : nlohmann::json(nullptr);
+    j["total_active_context_tokens"] = r.total_active_context_tokens ? nlohmann::json(*r.total_active_context_tokens) : nlohmann::json(nullptr);
+    j["output_path"] = r.output_path;
+    j["fingerprint"] = r.fingerprint;
+    j["prefer"] = to_string(r.prefer);
+    j["accuracy"] = to_string(r.accuracy);
+    return j;
+}
+
+static AutoconfigInternalConfig parse_autoconfig_internal(const nlohmann::json& j) {
+    AutoconfigInternalConfig r;
+    r.vram_usable_fraction = get_or(j, "vram_usable_fraction", 0.9375);
+    r.vram_safety_margin_gb = get_or(j, "vram_safety_margin_gb", 2.25);
+    r.non_tp_overhead_gib = get_or(j, "non_tp_overhead_gib", 1.25);
+    r.host_pin_fraction_total = get_or(j, "host_pin_fraction_total", 0.9);
+    r.hbm_spill_fraction_free = get_or(j, "hbm_spill_fraction_free", 0.6);
+    r.prefill_scratch_gb = get_or(j, "prefill_scratch_gb", 0.5);
+    r.min_seq_for_pairing = get_or(j, "min_seq_for_pairing", 16384);
+    r.device_pool_round_pages = get_or(j, "device_pool_round_pages", 1024);
+    r.expert_gib_quantum = get_or(j, "expert_gib_quantum", 0.5);
+    r.min_max_seq = get_or(j, "min_max_seq", 4096);
+    r.moe_fit_fixed_attn_mib = get_or(j, "moe_fit_fixed_attn_mib", 2224);
+    r.moe_fit_fixed_expert_mib = get_or(j, "moe_fit_fixed_expert_mib", 1627);
+    r.moe_fit_headroom_cushion = get_or(j, "moe_fit_headroom_cushion", 1.15);
+    r.moe_fit_free_floor_mib = get_or(j, "moe_fit_free_floor_mib", 256);
+    r.runtime_margin_quantum_gb = get_or(j, "runtime_margin_quantum_gb", 0.25);
+    r.stride_margin_cap_gb = get_or(j, "stride_margin_cap_gb", 6.0);
+    r.block_table_budget_gb = get_or(j, "block_table_budget_gb", 1.5);
+    return r;
+}
+
+static nlohmann::json autoconfig_internal_to_json(const AutoconfigInternalConfig& r) {
+    nlohmann::json j;
+    j["vram_usable_fraction"] = r.vram_usable_fraction;
+    j["vram_safety_margin_gb"] = r.vram_safety_margin_gb;
+    j["non_tp_overhead_gib"] = r.non_tp_overhead_gib;
+    j["host_pin_fraction_total"] = r.host_pin_fraction_total;
+    j["hbm_spill_fraction_free"] = r.hbm_spill_fraction_free;
+    j["prefill_scratch_gb"] = r.prefill_scratch_gb;
+    j["min_seq_for_pairing"] = r.min_seq_for_pairing;
+    j["device_pool_round_pages"] = r.device_pool_round_pages;
+    j["expert_gib_quantum"] = r.expert_gib_quantum;
+    j["min_max_seq"] = r.min_max_seq;
+    j["moe_fit_fixed_attn_mib"] = r.moe_fit_fixed_attn_mib;
+    j["moe_fit_fixed_expert_mib"] = r.moe_fit_fixed_expert_mib;
+    j["moe_fit_headroom_cushion"] = r.moe_fit_headroom_cushion;
+    j["moe_fit_free_floor_mib"] = r.moe_fit_free_floor_mib;
+    j["runtime_margin_quantum_gb"] = r.runtime_margin_quantum_gb;
+    j["stride_margin_cap_gb"] = r.stride_margin_cap_gb;
+    j["block_table_budget_gb"] = r.block_table_budget_gb;
+    return j;
+}
+
+static KdaStateInternalConfig parse_kda_state_internal(const nlohmann::json& j) {
+    KdaStateInternalConfig r;
+    r.mapped = get_or(j, "mapped", true);
+    return r;
+}
+
+static nlohmann::json kda_state_internal_to_json(const KdaStateInternalConfig& r) {
+    nlohmann::json j;
+    j["mapped"] = r.mapped;
+    return j;
+}
+
+static KvExpertRebalanceInternalConfig parse_kv_expert_rebalance_internal(const nlohmann::json& j) {
+    KvExpertRebalanceInternalConfig r;
+    r.enabled = get_or(j, "enabled", true);
+    r.max_waste = get_or(j, "max_waste", 0.1);
+    r.low_water_frac = get_or(j, "low_water_frac", 0.02);
+    r.high_water_frac = get_or(j, "high_water_frac", 0.0);
+    r.max_slots_per_grant = get_or(j, "max_slots_per_grant", 8);
+    r.tick_ms = get_or(j, "tick_ms", 200);
+    r.grant_cooldown_ms = get_or(j, "grant_cooldown_ms", 30000);
+    return r;
+}
+
+static nlohmann::json kv_expert_rebalance_internal_to_json(const KvExpertRebalanceInternalConfig& r) {
+    nlohmann::json j;
+    j["enabled"] = r.enabled;
+    j["max_waste"] = r.max_waste;
+    j["low_water_frac"] = r.low_water_frac;
+    j["high_water_frac"] = r.high_water_frac;
+    j["max_slots_per_grant"] = r.max_slots_per_grant;
+    j["tick_ms"] = r.tick_ms;
+    j["grant_cooldown_ms"] = r.grant_cooldown_ms;
     return j;
 }
 
@@ -2452,6 +2697,7 @@ Config parse_config(const nlohmann::json& j) {
     if (j.contains("serving")) cfg.serving = parse_serving(j.at("serving"));
     if (j.contains("preprocessing")) cfg.preprocessing = parse_preprocessing(j.at("preprocessing"));
     if (j.contains("_internal-prefix_cache")) cfg._internal_prefix_cache = parse_prefix_cache_internal(j.at("_internal-prefix_cache"));
+    if (j.contains("_internal-prefix_spill")) cfg._internal_prefix_spill = parse_prefix_spill_internal(j.at("_internal-prefix_spill"));
     if (j.contains("_internal-prescope")) cfg._internal_prescope = parse_prescope_internal(j.at("_internal-prescope"));
     if (j.contains("_internal-residual_correction")) cfg._internal_residual_correction = parse_residual_correction_internal(j.at("_internal-residual_correction"));
     if (j.contains("_internal-utility_scorer")) cfg._internal_utility_scorer = parse_utility_scorer_internal(j.at("_internal-utility_scorer"));
@@ -2468,6 +2714,10 @@ Config parse_config(const nlohmann::json& j) {
     if (j.contains("_internal-verifier")) cfg._internal_verifier = parse_verifier_internal(j.at("_internal-verifier"));
     if (j.contains("_internal-dspark")) cfg._internal_dspark = parse_dspark_internal(j.at("_internal-dspark"));
     if (j.contains("_internal-orchestrator")) cfg._internal_orchestrator = parse_orchestrator_internal(j.at("_internal-orchestrator"));
+    if (j.contains("autoconfig")) cfg.autoconfig = parse_autoconfig(j.at("autoconfig"));
+    if (j.contains("_internal-autoconfig")) cfg._internal_autoconfig = parse_autoconfig_internal(j.at("_internal-autoconfig"));
+    if (j.contains("_internal-kda_state")) cfg._internal_kda_state = parse_kda_state_internal(j.at("_internal-kda_state"));
+    if (j.contains("_internal-kv_expert_rebalance")) cfg._internal_kv_expert_rebalance = parse_kv_expert_rebalance_internal(j.at("_internal-kv_expert_rebalance"));
     if (j.contains("gpu_loader")) cfg.gpu_loader = parse_gpu_loader(j.at("gpu_loader"));
     return cfg;
 }
@@ -2496,6 +2746,7 @@ nlohmann::json config_to_json(const Config& cfg) {
     j["serving"] = serving_to_json(cfg.serving);
     j["preprocessing"] = preprocessing_to_json(cfg.preprocessing);
     j["_internal-prefix_cache"] = prefix_cache_internal_to_json(cfg._internal_prefix_cache);
+    j["_internal-prefix_spill"] = prefix_spill_internal_to_json(cfg._internal_prefix_spill);
     j["_internal-prescope"] = prescope_internal_to_json(cfg._internal_prescope);
     j["_internal-residual_correction"] = residual_correction_internal_to_json(cfg._internal_residual_correction);
     j["_internal-utility_scorer"] = utility_scorer_internal_to_json(cfg._internal_utility_scorer);
@@ -2512,6 +2763,10 @@ nlohmann::json config_to_json(const Config& cfg) {
     j["_internal-verifier"] = verifier_internal_to_json(cfg._internal_verifier);
     j["_internal-dspark"] = dspark_internal_to_json(cfg._internal_dspark);
     j["_internal-orchestrator"] = orchestrator_internal_to_json(cfg._internal_orchestrator);
+    j["autoconfig"] = autoconfig_to_json(cfg.autoconfig);
+    j["_internal-autoconfig"] = autoconfig_internal_to_json(cfg._internal_autoconfig);
+    j["_internal-kda_state"] = kda_state_internal_to_json(cfg._internal_kda_state);
+    j["_internal-kv_expert_rebalance"] = kv_expert_rebalance_internal_to_json(cfg._internal_kv_expert_rebalance);
     j["gpu_loader"] = gpu_loader_to_json(cfg.gpu_loader);
     return j;
 }
@@ -2642,6 +2897,9 @@ const char* field_name(FieldId id) {
         case FieldId::kModelIndexHeadDim: return "model.index_head_dim";
         case FieldId::kModelIndexTopkFreq: return "model.index_topk_freq";
         case FieldId::kModelIndexSkipTopkOffset: return "model.index_skip_topk_offset";
+        case FieldId::kModelIndexKpool: return "model.index_kpool";
+        case FieldId::kModelIndexKpoolCompress: return "model.index_kpool_compress";
+        case FieldId::kModelIndexKpoolAlwaysSelectTail: return "model.index_kpool_always_select_tail";
         case FieldId::kModelRopeScalingType: return "model.rope_scaling.type";
         case FieldId::kModelRopeScalingFactor: return "model.rope_scaling.factor";
         case FieldId::kModelRopeScalingBetaFast: return "model.rope_scaling.beta_fast";
@@ -2667,6 +2925,11 @@ const char* field_name(FieldId id) {
         case FieldId::kModelHcMult: return "model.hc_mult";
         case FieldId::kModelHcSinkhornIters: return "model.hc_sinkhorn_iters";
         case FieldId::kModelHcEps: return "model.hc_eps";
+        case FieldId::kModelLinearAttnConfigNumHeads: return "model.linear_attn_config.num_heads";
+        case FieldId::kModelLinearAttnConfigHeadDim: return "model.linear_attn_config.head_dim";
+        case FieldId::kModelLinearAttnConfigShortConvKernelSize: return "model.linear_attn_config.short_conv_kernel_size";
+        case FieldId::kModelLinearAttnConfigGateLowerBound: return "model.linear_attn_config.gate_lower_bound";
+        case FieldId::kModelMlaUseNope: return "model.mla_use_nope";
         case FieldId::kModelVisionEnabled: return "model.vision.enabled";
         case FieldId::kModelVisionHiddenSize: return "model.vision.hidden_size";
         case FieldId::kModelVisionNumLayers: return "model.vision.num_layers";
@@ -2820,6 +3083,7 @@ const char* field_name(FieldId id) {
         case FieldId::kSpeculationDsparkAuxCaptureMaxRows: return "speculation.dspark.aux_capture_max_rows";
         case FieldId::kSpeculationDsparkEpmDumpDir: return "speculation.dspark.epm_dump_dir";
         case FieldId::kSpeculationDsparkVerifyChunkPrefetch: return "speculation.dspark.verify_chunk_prefetch";
+        case FieldId::kSpeculationDsparkCtxRotate: return "speculation.dspark.ctx_rotate";
         case FieldId::kSpeculationSelfSpeculativeEnabled: return "speculation.self_speculative.enabled";
         case FieldId::kSpeculationSelfSpeculativeDraftExpertCount: return "speculation.self_speculative.draft_expert_count";
         case FieldId::kSpeculationSelfSpeculativeAdaptiveExitEnabled: return "speculation.self_speculative.adaptive_exit_enabled";
@@ -2902,8 +3166,12 @@ const char* field_name(FieldId id) {
         case FieldId::kComputePrefillSuperchunkTokens: return "compute.prefill_superchunk_tokens";
         case FieldId::kComputePrefillMoeBig: return "compute.prefill_moe_big";
         case FieldId::kComputeMoeBigChunkTokens: return "compute.moe_big_chunk_tokens";
+        case FieldId::kComputeMoeBigFitHeadroomMb: return "compute.moe_big_fit_headroom_mb";
+        case FieldId::kComputeMoeBigFitHeadroomExpertOnlyMb: return "compute.moe_big_fit_headroom_expert_only_mb";
         case FieldId::kComputeDsaSparsePrefill: return "compute.dsa_sparse_prefill";
         case FieldId::kComputeDsaIndexerRewind: return "compute.dsa_indexer_rewind";
+        case FieldId::kComputeDeterministic: return "compute.deterministic";
+        case FieldId::kComputeReferenceTrajectoryIdentity: return "compute.reference_trajectory_identity";
         case FieldId::kComputeDeterministicReduce: return "compute.deterministic_reduce";
         case FieldId::kComputeDeterministicEpCombine: return "compute.deterministic_ep_combine";
         case FieldId::kComputeDeterministicEpCombinePrecision: return "compute.deterministic_ep_combine_precision";
@@ -2922,6 +3190,9 @@ const char* field_name(FieldId id) {
         case FieldId::kServingPrefixCacheEnabled: return "serving.prefix_cache.enabled";
         case FieldId::kServingPrefixCacheMaxCachedTokens: return "serving.prefix_cache.max_cached_tokens";
         case FieldId::kServingPrefixCacheMaxEntries: return "serving.prefix_cache.max_entries";
+        case FieldId::kServingPrefixCacheKdaCheckpointsEnabled: return "serving.prefix_cache.kda_checkpoints.enabled";
+        case FieldId::kServingPrefixCacheKdaCheckpointsIntervalTokens: return "serving.prefix_cache.kda_checkpoints.interval_tokens";
+        case FieldId::kServingPrefixCacheKdaCheckpointsBudgetMib: return "serving.prefix_cache.kda_checkpoints.budget_mib";
         case FieldId::kPreprocessingPrepackedDir: return "preprocessing.prepacked_dir";
         case FieldId::kPreprocessingAutoPreprocess: return "preprocessing.auto_preprocess";
         case FieldId::kPreprocessingAutoPreprocessTarget: return "preprocessing.auto_preprocess_target";
@@ -2930,6 +3201,12 @@ const char* field_name(FieldId id) {
         case FieldId::kPreprocessingLivePrepack: return "preprocessing.live_prepack";
         case FieldId::kPreprocessingLivePrepackThreads: return "preprocessing.live_prepack_threads";
         case FieldId::kInternalPrefixCacheMaxEntryTokens: return "_internal-prefix_cache.max_entry_tokens";
+        case FieldId::kInternalPrefixCacheSubgridMidEdge: return "_internal-prefix_cache.subgrid_mid_edge";
+        case FieldId::kInternalPrefixCacheHibernateHolders: return "_internal-prefix_cache.hibernate_holders";
+        case FieldId::kInternalPrefixSpillEnabled: return "_internal-prefix_spill.enabled";
+        case FieldId::kInternalPrefixSpillPath: return "_internal-prefix_spill.path";
+        case FieldId::kInternalPrefixSpillMaxMib: return "_internal-prefix_spill.max_mib";
+        case FieldId::kInternalPrefixSpillIdleSeconds: return "_internal-prefix_spill.idle_seconds";
         case FieldId::kInternalPrescopeHiddenSize: return "_internal-prescope.hidden_size";
         case FieldId::kInternalPrescopePcaDim: return "_internal-prescope.pca_dim";
         case FieldId::kInternalPrescopeHiddenDim: return "_internal-prescope.hidden_dim";
@@ -3010,6 +3287,42 @@ const char* field_name(FieldId id) {
         case FieldId::kInternalDsparkConfidenceTraceCapacity: return "_internal-dspark.confidence_trace_capacity";
         case FieldId::kInternalOrchestratorPrefillScMinTokens: return "_internal-orchestrator.prefill_sc_min_tokens";
         case FieldId::kInternalOrchestratorPrefillScSmallChunkTokens: return "_internal-orchestrator.prefill_sc_small_chunk_tokens";
+        case FieldId::kInternalOrchestratorDegradedRetryEnabled: return "_internal-orchestrator.degraded_retry_enabled";
+        case FieldId::kInternalOrchestratorDegradedRetryMax: return "_internal-orchestrator.degraded_retry_max";
+        case FieldId::kInternalOrchestratorKvxpLargePrefillTokens: return "_internal-orchestrator.kvxp_large_prefill_tokens";
+        case FieldId::kInternalOrchestratorKvxpLargePrefillWaitMs: return "_internal-orchestrator.kvxp_large_prefill_wait_ms";
+        case FieldId::kAutoconfigEnabled: return "autoconfig.enabled";
+        case FieldId::kAutoconfigVramExpertRatio: return "autoconfig.vram_expert_ratio";
+        case FieldId::kAutoconfigTotalActiveContextTokens: return "autoconfig.total_active_context_tokens";
+        case FieldId::kAutoconfigOutputPath: return "autoconfig.output_path";
+        case FieldId::kAutoconfigFingerprint: return "autoconfig.fingerprint";
+        case FieldId::kAutoconfigPrefer: return "autoconfig.prefer";
+        case FieldId::kAutoconfigAccuracy: return "autoconfig.accuracy";
+        case FieldId::kInternalAutoconfigVramUsableFraction: return "_internal-autoconfig.vram_usable_fraction";
+        case FieldId::kInternalAutoconfigVramSafetyMarginGb: return "_internal-autoconfig.vram_safety_margin_gb";
+        case FieldId::kInternalAutoconfigNonTpOverheadGib: return "_internal-autoconfig.non_tp_overhead_gib";
+        case FieldId::kInternalAutoconfigHostPinFractionTotal: return "_internal-autoconfig.host_pin_fraction_total";
+        case FieldId::kInternalAutoconfigHbmSpillFractionFree: return "_internal-autoconfig.hbm_spill_fraction_free";
+        case FieldId::kInternalAutoconfigPrefillScratchGb: return "_internal-autoconfig.prefill_scratch_gb";
+        case FieldId::kInternalAutoconfigMinSeqForPairing: return "_internal-autoconfig.min_seq_for_pairing";
+        case FieldId::kInternalAutoconfigDevicePoolRoundPages: return "_internal-autoconfig.device_pool_round_pages";
+        case FieldId::kInternalAutoconfigExpertGibQuantum: return "_internal-autoconfig.expert_gib_quantum";
+        case FieldId::kInternalAutoconfigMinMaxSeq: return "_internal-autoconfig.min_max_seq";
+        case FieldId::kInternalAutoconfigMoeFitFixedAttnMib: return "_internal-autoconfig.moe_fit_fixed_attn_mib";
+        case FieldId::kInternalAutoconfigMoeFitFixedExpertMib: return "_internal-autoconfig.moe_fit_fixed_expert_mib";
+        case FieldId::kInternalAutoconfigMoeFitHeadroomCushion: return "_internal-autoconfig.moe_fit_headroom_cushion";
+        case FieldId::kInternalAutoconfigMoeFitFreeFloorMib: return "_internal-autoconfig.moe_fit_free_floor_mib";
+        case FieldId::kInternalAutoconfigRuntimeMarginQuantumGb: return "_internal-autoconfig.runtime_margin_quantum_gb";
+        case FieldId::kInternalAutoconfigStrideMarginCapGb: return "_internal-autoconfig.stride_margin_cap_gb";
+        case FieldId::kInternalAutoconfigBlockTableBudgetGb: return "_internal-autoconfig.block_table_budget_gb";
+        case FieldId::kInternalKdaStateMapped: return "_internal-kda_state.mapped";
+        case FieldId::kInternalKvExpertRebalanceEnabled: return "_internal-kv_expert_rebalance.enabled";
+        case FieldId::kInternalKvExpertRebalanceMaxWaste: return "_internal-kv_expert_rebalance.max_waste";
+        case FieldId::kInternalKvExpertRebalanceLowWaterFrac: return "_internal-kv_expert_rebalance.low_water_frac";
+        case FieldId::kInternalKvExpertRebalanceHighWaterFrac: return "_internal-kv_expert_rebalance.high_water_frac";
+        case FieldId::kInternalKvExpertRebalanceMaxSlotsPerGrant: return "_internal-kv_expert_rebalance.max_slots_per_grant";
+        case FieldId::kInternalKvExpertRebalanceTickMs: return "_internal-kv_expert_rebalance.tick_ms";
+        case FieldId::kInternalKvExpertRebalanceGrantCooldownMs: return "_internal-kv_expert_rebalance.grant_cooldown_ms";
         case FieldId::kGpuLoaderEnabled: return "gpu_loader.enabled";
         case FieldId::kGpuLoaderCalibrationMode: return "gpu_loader.calibration_mode";
         case FieldId::kGpuLoaderCalibrationPath: return "gpu_loader.calibration_path";
@@ -3482,6 +3795,7 @@ bool apply_field_update(Config& cfg, FieldId id, uint8_t value_type, uint32_t ra
 
 const ConfigFileLink kConfigFileLinks[] = {
     {"_internal-prefix_cache", "prefix_cache.json"},
+    {"_internal-prefix_spill", "prefix_spill.json"},
     {"_internal-prescope", "prescope.json"},
     {"_internal-residual_correction", "residual_correction.json"},
     {"_internal-utility_scorer", "utility_scorer.json"},
@@ -3498,7 +3812,10 @@ const ConfigFileLink kConfigFileLinks[] = {
     {"_internal-verifier", "verifier.json"},
     {"_internal-dspark", "dspark.json"},
     {"_internal-orchestrator", "orchestrator.json"},
+    {"_internal-autoconfig", "autoconfig.json"},
+    {"_internal-kda_state", "kda_state.json"},
+    {"_internal-kv_expert_rebalance", "kv_expert_rebalance.json"},
 };
-const size_t kConfigFileLinkCount = 17;
+const size_t kConfigFileLinkCount = 21;
 
 }  // namespace layerstorm::config

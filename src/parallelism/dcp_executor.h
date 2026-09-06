@@ -27,6 +27,7 @@
 
 #include "core/gpu_ref.h"
 #include "config/config_parser.h"             // config::GgufStrategy (CUDA-free)
+#include "compute/graphs/decode_span_graph.h" // INV-0.6(b) span graphs (CUDA-free header)
 #include "model/quantization/gguf_kquant.h"   // model::GgufKQuantType (CUDA-free)
 
 #include <cstddef>
@@ -175,11 +176,55 @@ struct AttentionLayerWeights {
 
     // V4-5a lightning-indexer compressor (CSA layers only; dims at
     // index_head_dim: wkv/wgate [2*128, hidden] BF16, APE [4, 256] F32,
-    // norm [128] F32).
+    // norm [128] F32). glm5_next (GF3.3/GF3.9) reuses wgate/ape for the
+    // IndexPool learned compressor: wgate [index_head_dim, hidden]
+    // (BF16 — GGUF Q8_0 is dequanted to BF16 at load), ape
+    // [index_kpool, index_head_dim] F32; _wkv/_norm stay null.
     const void* indexer_compressor_wkv = nullptr;
     const void* indexer_compressor_wgate = nullptr;
     const void* indexer_compressor_ape = nullptr;
     const void* indexer_compressor_norm = nullptr;
+
+    // ── GF3.9 KDA linear-attention weights (glm5_next linear layers only;
+    //    nullptr everywhere else). TP split per tp_weight_sharder.cpp:
+    //    q/k/v/b/f_b/g_b/convs/a_log/dt_bias column-parallel on the HEAD
+    //    axis, f_a/g_a/o_norm replicated, o_proj row-parallel (the shared
+    //    o_proj field above). Dtypes after upload: projections packed GGUF
+    //    k-quant (unsloth GGUF: Q8_0) or BF16 (native FP8 ckpt ships them
+    //    BF16, skip list); convs + o_norm BF16 (F32→BF16 converted at
+    //    upload on the GGUF path); a_log/dt_bias F32 (kernel contract). ──
+    const void* kda_q_proj = nullptr;    ///< [H_local*128, hidden]
+    const void* kda_k_proj = nullptr;    ///< [H_local*128, hidden]
+    const void* kda_v_proj = nullptr;    ///< [H_local*128, hidden]
+    const void* kda_b_proj = nullptr;    ///< [H_local, hidden] (beta)
+    const void* kda_f_a_proj = nullptr;  ///< [128, hidden] replicated
+    const void* kda_f_b_proj = nullptr;  ///< [H_local*128, 128]
+    const void* kda_g_a_proj = nullptr;  ///< [128, hidden] replicated
+    const void* kda_g_b_proj = nullptr;  ///< [H_local*128, 128]
+    const void* kda_q_conv1d = nullptr;  ///< [H_local*128, 4] BF16 taps
+    const void* kda_k_conv1d = nullptr;
+    const void* kda_v_conv1d = nullptr;
+    const void* kda_a_log = nullptr;     ///< [H_local] F32
+    const void* kda_dt_bias = nullptr;   ///< [H_local*128] F32
+    const void* kda_o_norm = nullptr;    ///< [128] BF16
+    // GGUF k-quant metadata for the 8 KDA projection GEMMs (o_proj rides
+    // the shared o_proj_is_gguf above).
+    bool kda_q_is_gguf = false;
+    bool kda_k_is_gguf = false;
+    bool kda_v_is_gguf = false;
+    bool kda_b_is_gguf = false;
+    bool kda_f_a_is_gguf = false;
+    bool kda_f_b_is_gguf = false;
+    bool kda_g_a_is_gguf = false;
+    bool kda_g_b_is_gguf = false;
+    model::GgufKQuantType kda_q_gguf_type{};
+    model::GgufKQuantType kda_k_gguf_type{};
+    model::GgufKQuantType kda_v_gguf_type{};
+    model::GgufKQuantType kda_b_gguf_type{};
+    model::GgufKQuantType kda_f_a_gguf_type{};
+    model::GgufKQuantType kda_f_b_gguf_type{};
+    model::GgufKQuantType kda_g_a_gguf_type{};
+    model::GgufKQuantType kda_g_b_gguf_type{};
 };
 
 // ── Per-layer execution parameters ───────────────────────────────────────────
@@ -242,9 +287,11 @@ struct AttentionExecParams {
     // laid out [batch * indexer_k_batch_stride + layer * indexer_k_page_stride
     // + logical_page]; rows exist only for layers that COMPUTE the indexer
     // (IndexShare full ∪ layer 0), nullptr otherwise. Page layout:
-    // [page_tokens × head_dim FP8 | page_tokens F32 scales]. When absent the
-    // producer falls back to its executor arena (B==1 only — the arena is
-    // structurally single-sequence).
+    // [page_tokens × head_dim FP8 | page_tokens F32 scales]. The paged pool
+    // is the ONLY key storage (S4 deleted the legacy B==1 executor arena):
+    // a blessed sparse/append step without covering page rows is a
+    // dispatcher/executor contract violation and the producers fail closed
+    // to dense with an ERROR log.
     // Per-RANK host tables (TD-GLM-INDEXER-DCP replicated mode: each rank
     // holds its own GPU's replica pages): indexer_k_pages[r] is rank r's
     // table with the batch/layer/page layout described above.
@@ -256,14 +303,20 @@ struct AttentionExecParams {
     // TD-GLM-INDEXER-BATCH: per-entry HOST seqlens (kv-meta staging; entry
     // b's current length) and a nonzero fingerprint identifying this step's
     // batch composition — the IndexShare reuse-validity key (seq_id-aware,
-    // unlike a bare seqlen match).
+    // unlike a bare seqlen match). TD-INDEXER-STEPKEY-TOKEN-BLIND
+    // (INV-DSA-EPOCH): the fingerprint mixes each sequence's dispatcher-
+    // owned REWIND EPOCH in addition to its (seq_id, token_pos) rows, so an
+    // overwrite re-feed (INV-DSA-REWIND) that reproduces an earlier step's
+    // positions with different tokens carries a DIFFERENT key — a shared
+    // IndexShare layer can never validate a selection derived from tokens
+    // that are no longer there. All layers of one step carry the same key.
     const int* host_seqlens_k = nullptr;   ///< HOST [batch_size]
     uint64_t indexer_step_key = 0;
 
     // TD-GLM-INDEXER-COV: set by the dispatcher when EVERY sequence in this
     // step has an indexer-K coverage gap — the producer must not run sparse
-    // from ANY storage (paged or arena), because skipped positions were never
-    // appended and would be scored as garbage.
+    // because skipped positions were never appended and would be scored as
+    // garbage.
     bool indexer_sparse_suppress = false;
 
     // TD-GLM-INDEXER-B1CASCADE (resolved) / INV-DSA-ROWMIX: per-row dense
@@ -288,7 +341,7 @@ struct AttentionExecParams {
     // (single sequence, consecutive positions contiguous with prior
     // coverage). The executor then runs the producer's K half batched over
     // all chunk rows — append first, always. Requires indexer_step_key
-    // != 0 (and indexer_k_pages for the paged mode; absent → arena).
+    // != 0 and covering indexer_k_pages rows.
     // With Options::sparse_prefill OFF (default) the chunk's own attention
     // stays dense prefill (append only). With it ON
     // (TD-SPARSE-CHUNK-PREFILL) the executor additionally runs the
@@ -348,6 +401,32 @@ struct AttentionExecParams {
         int num_ranks = 0;             ///< must equal dcp_size
     };
     const V4Step* v4 = nullptr;
+
+    // ── GF3.9 KDA linear-attention step (glm5_next linear layers only;
+    //    nullptr on every MLA/V4/sparse step). Staged by
+    //    ArchGlm5Next::stage_step, consumed by execute_attention_kda.
+    //    The state SLOT layout (per-linear-layer offsets, slot stride)
+    //    lives in Options::kda_layout; the arch supplies only per-step
+    //    slot addressing. All KDA kernels run on the kAttention stream
+    //    (INV-KDA-STATE (b)/(c) ordering). ──
+    struct KdaStepRank {
+        /// This sequence's whole-request slot base on this rank
+        /// (PageHandle::gpu_ptr) — the prefill path addresses state and
+        /// rings directly through it. nullptr on decode (slot table used).
+        void* slot_base = nullptr;
+        /// Per-row slot ids on this rank (PageHandle::page_idx), HOST
+        /// memory — the executor uploads them to its device slot table
+        /// for the decode kernels' base + slots[b] * stride indirection.
+        /// Per-rank INDEPENDENT (GF3.8 S4 finding). nullptr on prefill.
+        const int* slots_host = nullptr;
+    };
+    struct KdaStep {
+        int linear_ordinal = -1;       ///< dense KDA layer ordinal [0, 34)
+        bool decode = false;           ///< fused decode step vs chunked scan
+        const KdaStepRank* ranks = nullptr;  ///< [num_ranks]
+        int num_ranks = 0;             ///< must equal dcp_size
+    };
+    const KdaStep* kda = nullptr;
 
     // GLM-25k: DSA-guided KV tiering hook (kv_tiering_hook.h). Set by the
     // dispatcher on tierable steps only: B==1 non-draft non-graph decode
@@ -413,7 +492,7 @@ public:
         /// own shard, then the per-rank candidate lists are allgathered and
         /// exactly re-merged into the global top-k (identical to replicated
         /// mode's — see topk_merge.h). Requires `communicator` and
-        /// indexer_k_page_tokens > 0; paged storage only (no arena fallback).
+        /// indexer_k_page_tokens > 0; paged storage only.
         bool indexer_local = false;
         /// memory.kv_cache.indexer_k_page_size_tokens — the local-mode
         /// ownership unit; must match the dispatcher's provisioning PT.
@@ -538,6 +617,25 @@ public:
         // DSA
         bool has_dsa = false;
         int index_topk = 2048;
+        /// GF3.5 (IndexPool): model.index_kpool (1 = legacy unpooled).
+        /// Selection picks index_topk/index_kpool POOLS; expansion + the
+        /// always-selected un-pooled tail yield up to index_topk_rows()
+        /// token rows. The TWO numbers are distinct: budget vs row
+        /// capacity/stride (scratchpad/GF35_SURVEY.md, the 2051 overflow).
+        int index_kpool = 1;
+        /// GF3.5: indexer k_norm LayerNorm epsilon override. 0 → use
+        /// rms_norm_eps (legacy GLM-5.2/V3.2 behavior, unchanged). glm5_next
+        /// requires 1e-6 — a HARD constant in the reference
+        /// (vLLM attention.py:267 LayerNorm(eps=1e-6)), NOT the model's
+        /// rms_norm_eps (1e-5).
+        double indexer_norm_eps = 0.0;
+        /// Row capacity AND row stride of every sparse-selection buffer
+        /// (sparse_indices, candidate lists, prefill_attention's topk arg,
+        /// shard-translate strides): index_topk + kpool - 1 (== index_topk
+        /// on legacy models — byte-identical there).
+        int index_topk_rows() const {
+            return index_topk + (index_kpool > 1 ? index_kpool - 1 : 0);
+        }
         int index_n_heads = 64;    ///< DSA indexer query heads (GLM-5.2: 32)
         int index_head_dim = 128;  ///< DSA indexer head dim
         /// IndexShare (GLM-25b) per-layer full/shared mask (size num_layers).
@@ -545,6 +643,48 @@ public:
         /// preceding full layer's top-k. Empty → every layer is full (GGUF
         /// default / llama.cpp reference).
         std::vector<uint8_t> indexer_full_layers;
+        /// GF3.5: explicit computing-layer mask (size num_layers incl. MTP)
+        /// — layer owns indexer-K storage / computes selection. Built by the
+        /// engine from ModelConfig::computes_indexer. When EMPTY the
+        /// executor falls back to the legacy rule (full ∪ {layer 0}), which
+        /// is byte-identical for GLM-5.2/V3.2 — the field exists because
+        /// glm5_next has no such union (layer 0 is a KDA linear layer) and
+        /// its MTP layer DOES compute.
+        std::vector<uint8_t> indexer_computes_layers;
+
+        // ── GF3.9 KDA linear attention (glm5_next) ─────────────────────
+        // Enabled only when the model carries KDA layers; every field is
+        // inert (and the KDA scratch unallocated) otherwise. The slot
+        // layout numbers are VramLayout::kda's (copied by the engine from
+        // PageAllocator::kda_layout()); per-layer offsets are computed in
+        // the executor from the DENSE linear-layer ordinal the arch stages
+        // (KdaStep::linear_ordinal).
+        bool kda_enabled = false;
+        int kda_heads_per_rank = 0;        ///< H / tp (64 at tp=1)
+        int64_t kda_slot_bytes = 0;        ///< whole-request slot stride
+        int64_t kda_recurrent_bytes_per_layer = 0;
+        int64_t kda_ring_bytes_per_layer = 0;   ///< ONE of q/k/v
+        int64_t kda_per_layer_bytes = 0;
+        float kda_gate_lower_bound = -5.0f;
+        /// q/k L2-norm eps — the KDA reference constant (GF3.6), NOT
+        /// rms_norm_eps; o_norm uses rms_norm_eps (1e-5).
+        float kda_l2_eps = 1e-6f;
+        /// TD-KDA-STATE-MAPPED-SLABS: mapped-state mode. false (carve):
+        /// slot ids are whole-request slot indices, per-layer offsets are
+        /// computed from the ordinal, stride = kda_slot_bytes. true
+        /// (mapped): a slot id is the LAYER's run-start slab id over the
+        /// shared region (per-layer slot tables staged by the arch),
+        /// per-layer offsets are 0 (the handle IS the layer unit) and the
+        /// stride is kda_state_stride_bytes = slab_bytes. Kernel structs
+        /// and launch shapes are IDENTICAL either way.
+        bool kda_mapped = false;
+        /// Physical stride the kernels multiply slot ids by
+        /// (PageAllocator::kda_state_stride_bytes: slot_bytes carve,
+        /// slab_bytes mapped). 0 on non-KDA models.
+        int64_t kda_state_stride_bytes = 0;
+        /// Per-rank KDA state region base (PageAllocator::kda_state_base)
+        /// — the decode kernels' base + slots[b] * stride indirection.
+        std::vector<void*> kda_state_bases;
 
         // GGUF attention GEMM dispatch (GG-4). gguf_active is true when the
         // checkpoint's weights_format is gguf / weights is a gguf* type; it
@@ -552,6 +692,19 @@ public:
         // strategy. gguf_strategy selects mmvq/mmq (int) vs dequant_gemm.
         bool gguf_active = false;
         config::GgufStrategy gguf_strategy = config::GgufStrategy::int_strategy;
+
+        /// TD-GLM5-TP-COMBINE-PRECISION: fp32 TP partial combine. When true
+        /// (and dcp_size >= 2), every per-layer o_proj TP combine stores its
+        /// rank-local partial hidden in FP32 (fp32-out GEMM epilogue),
+        /// allreduces in FP32 (kCollFloat32 sum) and rounds to BF16 exactly
+        /// ONCE after the sum — shrinking the per-combine perturbation from
+        /// bf16 partial rounding (~2^-9 relative) to fp32 reassociation
+        /// (~2^-20), which is what makes a long greedy decode at TP>=2
+        /// token-identical to TP=1 on the 45-combine glm5_next stack
+        /// (INV-KDA-TP). Arch-keyed default (glm5_next: ON); the env
+        /// LS_TP_COMBINE_FP32=0/1 overrides for A/B measurement. Inert at
+        /// dcp_size == 1 (no combine exists; TP=1 numerics untouched).
+        bool tp_combine_fp32 = false;
 
         // Graph capture
         std::vector<int> graph_batch_sizes;        ///< Batch sizes to pre-capture (empty = none)
@@ -592,6 +745,17 @@ public:
     /// Execute the full attention flow for one layer (DCP_GUIDE §5 steps 1-14).
     /// All work enqueued on attention streams (Stream 0). Returns immediately.
     void execute_attention(const AttentionExecParams& params);
+
+    /// GF3.9: execute one KDA linear-attention layer (glm5_next; defined in
+    /// arch_glm5_next.cpp — the arch TU owns its executor half, like
+    /// arch_mla.cpp/arch_deepseek_v4.cpp). params.kda must be staged.
+    /// input_layernorm → q/k/v/b/f/g projections → fused conv → chunked
+    /// WY scan (prefill, 64-grid launches) or fused O(1) decode step →
+    /// gated RMSNorm → o_proj into hidden_out_. Everything on the
+    /// kAttention streams (INV-KDA-STATE (b)/(c) ordering). THROWS on
+    /// geometry/wiring errors (missing weights, missing kda step, rows
+    /// over the scratch bound) — never computes approximately.
+    void execute_attention_kda(const AttentionExecParams& params);
 
     /// V4-5c (ticket G, resolves TD-V4-OPROJ): DeepSeek-V4 grouped o_proj —
     /// the V4 equivalent of the MLA path's execute_oproj_and_reduce tail.
@@ -671,6 +835,15 @@ public:
     int num_heads_local() const { return num_heads_local_; }
     const std::vector<config::GpuRef>& gpus() const { return opts_.gpus; }
     const std::vector<void*>& hidden_out() const { return hidden_out_; }
+    /// INV-0.6(b) span-graph runner (P-29 step 7): keyed capture/replay cache
+    /// for the eager B=1 decode-chain spans (KDA layer chain, MLA common
+    /// prefix, driver gate span). Shared with the attention driver — one
+    /// runner, unique keys. LS_DECODE_CHAIN_GRAPH=0 disables.
+    compute::DecodeSpanGraphs& span_graphs() { return span_graphs_; }
+    /// TD-GLM5-TP-COMBINE-PRECISION: the RESOLVED fp32-TP-combine state
+    /// (opts + LS_TP_COMBINE_FP32 override, dcp>=2). Single source of truth —
+    /// the MoE dispatcher keys the shared/dense FFN combine off this too.
+    bool tp_combine_fp32_active() const { return tp_combine_fp32_active_; }
 
     // V4-4c dual RoPE: per-rank device cos/sin tables. `rope_table_device` is
     // the base-theta table (all models); `rope_table_compress_device` is the
@@ -695,10 +868,27 @@ public:
     // (#16): the CommandDispatcher's MTP eh_proj projection reuses this
     // single-GEMM router + workspace instead of duplicating the strategy/M
     // dispatch (see dispatch_mtp_projection).
+    // c_fp32 (TD-GLM5-TP-COMBINE-PRECISION): C is [M, N] FP32 and the GEMM
+    // stores its fp32 accumulator raw (TP partial combine; same route/
+    // crossover, f32c kernel variants).
+    // LS_TP_HIDDEN_PROBE diagnostic (TD-GLM5-TP-COMBINE-PRECISION): when the
+    // env is set, device-sync and dump a row-0 checksum of `bufs[r]` (BF16
+    // [B, hidden]) per rank with a stage tag — the TP1-vs-TP2 drift
+    // bisection instrument. No-op (and zero cost) when the env is unset.
+    void tp_hidden_probe(const char* tag, int layer_idx,
+                         void* const* bufs, int batch) const;
+
     void route_gguf_gemm(compute::AttentionDevice* attn,
                          int rank, int M, int N, int K,
                          const void* A, const void* B, void* C,
-                         model::GgufKQuantType type, void* stream) const;
+                         model::GgufKQuantType type, void* stream,
+                         bool c_fp32 = false) const;
+
+    /// The int-strategy mmvq/mmq crossover route_gguf_gemm applies (env-
+    /// latched LS_CHUNK_SMALLM family). Exposed so the fused multi-segment
+    /// projection path (arch_glm5_next emit_qkv, P-29 step 15) fuses exactly
+    /// the calls route_gguf_gemm would have sent to mmvq.
+    static int gguf_mmvq_max_m();
 
 private:
     void execute_attention_graph(const AttentionExecParams& params);
@@ -717,11 +907,11 @@ private:
 
     // GLM-25a: run the DSA lightning indexer for one rank/layer to produce this
     // step's sparse block indices. Reads the q-a-norm latent (q_compressed_) and
-    // normed hidden (normed_hidden_), appends the token's key to the persistent
-    // per-layer indexer-K cache at its position, scores all cached positions and
-    // writes sparse_indices_/topk_lengths_. Single-sequence step model (B==1,
-    // dcp_size==1, seqlen ≤ indexer_cache_tokens_); returns false → dense
-    // otherwise or when the layer has no indexer weights. Returns true when
+    // normed hidden (normed_hidden_), appends each entry's key into its
+    // sequence's dispatcher-provisioned paged indexer-K rows at its position,
+    // scores all stored positions and writes sparse_indices_/topk_lengths_.
+    // Returns false → dense (unblessed step, missing weights/rows, dead-row
+    // cohort shapes — see body). Returns true when
     // sparse indices were produced (caller flips params.is_sparse). The
     // emitted indices are GLOBAL positions; under sharded KV (KVS-4) the
     // caller translates them per rank via indexer_shard_translate before the
@@ -733,7 +923,7 @@ private:
     // appender — the producer's K half (k-proj → LayerNorm(w+b) → RoPE →
     // Hadamard → FP8 quant-append) batched over all chunk rows, appending
     // each row's key at its own position into the SAME storage the decode
-    // producer scores (paged rows or executor arena). NO scoring, NO sparse
+    // producer scores (dispatcher-provisioned page rows). NO scoring, NO sparse
     // output. Only layers that OWN indexer-K storage append (IndexShare full
     // ∪ layer 0); shared layers no-op (return true). Returns false when the
     // append could not run (missing blessing/weights/positions).
@@ -748,8 +938,7 @@ private:
     // / topk_lengths_dev_. Requires the chunk's indexer keys to be already
     // appended (append_indexer_chunk ran first this layer). Same IndexShare
     // reuse + dispatcher-blessing + storage-resolution rules as the decode
-    // producer; chunk = ONE sequence, so the arena is valid at any B (in
-    // replicated mode; local mode is paged-only). LOCAL indexer mode
+    // producer (paged storage in both indexer modes). LOCAL indexer mode
     // (TD-SPARSE-PREFILL-LOCAL-INDEXER): row b scores only this rank's
     // owned shard bounded PER ROW at owned_len(rank, len_b) — the shard
     // already holds the chunk's LATER keys, so the per-row bound is an
@@ -772,14 +961,12 @@ private:
     // Serves BOTH indexer modes: replicated (writes sparse_indices_dev_/
     // topk_lengths_dev_ rows directly) and local (writes per-row candidate
     // rows into the packed send buffer for the cross-rank merge). Caller
-    // must have resolved storage into indexer_page_rows_ and passed the
-    // arena slot. Returns false → caller runs the per-row loop, which stays
-    // authoritative (B < 2, scratch unallocated, per-row dense mask present,
-    // mixed paged/arena rows, bound beyond the endpoints iota, page-table
-    // overflow, or rows_per_wave < 2).
+    // must have resolved storage into indexer_page_rows_. Returns false →
+    // caller runs the per-row loop, which stays authoritative (B < 2,
+    // scratch unallocated, per-row dense mask present, bound beyond the
+    // endpoints iota, page-table overflow, or rows_per_wave < 2).
     bool prefill_score_topk_batched(compute::AttentionDevice* attn, int rank,
-                                    const AttentionExecParams& params,
-                                    int slot);
+                                    const AttentionExecParams& params);
 
     // TD-GLM-INDEXER-LOCAL-MERGE: allgather the per-rank shard candidate
     // buffers and run the exact cross-rank top-k merge on every rank, per
@@ -792,7 +979,7 @@ private:
 
     // Resolve batch entry b's dispatcher-provisioned indexer-K page row for
     // `layer` on `rank`, requiring coverage of [0, len). nullptr when
-    // unprovisioned/short (→ arena fallback). Shared by the decode producer
+    // unprovisioned/short (→ fail closed to dense). Shared by the decode producer
     // and the chunk appender.
     const void* const* indexer_page_row(const AttentionExecParams& params,
                                         int rank, int layer, int b,
@@ -813,6 +1000,30 @@ private:
     int kv_a_n_pad_ = 0;
 
     // Per-rank intermediate buffers [dcp_size]
+    // ── GF3.9 KDA scratch (glm5_next only; empty vectors otherwise).
+    // Sized for kda_rows_max_ = min(max(max_batch, superchunk_tokens), 512)
+    // rows at C = kda_heads_per_rank * 128 channels. The scan workspace is
+    // the GF3.7 fp32 workspace (~13.3 MiB per 64-token chunk at H=64 —
+    // ~107 MiB at the 512-row bound; logged at boot, PLAN GF3.9 budget).
+    int kda_rows_max_ = 0;
+    size_t kda_workspace_bytes_ = 0;
+    std::vector<void*> kda_x_bf16_;     // [3, rows, C] bf16 pre-conv q|k|v
+    std::vector<void*> kda_beta_;       // [rows, H_local] bf16
+    std::vector<void*> kda_lowrank_;    // [rows, 128] bf16 f_a/g_a staging
+    std::vector<void*> kda_lowrank2_;   // [rows, 128] bf16 g_a staging on
+                                        // the FUSED projection path (the
+                                        // f/g low-rank chains run from one
+                                        // launch, so g_a cannot reuse
+                                        // kda_lowrank_; P-29 step 15)
+    std::vector<void*> kda_rawg_;       // [rows, C] bf16 decay-gate pre-act
+    std::vector<void*> kda_g2_;         // [rows, C] bf16 output-gate pre-act
+    std::vector<void*> kda_conv_f32_;   // [3, rows, C] f32 post-conv q|k|v
+    std::vector<void*> kda_core_f32_;   // [rows, C] f32 pre-o_norm
+    std::vector<void*> kda_onorm_bf16_; // [rows, C] bf16 o_norm output
+    std::vector<void*> kda_workspace_;  // chunked-scan fp32 workspace
+    std::vector<void*> kda_slots_dev_;  // [max_batch] i32 decode slot table
+    std::vector<void*> kda_slots_host_; // pinned [max_batch] i32 staging
+
     std::vector<void*> normed_hidden_;            // [max_batch, hidden_size] BF16
     std::vector<void*> fp8_hidden_;             // [max_batch, hidden_size] FP8
     std::vector<void*> fp8_hidden_scales_;      // [max_batch, ceil(hidden/128)] float32
@@ -826,6 +1037,12 @@ private:
     std::vector<void*> kv_compressed_;          // [max_batch, kv_lora_rank + qk_rope] BF16 (alloc rows padded to kv_a_n_pad_; B==1 takes the kv_a GEMM write directly)
     std::vector<void*> kv_a_pad_out_;           // [max_batch, kv_a_n_pad_] BF16 kv_a GEMM scratch, only when max_batch > 1 and padding active
     std::vector<void*> hidden_out_;             // [max_batch, hidden_size] BF16
+    // TD-GLM5-TP-COMBINE-PRECISION: FP32 o_proj partial-hidden staging for
+    // the fp32 TP combine (same row bound as hidden_out_, 4 B/elem).
+    // Allocated only when tp_combine_fp32_active_.
+    std::vector<void*> hidden_f32_;
+    int hidden_f32_rows_ = 0;                   // hidden_f32_ row bound
+    bool tp_combine_fp32_active_ = false;       // resolved: opts + env + dcp>=2
     // V4-5c grouped o_proj stage-1 output scratch (ticket G), allocated only
     // when opts_.v4_o_groups > 0. Rows bound = max(max_batch,
     // superchunk_tokens) so V4-7b prefill chunk rows flow through.
@@ -959,12 +1176,13 @@ private:
     std::vector<void*> fp8_corrected_scales_;   // float32
     std::vector<void*> gemm_workspace_;         // max across all GEMMs
 
-    // GLM-25a: DSA indexer producer scratch (per rank), allocated when has_dsa.
-    // The indexer-K cache is PERSISTENT per layer × position (engine batch model:
-    // one new token per sequence per step; single-sequence path, B==1), holding
-    // up to indexer_cache_tokens_ positions per layer. Long-context / multi-seq
-    // uses the paged kIndexerK pool (TD-GLM-INDEXER-PAGED / -BATCH).
-    int indexer_cache_tokens_ = 0;              // positions per slot in the arena
+    // GLM-25a: DSA indexer producer scratch (per rank), allocated when
+    // has_dsa. Key STORAGE is exclusively the dispatcher-provisioned paged
+    // kIndexerK pool (TD-GLM-INDEXER-PAGED / -BATCH; S4 deleted the legacy
+    // B==1 persistent K arena). indexer_score_tokens_ sizes the per-rank
+    // score scratch + endpoints iota — the maximum positions one query can
+    // score, i.e. the serving context (rope_max_pos).
+    int indexer_score_tokens_ = 0;              // score-scratch positions
     // IndexShare (GLM-25b): per-rank step key under which sparse_indices_dev_
     // was last written by a FULL layer. A shared layer reuses that buffer iff
     // its step key matches (else it recomputes — always correct). The key is
@@ -980,19 +1198,22 @@ private:
     // Per-entry page-row scratch for the producer (avoids per-call allocation;
     // sized max_batch at allocate_buffers).
     std::vector<const void* const*> indexer_page_rows_;
-    // Arena slot per layer (−1 = shared layer that never computes → no K
-    // storage). Only IndexShare full layers + layer 0 get slots — GLM-5.2:
-    // 21 of 79. Paged migration notes live at the allocation site.
-    std::vector<int> indexer_layer_slot_;
-    int indexer_arena_slots_ = 0;
+    bool indexer_layer_computes(int layer) const {
+        return layer >= 0
+            && layer < static_cast<int>(indexer_layer_computes_.size())
+            && indexer_layer_computes_[layer] != 0;
+    }
+    // Layer → computes-the-indexer mask (IndexShare full layers ∪ layer 0;
+    // GLM-5.2: 21 of 79). Shared layers own no indexer-K storage — the
+    // appender no-ops for them and the producers reuse the preceding full
+    // layer's selection (or return dense when nothing reusable exists).
+    std::vector<uint8_t> indexer_layer_computes_;
     std::vector<void*> indexer_q_;              // [max_batch, index_n_heads*index_head_dim] BF16
     std::vector<void*> indexer_k_;              // [max_batch, index_head_dim] BF16
     std::vector<void*> indexer_weights_;        // [max_batch, index_n_heads] BF16 (indexer_proj out)
     std::vector<void*> indexer_score_proj_;     // [max_batch, index_n_heads] F32 (scaled score weights)
-    std::vector<void*> indexer_k_cache_;        // [num_layers, cache_tokens, index_head_dim] FP8 (persistent)
-    std::vector<void*> indexer_k_scales_;       // [num_layers, cache_tokens] F32 per-position scale
-    std::vector<void*> indexer_scores_;         // [cache_tokens] F32 one-query score scratch
-    std::vector<void*> indexer_block_endpoints_;// [cache_tokens] int32 static iota (position ids)
+    std::vector<void*> indexer_scores_;         // [score_tokens] F32 one-query score scratch
+    std::vector<void*> indexer_block_endpoints_;// [score_tokens] int32 static iota (position ids)
     std::vector<void*> indexer_topk_scores_;    // [index_topk] F32 topk output scratch
                                                 // ([max_batch, index_topk] under
                                                 // sparse_prefill — the batched
@@ -1011,6 +1232,24 @@ private:
     std::vector<int> indexer_row_bounds_host_;   // pageable staging mirror
     std::vector<const void*> indexer_page_table_host_;
     bool indexer_batch_logged_ = false;  // one-time "batched producer" line
+    // P-29 step 7 (INV-0.6(b) kIndexer span): B=1 decode-producer device
+    // state at STABLE addresses so the whole indexer chain graphs —
+    // per-(rank) per-LAYER device page-pointer rows (restaged only when a
+    // layer's page row content drifts, i.e. every indexer page-growth) and
+    // a per-rank int[2] bounds slot the in-graph bounds kernel writes from
+    // device seqlens each replay. Lazily allocated on first span use.
+    std::vector<void*> indexer_dec_ptab_dev_;    // [layers * pages_cap] ptrs
+    std::vector<std::vector<const void*>> indexer_dec_ptab_mirror_;
+    size_t indexer_dec_ptab_cap_ = 0;            // pages per layer row
+    std::vector<void*> indexer_dec_bounds_dev_;  // int[2] per rank
+    bool indexer_dec_span_logged_ = false;
+    // GF3.5 IndexPool scratch (allocated only when index_kpool > 1):
+    // per-token raw gate vectors (decode B rows / chunk rows) and the
+    // pool-id selection scratch (top-k emits POOL ids here at stride
+    // index_topk/kpool; kpool expansion then writes token rows into
+    // sparse_indices_dev_ at index_topk_rows stride).
+    std::vector<void*> indexer_gate_;           // [max_batch, head_dim] BF16
+    std::vector<void*> indexer_pool_ids_;       // [sparse_rows, topk/kpool] int32
     std::vector<void*> sparse_indices_dev_;     // [max_batch, index_topk] int32
     std::vector<void*> topk_lengths_dev_;       // [max_batch] int32
     // KVS-4 (sharded KV only): rank-LOCAL translation of the global top-k —
@@ -1093,6 +1332,8 @@ private:
 
     // Cached stream pointers [dcp_size]
     std::vector<void*> attn_streams_;
+    /// INV-0.6(b) span-graph runner (P-29 step 7) — see span_graphs().
+    compute::DecodeSpanGraphs span_graphs_;
 
     // INV-NCCL-GRAPH (env LS_NCCL_GRAPH, default OFF): captured per-rank
     // graphs of the Step-14 o_proj TP allreduce (fixed hidden_out_ buffers,

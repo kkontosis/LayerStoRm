@@ -253,11 +253,16 @@ TEST(NvmeTier, SlotOffsetAddressing) {
     // Write different patterns to different layer slots within the same
     // expert file.  All layers are first_moe_layer through
     // first_moe_layer + num_moe_layers - 1.
+    // write_expert(key, host_ptr) is async (io_uring): the buffer must stay
+    // valid until the completion is polled — keep all buffers alive until
+    // after drain_writes() (the old per-iteration vector was a use-after-free
+    // once writes stopped being synchronous).
     int expert_idx = 3;
+    std::vector<std::vector<uint8_t>> bufs;
     for (int moe_offset = 0; moe_offset < kNumMoeLayers; ++moe_offset) {
         auto k = key(static_cast<uint32_t>(kFirstMoeLayer + moe_offset),
                       static_cast<uint16_t>(expert_idx));
-        std::vector<uint8_t> data(kSlotSize);
+        auto& data = bufs.emplace_back(kSlotSize);
         fill_pattern(data.data(), kSlotSize, k);
         auto tok = tier.write_expert(k, data.data());
         ASSERT_TRUE(tok.has_value());
@@ -478,11 +483,13 @@ TEST(NvmeTier, MultiDriveStriping) {
     auto k0 = key(kFirstMoeLayer, 0);
     auto k1 = key(kFirstMoeLayer, 1);
 
-    std::vector<uint8_t> data(kSlotSize);
-    fill_pattern(data.data(), kSlotSize, k0);
-    tier.write_expert(k0, data.data());
-    fill_pattern(data.data(), kSlotSize, k1);
-    tier.write_expert(k1, data.data());
+    // Async writes (io_uring): each write needs its own buffer, kept valid
+    // until drain — refilling one buffer overwrote the first write's source.
+    std::vector<uint8_t> data0(kSlotSize), data1(kSlotSize);
+    fill_pattern(data0.data(), kSlotSize, k0);
+    tier.write_expert(k0, data0.data());
+    fill_pattern(data1.data(), kSlotSize, k1);
+    tier.write_expert(k1, data1.data());
     drain_writes(tier);
 
     // Expert 0 on drive 0, expert 1 on drive 1.
@@ -583,10 +590,10 @@ TEST(NvmeTier, PollCompletionsEmpty) {
 // ── Duplicate write for same expert key ─────────────────────────────────────
 
 TEST(NvmeTier, DuplicateWriteInflightReturnsNullopt) {
-    // Without io_uring, writes are synchronous, so this test only verifies
-    // the API contract: a second write while the first is inflight is rejected.
-    // With sync fallback, the first write completes immediately, so the second
-    // succeeds.  This test documents the behavior.
+    // API contract: a second write while the first is inflight is rejected.
+    // With io_uring the first write stays inflight until polled, so the
+    // duplicate returns nullopt; with the sync fallback the first write
+    // completes immediately, so the second succeeds.
     TempDirs dirs;
     dirs.add();
     auto hw = test_hw();
@@ -598,8 +605,17 @@ TEST(NvmeTier, DuplicateWriteInflightReturnsNullopt) {
     std::vector<uint8_t> data(kSlotSize, 0x11);
     auto tok1 = tier.write_expert(k, data.data());
     ASSERT_TRUE(tok1.has_value());
-    // With sync fallback, tok1 == 0 (completed immediately).
-    // A second write should also succeed (sync).
     auto tok2 = tier.write_expert(k, data.data());
+#ifdef LAYERSTORM_HAS_URING
+    // First write inflight until drained — duplicate rejected.
+    EXPECT_FALSE(tok2.has_value());
+    drain_writes(tier);
+    // After the inflight write completes, a rewrite is accepted again.
+    auto tok3 = tier.write_expert(k, data.data());
+    EXPECT_TRUE(tok3.has_value());
+    drain_writes(tier);
+#else
+    // Sync fallback: first write completed immediately, second succeeds.
     EXPECT_TRUE(tok2.has_value());
+#endif
 }

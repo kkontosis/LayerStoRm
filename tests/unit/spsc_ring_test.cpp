@@ -42,7 +42,7 @@ TEST(IpcProtocol, StructSizes) {
     EXPECT_EQ(sizeof(lipc::GpuSnapshot), 56u);
     EXPECT_EQ(sizeof(lipc::RequestAcceptance), 16u);
     // Cross-language invariant: Python ctypes must match this exact value.
-    EXPECT_EQ(sizeof(lipc::StateSnapshot), 1676928u);  // TD-IPC-MOE-LAYER-CAP: kMaxMoeLayers 64→128 (still a multiple of 64)
+    EXPECT_EQ(sizeof(lipc::StateSnapshot), 2095744u);  // TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION: kMaxExperts 256→320; TD-IPC-MOE-LAYER-CAP: kMaxMoeLayers 64→128 (still a multiple of 64)
 }
 
 TEST(IpcProtocol, FieldOffsets) {
@@ -66,7 +66,15 @@ TEST(IpcProtocol, FieldOffsets) {
 
 TEST(IpcProtocol, EngineInfoOffsets) {
     // Cross-language invariant: Python ctypes EngineInfo must match these offsets.
-    EXPECT_EQ(sizeof(lipc::EngineInfo), 128u);
+    // Size tracked against the Python mirror (python/orchestrator/
+    // shm_protocol.py EngineInfo, ctypes.sizeof == 272) — it grew past the
+    // original 128 as vocab_size (6fcedbc6), moe_batch_capacity, the V4
+    // metadata block (attention_types, now offset 136), the KDA state-pool
+    // geometry (TD-GLM5-KDA-SLOTS-EXPORT) and moe_chunk_capacity (P-30
+    // step 1, inserted after vocab_size at 124 — +4 shift for everything
+    // after, +4 alignment padding before the int64 kda_state_slot_bytes)
+    // were appended. Update BOTH sides together.
+    EXPECT_EQ(sizeof(lipc::EngineInfo), 272u);
     EXPECT_EQ(offsetof(lipc::EngineInfo, ipc_base), 0u);
     EXPECT_EQ(offsetof(lipc::EngineInfo, ipc_total_bytes), 8u);
     EXPECT_EQ(offsetof(lipc::EngineInfo, cmd_ring_offset), 16u);
@@ -87,6 +95,15 @@ TEST(IpcProtocol, EngineInfoOffsets) {
     EXPECT_EQ(offsetof(lipc::EngineInfo, num_expert_devices), 108u);
     EXPECT_EQ(offsetof(lipc::EngineInfo, kv_bytes_per_page), 112u);
     EXPECT_EQ(offsetof(lipc::EngineInfo, vocab_size), 120u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, moe_chunk_capacity), 124u);  // P-30 step 1
+    EXPECT_EQ(offsetof(lipc::EngineInfo, attention_types), 136u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, seq_fork_truncatable), 232u);
+    // TD-GLM5-KDA-SLOTS-EXPORT block (all zero for non-KDA models).
+    EXPECT_EQ(offsetof(lipc::EngineInfo, kda_state_mapped), 236u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, kda_state_slots), 240u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, kda_state_slot_bytes), 248u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, kda_state_pages_per_seq), 256u);
+    EXPECT_EQ(offsetof(lipc::EngineInfo, kda_state_pool_pages), 264u);
 }
 
 TEST(IpcProtocol, IpcLayoutDefaults) {

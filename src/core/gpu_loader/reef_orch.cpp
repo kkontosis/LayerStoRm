@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -53,12 +54,144 @@ ReefOrch::ReefOrch(int tp, std::vector<int> caps, LoaderConstants k)
       cap(std::move(caps)),
       M(tp) {}
 
+// ── TD-KVXP-CAPACITY-REPUBLISH: live cap refresh (see reef_orch.h) ─────────
+
+void reef_orch_refresh_caps(ReefOrch& o, const std::vector<int>& new_caps,
+                            const std::vector<int>& xtp_positions) {
+    if (new_caps.size() != o.cap.size()) {
+        std::fprintf(stderr,
+                     "[reef] refresh_caps: shape mismatch (%zu != %zu) — "
+                     "refresh IGNORED, caps left as-is\n",
+                     new_caps.size(), o.cap.size());
+        return;
+    }
+    o.cap = new_caps;
+    // Re-arm the XTP route caps from the refreshed capacity IFF they are
+    // armed. The cap value is the MEASURED stable-zone slot count — the same
+    // rule as the boot arming (TD-MOE-PLACEMENT-CAPACITY-CAP), never a tuned
+    // constant. A disarmed route_cap (empty) stays disarmed.
+    if (!o.route_cap.empty()) {
+        o.route_cap.assign(o.cap.size(), -1);
+        for (int g : xtp_positions) {
+            if (g < 0 || static_cast<size_t>(g) >= o.cap.size()) continue;
+            o.route_cap[static_cast<size_t>(g)] =
+                o.cap[static_cast<size_t>(g)];
+        }
+    }
+    // Board capacity is a reserve HINT (alloc_slot grows past it) — no
+    // resize. Record the refresh in the decision dump so the offline replay
+    // (tools/reef_sim) can apply it at the same solve count.
+    if (o.decision_dump) {
+        std::fprintf(o.decision_dump, "C %llu",
+                     static_cast<unsigned long long>(o.solve_count));
+        for (size_t g = 0; g < o.cap.size(); ++g)
+            std::fprintf(o.decision_dump, " %d", o.cap[g]);
+        std::fputc('\n', o.decision_dump);
+    }
+}
+
+// ── TD-MOE-PLACEMENT-CAPACITY-CAP: post-solve route-capacity repair ────────
+// Enforce ReefOrch::route_cap on one solve's assignment (device-index space,
+// a[i] in [0,M) or -1 = solver-invalid, emitted as position 0 downstream).
+// The solver itself stays frozen; when no cap binds this is a read-only pass
+// and the assignment is byte-identical to the uncapped path. When a capped
+// device holds more experts than its stable zone can physically fit, its
+// overflow MISSES (never resident hits — they already hold slots, and
+// assigned hits <= residents <= stable slots, so overflow <= misses) are
+// re-homed one at a time onto the headroom device minimizing the solver's
+// full evaluate() objective — the same signals the solve ranked by.
+// Deterministic: ascending device scan, ascending (i, d) with strict <.
+// If no destination has headroom the residual is left in place and counted
+// (the serving-level degraded retry stays the net for that physically
+// infeasible case).
+template <typename Solver>
+static void enforce_route_caps(ReefOrch& o, Solver& sv, int n,
+                               std::vector<int>& a) {
+    if (o.route_cap.empty()) return;
+    const int M = o.M;
+    int cnt[kMaxDevices] = {0};
+    int capj[kMaxDevices];
+    bool any_cap = false;
+    for (int j = 0; j < M; ++j) {
+        const int pos = o.K.devices[static_cast<size_t>(j)].position;
+        capj[j] = (pos >= 0 && static_cast<size_t>(pos) < o.route_cap.size())
+                      ? o.route_cap[static_cast<size_t>(pos)] : -1;
+        if (capj[j] >= 0) any_cap = true;
+    }
+    if (!any_cap) return;
+    for (int i = 0; i < n; ++i) {
+        // A solver-invalid entry (-1, r.n < n) makes evaluate() unsafe and
+        // the share unknowable — refuse the repair for this route entirely
+        // (cannot happen off the two production tiers; defensive only).
+        if (a[static_cast<size_t>(i)] < 0 || a[static_cast<size_t>(i)] >= M)
+            return;
+        ++cnt[a[static_cast<size_t>(i)]];
+    }
+    bool binds = false;
+    for (int j = 0; j < M; ++j)
+        if (capj[j] >= 0 && cnt[j] > capj[j]) { binds = true; break; }
+    if (!binds) return;
+    for (int j = 0; j < M; ++j) {
+        while (capj[j] >= 0 && cnt[j] > capj[j]) {
+            int best_i = -1, best_d = -1;
+            double best_T = 0.0;
+            for (int i = 0; i < n; ++i) {
+                if (a[static_cast<size_t>(i)] != j) continue;
+                if (o.req.cached_at(i, j)) continue;  // hits keep their device
+                for (int d = 0; d < M; ++d) {
+                    if (d == j) continue;
+                    if (capj[d] >= 0 && cnt[d] >= capj[d]) continue;
+                    a[static_cast<size_t>(i)] = d;
+                    const double T = sv.evaluate(o.K, o.req,
+                                                 a.data(), nullptr);
+                    a[static_cast<size_t>(i)] = j;
+                    if (best_i < 0 || T < best_T) {
+                        best_T = T;
+                        best_i = i;
+                        best_d = d;
+                    }
+                }
+            }
+            if (best_i < 0) {
+                // Physically infeasible (every headroom-less device capped,
+                // or overflow of pure hits — cannot happen when the caps
+                // mirror the stable zones). Leave the residual; degrade
+                // (+ the serving retry) remains the net.
+                if (o.route_cap_residual == 0)
+                    std::fprintf(stderr,
+                                 "[reef] route-cap residual: device %d over "
+                                 "cap %d by %d with no headroom destination "
+                                 "(TD-MOE-PLACEMENT-CAPACITY-CAP; degraded "
+                                 "finalize + retry remain the net)\n",
+                                 j, capj[j], cnt[j] - capj[j]);
+                ++o.route_cap_residual;
+                break;
+            }
+            a[static_cast<size_t>(best_i)] = best_d;
+            --cnt[j];
+            ++cnt[best_d];
+            ++o.route_cap_moves;
+        }
+    }
+}
+
 void reef_orch_route(ReefOrch& o, int layer,
                      const std::vector<uint16_t>& topk,
                      std::vector<uint8_t>& assign) {
     using layerstorm::memory::ExpertKey;
     const int M = o.M;
     const int n = static_cast<int>(topk.size());
+    // Loud capacity guard (TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION audit):
+    // solver_big is BasicLoaderSolver<kMaxExpertsLarge> with fixed
+    // std::array members; its only internal protection is an assert that
+    // vanishes under NDEBUG. The header promises callers fail loud beyond
+    // kMaxExpertsLarge — enforce it here rather than in every caller.
+    if (n > kMaxExpertsLarge) {
+        throw std::runtime_error(
+            "reef_orch_route: union size " + std::to_string(n) +
+            " exceeds kMaxExpertsLarge=" + std::to_string(kMaxExpertsLarge) +
+            " (LoaderSolver256 fixed capacity)");
+    }
     // 1. Recency + decayed-frequency touch (i-order, mirrors route_moe_by_loader).
     o.board.advance_recency();
     for (int i = 0; i < n; ++i) {
@@ -131,16 +264,37 @@ void reef_orch_route(ReefOrch& o, int layer,
     // 3. Solve → target GPU positions. Unions <= 64 use the frozen production
     // solver (decode byte-identity); larger unions the 256-bound
     // instantiation (pinned-greedy tier beyond the exact budgets).
-    auto emit = [&](const auto& r) {
+    auto emit = [&](const auto& r, auto& sv) {
+        auto& a = o.route_scratch;
+        a.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             const int jj = (i < r.n) ? r.assignment[static_cast<size_t>(i)] : -1;
+            a[static_cast<size_t>(i)] = (jj >= 0 && jj < M) ? jj : -1;
+        }
+        // TD-MOE-PLACEMENT-CAPACITY-CAP: repair over-capacity shares on
+        // capped (wave-excluded) positions. No-op (byte-identical) when
+        // route_cap is empty or no cap binds. The first engagement is
+        // logged once per boot (INV-REEF-CAP acceptance evidence:
+        // route_cap_moves > 0 must be observable in the serve log; same
+        // stderr channel as the residual warning above).
+        const uint64_t cap_moves_before = o.route_cap_moves;
+        enforce_route_caps(o, sv, n, a);
+        if (cap_moves_before == 0 && o.route_cap_moves > 0)
+            std::fprintf(stderr,
+                         "[reef] route-cap repair engaged: %llu expert(s) "
+                         "re-homed (layer %d, union %d) — over-capacity XTP "
+                         "share capped at stable-zone capacity "
+                         "(TD-MOE-PLACEMENT-CAPACITY-CAP)\n",
+                         static_cast<unsigned long long>(o.route_cap_moves),
+                         layer, n);
+        for (int i = 0; i < n; ++i) {
+            const int jj = a[static_cast<size_t>(i)];
             assign[static_cast<size_t>(i)] = static_cast<uint8_t>(
-                (jj >= 0 && jj < M) ? o.K.devices[static_cast<size_t>(jj)].position
-                                    : 0);
+                jj >= 0 ? o.K.devices[static_cast<size_t>(jj)].position : 0);
         }
     };
-    if (n <= kMaxExperts) emit(o.solver.solve(o.K, req));
-    else                  emit(o.solver_big.solve(o.K, req));
+    if (n <= kMaxExperts) emit(o.solver.solve(o.K, req), o.solver);
+    else                  emit(o.solver_big.solve(o.K, req), o.solver_big);
     ++o.solve_count;
     if (o.decision_dump) {
         std::fprintf(o.decision_dump, "R %d %d |", layer, n);

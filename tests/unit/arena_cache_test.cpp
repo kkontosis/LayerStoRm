@@ -209,6 +209,52 @@ TEST(ArenaCacheTest, HashConfigSensitivity) {
     EXPECT_NE(hp1, hp2);
 }
 
+TEST(ArenaCacheTest, HashConfigCensusIdentity) {
+    // P-29 step 13 phase B: the MoE-layer census id folds into the arena identity
+    // ONLY when the census extends past num_hidden_layers (MTP/NextN experts
+    // armed as arena tenants). census_id 0 == the historical formula, so
+    // every store written before the parameter existed keeps its exact hash
+    // (no one-time wipe); a non-zero id must separate a 42-layer/12,096-slot
+    // store from a 43-layer/12,384-slot one so the mismatch takes the normal
+    // on_conflict path instead of being mis-adopted.
+    layerstorm::config::PinHostExpertPoolSizingConfig sizing;
+    layerstorm::config::CrossNodeSpillConfig spill;
+    std::vector<lm::ArenaCache::NodeIdentity> nodes{{0, 2}, {2, 1}};
+
+    // Baseline: the call shape from before the parameter existed.
+    const uint64_t h = lm::ArenaCache::hash_config(64, 0, nodes, sizing, spill);
+    // census_id = 0 (with and without an explicit placement_id) is byte-
+    // identical to that baseline.
+    EXPECT_EQ(h, lm::ArenaCache::hash_config(64, 0, nodes, sizing, spill,
+                                             /*placement_id=*/0,
+                                             /*census_id=*/0));
+    EXPECT_EQ(h, lm::ArenaCache::hash_config(64, 0, nodes, sizing, spill, 0));
+
+    // Any non-zero census id folds in, and distinct ids are distinct.
+    const uint64_t hc1 = lm::ArenaCache::hash_config(64, 0, nodes, sizing,
+                                                     spill, 0, 12096);
+    const uint64_t hc2 = lm::ArenaCache::hash_config(64, 0, nodes, sizing,
+                                                     spill, 0, 12384);
+    EXPECT_NE(h, hc1);
+    EXPECT_NE(h, hc2);
+    EXPECT_NE(hc1, hc2);
+    // Deterministic across calls (FNV-1a over the same inputs).
+    EXPECT_EQ(hc1, lm::ArenaCache::hash_config(64, 0, nodes, sizing, spill,
+                                               0, 12096));
+
+    // The census axis is INDEPENDENT of the placement axis: the same numeric
+    // id in the two slots must not collide (each has its own domain tag), and
+    // both folded together differ from either alone.
+    const uint64_t hp = lm::ArenaCache::hash_config(64, 0, nodes, sizing,
+                                                    spill, 12096, 0);
+    EXPECT_NE(hp, hc1);
+    const uint64_t hpc = lm::ArenaCache::hash_config(64, 0, nodes, sizing,
+                                                     spill, 12096, 12096);
+    EXPECT_NE(hpc, hp);
+    EXPECT_NE(hpc, hc1);
+    EXPECT_NE(hpc, h);
+}
+
 TEST(ArenaCacheTest, KeyHashDependsOnIdentityAndKey) {
     CacheFixture f;
     const uint64_t h1 = f.cache->key_hash(key(1, 2));

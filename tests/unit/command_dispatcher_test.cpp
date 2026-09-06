@@ -17,9 +17,11 @@
 #include "compute/graphs/graph_registry.h"
 #include "compute/stream_manager.h"
 #include "config/config_parser.h"
+#include "core/gpu_loader/reef_orch.h"
 #include "core/gpu_ref.h"
 #include "core/memory/eviction_policy.h"
 #include "core/memory/expert_cache.h"
+#include "core/memory/expert_zone_math.h"
 #include "core/memory/numa_manager.h"
 #include "core/memory/nvme_tier.h"
 #include "core/memory/page_allocator.h"
@@ -119,8 +121,16 @@ static lc::Config small_config() {
         {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
                           {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
         {"hardware", {
-            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1}},
-                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1}}}},
+            // vram_allocation_gb.expert_streaming: since the KV pool became
+            // demand/auto-sized it soaks all residual VRAM and the auto expert
+            // reserve shrinks to the bare top-K minimum (min_expert_cache =
+            // experts_per_tok slots ~0.2 MiB here), which cannot host the
+            // experts these tests reserve. Pin an explicit expert-cache budget
+            // so the fixture exercises dispatcher logic, not zone sizing.
+            {"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}},
+                      {{"id", 1}, {"type", "rtx5090"}, {"vram_gb", 1},
+                       {"vram_allocation_gb", {{"expert_streaming", 0.25}}}}}},
             {"tp_array", {0, 1}},
             {"system_ram_gb", 64}}},
         {"memory", {{"vram_safety_margin_gb", 0.1},
@@ -1226,6 +1236,753 @@ TEST_F(CommandDispatcherTest, SeqFork_ThenFreeBoth) {
     EXPECT_EQ(free_final, free_initial);  // All pages returned
 }
 
+TEST_F(CommandDispatcherTest, SeqForkFrozen_SharesWithoutCow) {
+    // R3 (TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE): a FROZEN fork (prefix
+    // holder registration) skips the CoW frontier split — pure refcount
+    // share, ZERO pages allocated.  The measured motivation: every
+    // registration fork on the GLM champion first died on the indexer-K
+    // CoW group, capping live holders at 3 of 8.
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/230);
+    cmd_create.seq_create.seq_id     = 9100;
+    cmd_create.seq_create.prompt_len = 32;  // 2 logical pages
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    ASSERT_EQ(cmp.status, 0u);
+
+    const int free_before = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK_FROZEN, /*seq=*/231);
+    cmd_fork.seq_fork.src_seq_id = 9100;
+    cmd_fork.seq_fork.dst_seq_id = 9101;
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_SEQ_OP_DONE));
+    EXPECT_EQ(cmp.status, 0u);
+
+    // ZERO allocation — refcount share only.
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before);
+
+    // Freeing the parent returns nothing (holder refs pin every page);
+    // freeing the holder returns everything.
+    auto cmd_free_src = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/232);
+    cmd_free_src.seq_free.seq_id = 9100;
+    dispatcher_->dispatch(cmd_free_src);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before);
+
+    auto cmd_free_dst = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/233);
+    cmd_free_dst.seq_free.seq_id = 9101;
+    dispatcher_->dispatch(cmd_free_dst);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_before + 2 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkFrozen_ChildForkCowsFromHolder) {
+    // The CoW deferred by a frozen fork happens at the NEXT fork — a
+    // working child forked FROM the holder gets its own frontier copies
+    // (the holder's shared originals have refcount >= 2).
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/240);
+    cmd_create.seq_create.seq_id     = 9200;
+    cmd_create.seq_create.prompt_len = 16;  // 1 logical page
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    const int free_initial = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK_FROZEN, /*seq=*/241);
+    cmd_fork.seq_fork.src_seq_id = 9200;
+    cmd_fork.seq_fork.dst_seq_id = 9201;   // holder
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial);
+
+    // Parent dies; the holder alone pins the KV.
+    auto cmd_free_src = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/242);
+    cmd_free_src.seq_free.seq_id = 9200;
+    dispatcher_->dispatch(cmd_free_src);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+
+    // Hit: fork a working child FROM the holder — a NORMAL fork, which
+    // CoW-copies the frontier logical group (kKvLayers pages).
+    auto cmd_hit = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/243);
+    cmd_hit.seq_fork.src_seq_id = 9201;
+    cmd_hit.seq_fork.dst_seq_id = 9202;
+    dispatcher_->dispatch(cmd_hit);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial - static_cast<int>(kKvLayers));
+
+    // Teardown returns everything.
+    for (uint64_t sid : {9202ull, 9201ull}) {
+        auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/244);
+        f.seq_free.seq_id = sid;
+        dispatcher_->dispatch(f);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    }
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial + static_cast<int>(kKvLayers));
+}
+
+// ═══ R4a: truncating fork (CMD_SEQ_FORK.prefix_len) ═══════════════════════
+// Fixture page size = 16 tokens (DcpConfig default page_size_tokens — the
+// same authority handle_seq_create's non-V4 arm uses), kKvLayers physical
+// pages per logical page.
+
+TEST_F(CommandDispatcherTest, SeqForkTruncated_MidPageStraddleCows) {
+    // prefix_len mid-page: the child refcount-shares the whole logical
+    // pages below the boundary and CoWs the STRADDLING logical group (its
+    // first append at prefix_len lands inside it).  Pages past the
+    // boundary are NOT taken — the parent's tail returns at parent free
+    // while the shared prefix stays pinned by the child (INV-SLAB-2
+    // fork-family accounting).
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/250);
+    cmd_create.seq_create.seq_id     = 9300;
+    cmd_create.seq_create.prompt_len = 48;  // 3 logical pages
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    ASSERT_EQ(cmp.status, 0u);
+    const int free_initial = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/251);
+    cmd_fork.seq_fork.src_seq_id = 9300;
+    cmd_fork.seq_fork.dst_seq_id = 9301;
+    cmd_fork.seq_fork.prefix_len = 24;  // pages 0 (shared) + 1 (straddle)
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_SEQ_OP_DONE));
+    EXPECT_EQ(cmp.status, 0u);
+    // Child holds ceil(24/16) = 2 logical pages, not the parent's 3.
+    EXPECT_EQ(cmp.seq_op.page_count, 2u * kKvLayers);
+    // Exactly one logical group CoW-copied (the straddle).
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial - static_cast<int>(kKvLayers));
+
+    // Parent free: its tail page 2 AND its straddle originals (child holds
+    // fresh CoW copies) return; only shared page 0 stays pinned.
+    auto cmd_free_src = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/252);
+    cmd_free_src.seq_free.seq_id = 9300;
+    dispatcher_->dispatch(cmd_free_src);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial + 1 * static_cast<int>(kKvLayers));
+
+    // Child free returns the shared page 0 + its CoW copies.
+    auto cmd_free_dst = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/253);
+    cmd_free_dst.seq_free.seq_id = 9301;
+    dispatcher_->dispatch(cmd_free_dst);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_initial + 3 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncated_PageAlignedSharesWithoutCow) {
+    // prefix_len on a page boundary: no logical page straddles — every
+    // shared page is read-only for both lifetimes (the child's first
+    // append at prefix_len allocates a FRESH logical page via
+    // ensure_pages), so the fork is a pure refcount share, zero pages.
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/260);
+    cmd_create.seq_create.seq_id     = 9400;
+    cmd_create.seq_create.prompt_len = 48;  // 3 logical pages
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    const int free_before = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/261);
+    cmd_fork.seq_fork.src_seq_id = 9400;
+    cmd_fork.seq_fork.dst_seq_id = 9401;
+    cmd_fork.seq_fork.prefix_len = 32;  // exactly pages 0..1
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.seq_op.page_count, 2u * kKvLayers);
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before)
+        << "aligned truncation must not allocate";
+
+    for (uint64_t sid : {9400ull, 9401ull}) {
+        auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/262);
+        f.seq_free.seq_id = sid;
+        dispatcher_->dispatch(f);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    }
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_before + 3 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncated_FullLengthMatchesLegacyFork) {
+    // REGRESSION GUARD (R4a must-hold): when prefix_len covers the whole
+    // parent, the truncated fork's page accounting is IDENTICAL to the
+    // legacy full fork (prefix_len == 0) — same handle count, same CoW of
+    // the partial frontier group, same allocator delta.  (prefix_len == 0
+    // itself IS the untouched legacy code path; SeqFork_Success and every
+    // pre-R4 producer pin that byte-identically.)
+    make_dispatcher();
+
+    // Two identically-shaped parents (unaligned length → partial frontier).
+    for (uint64_t sid : {9500ull, 9510ull}) {
+        auto c = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/270);
+        c.seq_create.seq_id     = sid;
+        c.seq_create.prompt_len = 24;  // 2 logical pages, last partial
+        dispatcher_->dispatch(c);
+        lipc::Completion cmp{};
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+        ASSERT_EQ(cmp.status, 0u);
+    }
+    lipc::Completion cmp{};
+
+    const int free_0 = page_allocator_->free_pages(0, lmem::Pool::kMain);
+    auto legacy = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/271);
+    legacy.seq_fork.src_seq_id = 9500;
+    legacy.seq_fork.dst_seq_id = 9501;
+    legacy.seq_fork.prefix_len = 0;   // legacy full fork
+    dispatcher_->dispatch(legacy);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    ASSERT_EQ(cmp.status, 0u);
+    const uint32_t legacy_pages = cmp.seq_op.page_count;
+    const int legacy_delta =
+        free_0 - page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    const int free_1 = page_allocator_->free_pages(0, lmem::Pool::kMain);
+    auto trunc = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/272);
+    trunc.seq_fork.src_seq_id = 9510;
+    trunc.seq_fork.dst_seq_id = 9511;
+    trunc.seq_fork.prefix_len = 24;   // covers the whole parent
+    dispatcher_->dispatch(trunc);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    ASSERT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.seq_op.page_count, legacy_pages);
+    EXPECT_EQ(free_1 - page_allocator_->free_pages(0, lmem::Pool::kMain),
+              legacy_delta);
+
+    for (uint64_t sid : {9500ull, 9501ull, 9510ull, 9511ull}) {
+        auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/273);
+        f.seq_free.seq_id = sid;
+        dispatcher_->dispatch(f);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    }
+    // free_0 was sampled AFTER creating both parents — full teardown also
+    // returns their 2 x 2 logical pages.
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_0 + 4 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncatedFrozen_PureShareIncludesStraddle) {
+    // FROZEN truncating fork (mid-edge holder registration, R4f's
+    // primitive): both CoW splits are skipped — the holder never appends,
+    // and rows >= prefix_len in the shared straddling page are
+    // parent-owned bytes the holder never reads (every consumer is
+    // bounded by the declared kv_len).  Zero allocation.
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/280);
+    cmd_create.seq_create.seq_id     = 9600;
+    cmd_create.seq_create.prompt_len = 48;  // 3 logical pages
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    const int free_before = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK_FROZEN, /*seq=*/281);
+    cmd_fork.seq_fork.src_seq_id = 9600;
+    cmd_fork.seq_fork.dst_seq_id = 9601;
+    cmd_fork.seq_fork.prefix_len = 24;  // straddles page 1 — still shared
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.seq_op.page_count, 2u * kKvLayers);
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before);
+
+    // Parent free: only the untaken tail page returns.
+    auto cmd_free_src = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/282);
+    cmd_free_src.seq_free.seq_id = 9600;
+    dispatcher_->dispatch(cmd_free_src);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_before + 1 * static_cast<int>(kKvLayers));
+
+    auto cmd_free_dst = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/283);
+    cmd_free_dst.seq_free.seq_id = 9601;
+    dispatcher_->dispatch(cmd_free_dst);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_before + 3 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncated_ClampsToParentAllocation) {
+    // prefix_len beyond the parent's allocated pages (windowed admission
+    // under-allocates vs token length): the child takes everything the
+    // parent holds and grows the rest lazily — never an error, and no CoW
+    // of the last group (the boundary is past it, so no shared page is
+    // ever written by the child).
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/290);
+    cmd_create.seq_create.seq_id     = 9700;
+    cmd_create.seq_create.prompt_len = 32;  // 2 logical pages
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    const int free_before = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/291);
+    cmd_fork.seq_fork.src_seq_id = 9700;
+    cmd_fork.seq_fork.dst_seq_id = 9701;
+    cmd_fork.seq_fork.prefix_len = 100;  // ceil(100/16) = 7 > 2 allocated
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.seq_op.page_count, 2u * kKvLayers);
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before);
+
+    for (uint64_t sid : {9700ull, 9701ull}) {
+        auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/292);
+        f.seq_free.seq_id = sid;
+        dispatcher_->dispatch(f);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    }
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain),
+              free_before + 2 * static_cast<int>(kKvLayers));
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncated_RejectedOnV4Arch) {
+    // R4a per-architecture gate: a truncating fork on a V4 side-tier
+    // architecture is REJECTED (kSeqFork error), never approximated — the
+    // SWA/compressor rings mutate in place, so the ring state a truncated
+    // child needs was overwritten by the parent's later appends.  A FULL
+    // fork (prefix_len == 0) on the same arch stays allowed.
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/300);
+    cmd_create.seq_create.seq_id     = 9800;
+    cmd_create.seq_create.prompt_len = 32;
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    ASSERT_EQ(cmp.status, 0u);
+
+    // Flip the live config's architecture (the gate reads it at fork
+    // time); the parent was created on the default arch so its page
+    // layout is unaffected.
+    cfg_->model.architecture = lc::Architecture::deepseek_v4;
+
+    auto cmd_fork = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/301);
+    cmd_fork.seq_fork.src_seq_id = 9800;
+    cmd_fork.seq_fork.dst_seq_id = 9801;
+    cmd_fork.seq_fork.prefix_len = 16;
+    dispatcher_->dispatch(cmd_fork);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kSeqFork));
+
+    // Full fork still succeeds on V4.
+    auto cmd_full = make_cmd(lipc::CMD_SEQ_FORK, /*seq=*/302);
+    cmd_full.seq_fork.src_seq_id = 9800;
+    cmd_full.seq_fork.dst_seq_id = 9801;
+    cmd_full.seq_fork.prefix_len = 0;
+    dispatcher_->dispatch(cmd_full);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_SEQ_OP_DONE));
+    EXPECT_EQ(cmp.status, 0u);
+
+    cfg_->model.architecture = lc::Architecture::deepseek_v3;
+    for (uint64_t sid : {9800ull, 9801ull}) {
+        auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/303);
+        f.seq_free.seq_id = sid;
+        dispatcher_->dispatch(f);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    }
+}
+
+TEST_F(CommandDispatcherTest, SeqForkTruncatableFollowsArchProperty) {
+    // R4b capability gate: seq_fork_truncatable() is derived from the
+    // ACTIVE AttentionArch's lossy_position_indexed_state() property (V4
+    // in-place rings => not truncatable), selected by the live config —
+    // the same source handle_seq_fork's rejection gate and the
+    // EngineInfo::seq_fork_truncatable export read.
+    make_dispatcher();
+    EXPECT_TRUE(dispatcher_->seq_fork_truncatable())
+        << "MLA/DSA archs have no lossy position-indexed state";
+    cfg_->model.architecture = lc::Architecture::deepseek_v4;
+    EXPECT_FALSE(dispatcher_->seq_fork_truncatable())
+        << "V4 side-tier rings are lossy position-indexed state";
+    // GF3.2: glm5_next's KDA recurrent state is lossy in a purer form than
+    // V4's rings (no position axis at all — state@N unrecoverable), so the
+    // property gate excludes it with zero new gating code.
+    cfg_->model.architecture = lc::Architecture::glm5_next;
+    EXPECT_FALSE(dispatcher_->seq_fork_truncatable())
+        << "KDA recurrent state is lossy (mutate-in-place, no position "
+           "addressing) — truncating forks must be rejected whole-sequence";
+    cfg_->model.architecture = lc::Architecture::deepseek_v3;
+    EXPECT_TRUE(dispatcher_->seq_fork_truncatable());
+}
+
+TEST_F(CommandDispatcherTest, Glm5NextAttentionStubRefusesLoudly) {
+    // GF3.9 (supersedes the GF3.2 honest-stub contract): ArchGlm5Next is
+    // now EXECUTABLE — the loud-refusal surface moved from a blanket stub
+    // to the hybrid dispatch gates. A KDA-layer step whose sequence
+    // carries no KDA state slot (this fixture never claimed one — the
+    // seq_id is unknown) must REFUSE with kComputeValidation and a message
+    // naming the architecture, never silently no-op or fall through to the
+    // MLA arch.
+    make_dcp_dispatcher();
+    cfg_->model.architecture = lc::Architecture::glm5_next;
+    // A minimal hybrid axis: layer 0 is a KDA linear layer.
+    cfg_->model.layer_types.assign(
+        static_cast<size_t>(cfg_->model.num_hidden_layers),
+        lc::LayerAttentionType::deepseek_sparse_attention);
+    cfg_->model.layer_types[0] = lc::LayerAttentionType::linear_attention;
+    lc::LinearAttnConfig la;
+    cfg_->model.linear_attn_config = la;
+
+    auto cmd = make_cmd(lipc::D_B_CMD_RUN_ATTENTION, /*seq=*/9250);
+    cmd.run_attention.layer_idx  = 0;
+    cmd.run_attention.num_seqs   = 1;
+    cmd.run_attention.is_prefill = 0;
+    cmd.run_attention.use_graph  = 0;
+    cmd.run_attention.is_draft   = 0;
+    cmd.run_attention.chunk_start = 0;
+    cmd.run_attention.chunk_len   = 0;
+    dispatcher_->dispatch(cmd);
+
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.cmd_seq, 9250u);
+    EXPECT_EQ(cmp.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+    EXPECT_NE(std::string(cmp.error.message).find("glm5_next"),
+              std::string::npos)
+        << "refusal must name the architecture: " << cmp.error.message;
+
+    // Arch selection is per call: flipping back to an MLA arch restores the
+    // normal path on the SAME dispatcher (byte-identical MLA behavior).
+    cfg_->model.architecture = lc::Architecture::deepseek_v3;
+    cfg_->model.layer_types.clear();
+    cfg_->model.linear_attn_config.reset();
+    auto ok = make_cmd(lipc::D_B_CMD_RUN_ATTENTION, /*seq=*/9251);
+    ok.run_attention.layer_idx  = 2;
+    ok.run_attention.num_seqs   = 4;
+    ok.run_attention.is_prefill = 0;
+    ok.run_attention.use_graph  = 0;
+    ok.run_attention.is_draft   = 0;
+    ok.run_attention.chunk_start = 0;
+    ok.run_attention.chunk_len   = 0;
+    dispatcher_->dispatch(ok);
+    dispatcher_->poll_compute_completions();
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_COMPUTE_DONE));
+    EXPECT_EQ(cmp.cmd_seq, 9251u);
+}
+
+// GF3.10: the blanket dcp_size >= 2 refusal is GONE from
+// ArchGlm5Next::validate_shape — what stays fail-closed is sequence-
+// SHARDED KV (a whole-sequence KDA recurrent state owns no token shard).
+// Two arms over a genuine TWO-RANK DcpExecutor prove exactly that split:
+// sharded still refuses at Phase A naming "sharded"; replicated walks
+// PAST validate_shape and lands on the next honest gate (stage_step's
+// unknown-seq_id frontier check), with no trace of the old TP refusal.
+TEST_F(CommandDispatcherTest, Glm5NextTp2RefusesShardedKvOnly) {
+    lc::GpuRef gpu0{0, 0, lc::GpuType::rtx5090};
+    lc::GpuRef gpu1{1, 1, lc::GpuType::rtx5090};
+    const size_t hidden_bytes = 8 * 256 * 2;  // max_batch * hidden * BF16
+
+    // One arm = one FRESH dispatcher over its own dcp_size=2 executor.
+    // Everything the dispatcher borrows is destroyed after dispatcher_.
+    auto run_arm = [&](lc::DcpKvMode mode, uint32_t cmd_seq,
+                       lipc::Completion& cmp) {
+        // Live config FIRST — the arch reads it at dispatch, and
+        // ensure_layer_axis latches the hybrid axis on first use.
+        cfg_->model.architecture = lc::Architecture::glm5_next;
+        cfg_->model.layer_types.assign(
+            static_cast<size_t>(cfg_->model.num_hidden_layers),
+            lc::LayerAttentionType::deepseek_sparse_attention);
+        cfg_->model.layer_types[0] = lc::LayerAttentionType::linear_attention;
+        cfg_->model.linear_attn_config = lc::LinearAttnConfig{};
+        cfg_->hardware.dcp_kv_mode = mode;
+
+        auto attn0 = lcomp::make_null_attention_device(gpu0);
+        auto attn1 = lcomp::make_null_attention_device(gpu1);
+
+        lpar::DcpExecutor::Options dcp_opts{
+            .dcp_size             = 2,
+            .gpus                 = {gpu0, gpu1},
+            .max_batch_size       = 8,
+            .hidden_size          = 256,
+            .num_attention_heads  = 4,
+            .q_lora_rank          = 64,
+            .kv_lora_rank         = 32,
+            .qk_rope_head_dim     = 16,
+            .qk_nope_head_dim     = 32,
+            .v_head_dim           = 64,
+            .rms_norm_eps         = 1e-6f,
+            .stream_manager       = stream_manager_.get(),
+            .attention_devices    = {attn0.get(), attn1.get()},
+        };
+        auto dcp = std::make_unique<lpar::DcpExecutor>(std::move(dcp_opts));
+
+        void* attn_buf0 = aligned_alloc_zeroed(hidden_bytes);
+        void* attn_buf1 = aligned_alloc_zeroed(hidden_bytes);
+        void* moe_buf0  = aligned_alloc_zeroed(hidden_bytes);
+        void* moe_buf1  = aligned_alloc_zeroed(hidden_bytes);
+
+        ldam::CommandDispatcher::Deps deps{
+            .cmp_ring           = cmp_ring_.get(),
+            .transfer_engine    = transfer_engine_.get(),
+            .expert_cache       = cache_.get(),
+            .stream_manager     = stream_manager_.get(),
+            .graph_registry     = graph_registry_.get(),
+            .coactivation_graph = coactivation_graph_.get(),
+            .dcp_executor       = dcp.get(),
+            .sideband_base      = sideband_base_,
+            .live_config        = cfg_.get(),
+            .attention_devices  = {attn0.get(), attn1.get()},
+            .device_backends    = {test_device_backends_[0].get(),
+                                   test_device_backends_[1].get()},
+            .cuda_kernels_enabled = false,
+            .hidden_state_pairs = {
+                ldam::HiddenStatePair{attn_buf0, moe_buf0, 0, 0, 0},
+                ldam::HiddenStatePair{attn_buf1, moe_buf1, 1, 1, 1},
+            },
+            // small_config: num_hidden_layers == 6, two ranks.
+            .per_layer_attn_weights = make_fake_attn_weights(6, 2),
+            .max_batch_size     = 8,
+        };
+        dispatcher_ = std::make_unique<ldam::CommandDispatcher>(std::move(deps));
+
+        // Layer 0 is the KDA linear layer; decode shape, no graph.
+        auto cmd = make_cmd(lipc::D_B_CMD_RUN_ATTENTION, cmd_seq);
+        cmd.run_attention.layer_idx   = 0;
+        cmd.run_attention.num_seqs    = 1;
+        cmd.run_attention.is_prefill  = 0;
+        cmd.run_attention.use_graph   = 0;
+        cmd.run_attention.is_draft    = 0;
+        cmd.run_attention.chunk_start = 0;
+        cmd.run_attention.chunk_len   = 0;
+        dispatcher_->dispatch(cmd);
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+
+        dispatcher_.reset();
+        dcp.reset();
+        std::free(attn_buf0);
+        std::free(attn_buf1);
+        std::free(moe_buf0);
+        std::free(moe_buf1);
+    };
+
+    // ── Arm 1: sharded KV at TP=2 — still refused at Phase A. ──
+    lipc::Completion sharded{};
+    run_arm(lc::DcpKvMode::sharded, /*cmd_seq=*/9260, sharded);
+    EXPECT_EQ(sharded.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(sharded.cmd_seq, 9260u);
+    EXPECT_EQ(sharded.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+    const std::string sharded_msg(sharded.error.message);
+    EXPECT_NE(sharded_msg.find("sharded"), std::string::npos)
+        << "the surviving refusal must name sequence-sharded KV: "
+        << sharded_msg;
+    EXPECT_NE(sharded_msg.find("glm5_next"), std::string::npos)
+        << "refusal must name the architecture: " << sharded_msg;
+
+    // ── Arm 2: replicated KV at TP=2 — proceeds PAST validate_shape. ──
+    // The next honest gate is stage_step's frontier machinery, which has
+    // no state slot for this never-created sequence.
+    lipc::Completion repl{};
+    run_arm(lc::DcpKvMode::replicated, /*cmd_seq=*/9261, repl);
+    EXPECT_EQ(repl.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(repl.cmd_seq, 9261u);
+    const std::string repl_msg(repl.error.message);
+    // The FULL arch-prefixed message: build_kv_metadata has its own
+    // "...unknown seq_id" failure string, but with no page_allocator in
+    // these deps it returns kUnavailable and falls through — only the
+    // ArchGlm5Next::stage_step decode-branch refusal matches this prefix.
+    EXPECT_NE(repl_msg.find("glm5_next: KDA step on unknown seq_id"),
+              std::string::npos)
+        << "replicated TP=2 must reach stage_step, not die at Phase A: "
+        << repl_msg;
+    EXPECT_EQ(repl_msg.find("sharded"), std::string::npos)
+        << "replicated KV must not trip the sharded refusal: " << repl_msg;
+    EXPECT_EQ(repl_msg.find("GF3.10"), std::string::npos)
+        << "the blanket TP refusal must be gone: " << repl_msg;
+    EXPECT_EQ(repl_msg.find("tensor_parallelism 1"), std::string::npos)
+        << "the blanket TP refusal must be gone: " << repl_msg;
+}
+
+// ── P-29 step 13 phase B: KDA anchor commands, negative controls ─────────────────
+// INV-KDA-REWIND: the ONLY legal KDA rewind is restore-from-anchor + forward
+// replay. Both anchor commands must refuse loudly (kComputeValidation, a
+// message naming the command) when the sequence carries no KDA state — never
+// silently no-op, which would leave the recurrent state at the WRONG position
+// with the orchestrator believing the rewind happened.
+
+TEST_F(CommandDispatcherTest, KdaRestore_UnknownSeqErrors) {
+    make_dispatcher();
+
+    // (a) Never-created sequence.
+    auto cmd = make_cmd(lipc::D_CMD_KDA_RESTORE, /*seq=*/9600);
+    cmd.kda_anchor.seq_id = 987654ull;
+    cmd.kda_anchor.pos    = 128;
+    dispatcher_->dispatch(cmd);
+
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.cmd_seq, 9600u);
+    EXPECT_EQ(cmp.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+    const std::string msg(cmp.error.message);
+    EXPECT_NE(msg.find("kda_restore"), std::string::npos)
+        << "refusal must name the command: " << msg;
+
+    // (b) KNOWN sequence that carries no KDA state (this fixture's config is
+    // an MLA arch — no linear layers, so no state slot was ever claimed):
+    // the same fail-closed path, not a silent success.
+    auto create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/9601);
+    create.seq_create.seq_id     = 9610;
+    create.seq_create.prompt_len = 16;
+    dispatcher_->dispatch(create);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+
+    auto known = make_cmd(lipc::D_CMD_KDA_RESTORE, /*seq=*/9602);
+    known.kda_anchor.seq_id = 9610;
+    known.kda_anchor.pos    = 0;
+    dispatcher_->dispatch(known);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.cmd_seq, 9602u);
+    EXPECT_EQ(cmp.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+    EXPECT_NE(std::string(cmp.error.message).find("kda_restore"),
+              std::string::npos)
+        << cmp.error.message;
+
+    auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/9603);
+    f.seq_free.seq_id = 9610;
+    dispatcher_->dispatch(f);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+}
+
+TEST_F(CommandDispatcherTest, KdaSnapshot_UnknownSeqErrors) {
+    make_dispatcher();
+
+    auto cmd = make_cmd(lipc::D_CMD_KDA_SNAPSHOT, /*seq=*/9620);
+    cmd.kda_anchor.seq_id = 987655ull;
+    cmd.kda_anchor.pos    = 64;
+    dispatcher_->dispatch(cmd);
+
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.cmd_seq, 9620u);
+    EXPECT_EQ(cmp.error.error_category,
+              static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+    const std::string msg(cmp.error.message);
+    EXPECT_NE(msg.find("kda_snapshot"), std::string::npos)
+        << "refusal must name the command: " << msg;
+
+    // A KNOWN sequence with no KDA state must NOT produce a bogus anchor
+    // either — an empty snapshot would make a later restore silently
+    // "succeed" against nothing.
+    auto create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/9621);
+    create.seq_create.seq_id     = 9630;
+    create.seq_create.prompt_len = 16;
+    dispatcher_->dispatch(create);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+
+    auto known = make_cmd(lipc::D_CMD_KDA_SNAPSHOT, /*seq=*/9622);
+    known.kda_anchor.seq_id = 9630;
+    known.kda_anchor.pos    = 16;
+    dispatcher_->dispatch(known);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    EXPECT_EQ(cmp.cmd_seq, 9622u);
+    EXPECT_NE(std::string(cmp.error.message).find("kda_snapshot"),
+              std::string::npos)
+        << cmp.error.message;
+
+    auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/9623);
+    f.seq_free.seq_id = 9630;
+    dispatcher_->dispatch(f);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+}
+
+TEST_F(CommandDispatcherTest, SeqHibernate_NoTieringIsNoopSuccess) {
+    // CMD_SEQ_HIBERNATE without a KV-tiering manager (V4 / untired arms)
+    // must succeed as a no-op — the orchestrator does not know the arch.
+    make_dispatcher();
+
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/250);
+    cmd_create.seq_create.seq_id     = 9300;
+    cmd_create.seq_create.prompt_len = 16;
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    const int free_before = page_allocator_->free_pages(0, lmem::Pool::kMain);
+
+    auto cmd_h = make_cmd(lipc::CMD_SEQ_HIBERNATE, /*seq=*/251);
+    cmd_h.seq_hibernate.seq_id = 9300;
+    cmd_h.seq_hibernate.kv_len = 16;
+    dispatcher_->dispatch(cmd_h);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_SEQ_OP_DONE));
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.seq_op.page_count, 0u);
+    EXPECT_EQ(page_allocator_->free_pages(0, lmem::Pool::kMain), free_before);
+
+    auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/252);
+    f.seq_free.seq_id = 9300;
+    dispatcher_->dispatch(f);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+}
+
+TEST_F(CommandDispatcherTest, SeqHibernate_UnknownSeqErrors) {
+    make_dispatcher();
+    auto cmd_h = make_cmd(lipc::CMD_SEQ_HIBERNATE, /*seq=*/260);
+    cmd_h.seq_hibernate.seq_id = 9999;
+    cmd_h.seq_hibernate.kv_len = 16;
+    dispatcher_->dispatch(cmd_h);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+}
+
+TEST_F(CommandDispatcherTest, SeqHibernate_ZeroKvLenErrors) {
+    // kv_len carries the holder's KV coverage — required so hibernation
+    // never demotes the write-frontier page of an over-allocated holder
+    // (the B3 gate incident: a hit-child's first chunk write fail-closed
+    // on a demoted page).
+    make_dispatcher();
+    auto cmd_create = make_cmd(lipc::CMD_SEQ_CREATE, /*seq=*/261);
+    cmd_create.seq_create.seq_id     = 9400;
+    cmd_create.seq_create.prompt_len = 16;
+    dispatcher_->dispatch(cmd_create);
+    lipc::Completion cmp{};
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    auto cmd_h = make_cmd(lipc::CMD_SEQ_HIBERNATE, /*seq=*/262);
+    cmd_h.seq_hibernate.seq_id = 9400;
+    cmd_h.seq_hibernate.kv_len = 0;
+    dispatcher_->dispatch(cmd_h);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR));
+    auto f = make_cmd(lipc::CMD_SEQ_FREE, /*seq=*/263);
+    f.seq_free.seq_id = 9400;
+    dispatcher_->dispatch(f);
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+}
+
 TEST_F(CommandDispatcherTest, SeqFork_UnknownSource) {
     make_dispatcher();
 
@@ -1387,6 +2144,8 @@ TEST_F(CommandDispatcherTest, NvmeEvictHost_Success) {
     std::vector<std::byte> data(4096, std::byte{0xAB});
     auto tok = nvme->write_expert({1, 0}, data.data());
     ASSERT_TRUE(tok.has_value());
+    // NvmeTier writes are async (io_uring): quiesce before asserting tier state.
+    nvme->drain();
     EXPECT_TRUE(nvme->is_in_host_ram({1, 0}));
 
     ldam::CommandDispatcher::Deps deps{
@@ -1565,6 +2324,9 @@ TEST_F(CommandDispatcherTest, CancelTransfer_PcieH2D) {
                                      std::byte{0xAA});
     auto tok = nvme->write_expert({1, 0}, host_data.data());
     ASSERT_TRUE(tok.has_value());
+    // NvmeTier writes are async (io_uring): the slot only becomes a host
+    // source once the write completes — quiesce before dispatching H2D.
+    nvme->drain();
 
     // Re-create dispatcher with NvmeTier.
     ldam::CommandDispatcher::Deps deps{
@@ -3543,6 +4305,8 @@ TEST_F(CommandDispatcherTest, SlowEvictToHost_D2H_ThenEvict) {
     // Expert evicted from VRAM.
     EXPECT_EQ(cache_->lookup({1, 0}, 0), nullptr);
     // Expert now in host RAM warm cache.
+    // NvmeTier writes are async (io_uring): quiesce before asserting tier state.
+    nvme->drain();
     EXPECT_TRUE(nvme->is_in_host_ram({1, 0}));
 
     std::error_code ec;
@@ -4259,6 +5023,62 @@ TEST_F(CommandDispatcherTest, AsyncCompute_PendingCount) {
     event_ready = true;
     EXPECT_EQ(dispatcher_->poll_compute_completions(), 2u);
     EXPECT_EQ(dispatcher_->pending_compute_count(), 0u);
+    // Reset dispatcher before locals (deferred_sm) go out of scope.
+    dispatcher_.reset();
+}
+
+// 44z: the quiesce predicate the expert-zone rebalancer gates its reclaim
+// barriers on. It must mean "no MoE kernel is in flight", NOT "the pipeline
+// is idle" — the stronger reading deadlocked live: a prefill stalled on a KV
+// page claim holds its progressive state ACTIVE while waiting, so quiesce
+// never became true, so the drain never released the slabs the prefill was
+// waiting for (engine wedged, GPU 0%). See moe_dispatch_quiesced().
+TEST_F(CommandDispatcherTest, MoePipelineQuiesce_TracksInFlightKernelsOnly) {
+    bool event_ready = false;
+    lc::GpuRef gpu0{0, 0, lc::GpuType::rtx5090};
+    auto [deferred_backends, deferred_sm] = make_deferred_stream_manager(
+        {gpu0}, event_ready);
+
+    auto registry = std::make_unique<ldam::BufferRegistry>();
+    int fake_mem[4] = {};
+    uint32_t buf1 = registry->register_buffer(&fake_mem[0], 4096, 0, "input");
+    uint32_t buf2 = registry->register_buffer(&fake_mem[1], 4096, 0, "output");
+    uint32_t buf3 = registry->register_buffer(&fake_mem[2], 4096, 0, "weight");
+
+    ldam::CommandDispatcher::Deps deps{
+        .cmp_ring        = cmp_ring_.get(),
+        .stream_manager  = deferred_sm.get(),
+        .buffer_registry = registry.get(),
+        .attention_devices = {test_attn_devices_[0].get()},
+        .expert_devices    = {test_expert_devices_[0].get()},
+        .cuda_kernels_enabled = false,
+    };
+    dispatcher_ = std::make_unique<ldam::CommandDispatcher>(std::move(deps));
+
+    // Nothing dispatched: quiesced.
+    ASSERT_EQ(dispatcher_->pending_compute_count(), 0u);
+    EXPECT_TRUE(dispatcher_->moe_dispatch_quiesced());
+
+    // A kernel in flight is the ONE thing that blocks the reclaim barriers.
+    auto cmd = make_cmd(lipc::CMD_RMSNORM, /*seq=*/920, /*gpu_idx=*/0);
+    cmd.rmsnorm.num_tokens    = 4;
+    cmd.rmsnorm.input_buf_id  = buf1;
+    cmd.rmsnorm.output_buf_id = buf2;
+    cmd.rmsnorm.weight_buf_id = buf3;
+    cmd.rmsnorm.eps           = 1e-5f;
+    dispatcher_->dispatch(cmd);
+
+    ASSERT_EQ(dispatcher_->pending_compute_count(), 1u);
+    EXPECT_FALSE(dispatcher_->moe_dispatch_quiesced())
+        << "an enqueued kernel may still be reading expert slots";
+
+    // Once it retires, quiesce returns immediately — it does NOT additionally
+    // wait for any progressive-MoE state to reach kIdle.
+    event_ready = true;
+    EXPECT_EQ(dispatcher_->poll_compute_completions(), 1u);
+    ASSERT_EQ(dispatcher_->pending_compute_count(), 0u);
+    EXPECT_TRUE(dispatcher_->moe_dispatch_quiesced());
+
     // Reset dispatcher before locals (deferred_sm) go out of scope.
     dispatcher_.reset();
 }
@@ -6315,19 +7135,22 @@ TEST_F(CommandDispatcherTest, MoeTP2_DisjointBitsets_RoutedAllreduce) {
     ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
     EXPECT_EQ(cmp.status, 0u);
 
-    // Count allreduce groups: exactly 2 (shared expert + routed output).
+    // Count allreduce groups: INV-NCCL-FUSE fuses the shared-expert reduce
+    // and the routed EP-combine reduce into ONE nccl group per dispatch
+    // (allreduce_hidden_fused) — bit-identical to the former two groups,
+    // aggregation changes launch count only.
     int group_count = 0;
     int allreduce_count = 0;
     for (const auto& entry : nccl_log) {
         if (entry == "group_begin") ++group_count;
         if (entry == "allreduce") ++allreduce_count;
     }
-    EXPECT_EQ(group_count, 2)
-        << "Disjoint bitsets should produce 2 allreduce groups "
-           "(shared expert + routed output)";
+    EXPECT_EQ(group_count, 1)
+        << "Disjoint bitsets should produce ONE fused allreduce group "
+           "(shared expert + routed output, INV-NCCL-FUSE)";
     EXPECT_EQ(allreduce_count, 4)
-        << "TP=2 with 2 groups should produce 4 allreduce calls total "
-           "(2 per group)";
+        << "TP=2 fused combine should produce 4 allreduce calls total "
+           "(2 tensors per rank)";
 
     dispatcher_.reset();
     dcp.reset();
@@ -6389,6 +7212,7 @@ TEST_F(CommandDispatcherTest, FetchAndRunMoe_AllCached) {
     EXPECT_EQ(cmp.cmd_seq, 10u);
     EXPECT_EQ(cmp.status, 0u);
     EXPECT_EQ(cmp.compute.routed_miss_count, 0);
+    EXPECT_EQ(cmp.compute.moe_degraded, 0);  // TD-MOE-PROGRESSIVE-DEGRADED-SILENT
 
     // All experts should be unlocked after finalization.
     for (uint16_t e = 0; e < 3; ++e) {
@@ -6487,8 +7311,72 @@ TEST_F(CommandDispatcherTest, FetchAndRunMoe_Timeout) {
     EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_COMPUTE_DONE));
     EXPECT_EQ(cmp.cmd_seq, 30u);
     EXPECT_EQ(cmp.compute.routed_miss_count, 1);  // expert 1 never arrived
+    // TD-MOE-PROGRESSIVE-DEGRADED-SILENT: this is the QUIESCENCE finalize
+    // (expert 1 was never sourceable, its fetch dropped, nothing in flight)
+    // — the computed routed subset is correct, so it is NOT degraded.
+    EXPECT_EQ(cmp.compute.moe_degraded, 0);
 
     // Expert 0 unlocked.
+    EXPECT_FALSE(cache_->is_locked({1, 0}, 0));
+}
+
+// TD-MOE-PROGRESSIVE-DEGRADED-SILENT: a fetch-deadline timeout while a
+// requested expert's H2D is GENUINELY in flight finalizes with an incomplete
+// expert set — that finalize must be marked moe_degraded=1 on the completion
+// so the orchestrator can count it per request (retry / identity-gate
+// discard) instead of trusting the daemon log. (The no-capacity wave-stall
+// arm needs a real CUDA expert cache — budgeted issue — and is exercised by
+// the GPU serve validation, not the null backend.)
+TEST_F(CommandDispatcherTest, FetchAndRunMoe_DegradedTimeoutObservable) {
+    // Expert 1 sourced from a mock LoadedModel so the ELM starts a REAL
+    // in-flight H2D (same shape as FetchAndRunMoe_ProgressiveArrival) —
+    // but the arrival is never polled, so only the deadline can finalize.
+    lmod::LoadedModel model;
+    model.layers.resize(6);
+    model.layers[1].layer_idx = 1;
+    model.layers[1].routed_experts.resize(8);
+    std::vector<std::byte> fake_data(expert_bytes_, std::byte{0x42});
+    lmod::RawTensor rt{
+        .data = std::span<const std::byte>(fake_data),
+        .dtype = lmod::SafetensorsDtype::F8_E4M3,
+        .shape = {expert_bytes_}};
+    lmod::WeightBundle wb{.id = {}, .weight = rt, .packed_slot = rt.data};
+    model.layers[1].routed_experts[1].push_back(std::move(wb));
+
+    make_dispatcher(&model);
+
+    // Expert 0 cached + ready (the finalize computes it — degraded, not empty).
+    cache_->reserve({1, 0}, 0, lmem::CacheZone::kStreaming);
+    cache_->mark_all_ready({1, 0}, 0);
+
+    write_expert_sideband(sideband_base_,
+        {pfe(1, 0, 0), pfe(1, 1, 0)});
+
+    auto cmd = make_cmd(lipc::E_CMD_FETCH_AND_RUN_MOE, /*seq=*/35, /*gpu=*/0);
+    cmd.fetch_and_run_moe.layer_idx     = 1;
+    cmd.fetch_and_run_moe.num_seqs      = 1;
+    cmd.fetch_and_run_moe.expert_count  = 2;
+    cmd.fetch_and_run_moe.timeout_us    = 1;   // expires immediately
+    cmd.fetch_and_run_moe.moe_mode      = 0;
+    dispatcher_->dispatch(cmd);
+
+    // The H2D is in flight (never polled) — advance until the deadline
+    // finalize fires.
+    lipc::Completion cmp{};
+    bool finalized = false;
+    for (int i = 0; i < 1000 && !finalized; ++i)
+        finalized = dispatcher_->advance_progressive_moe();
+    ASSERT_TRUE(finalized) << "deadline finalize never fired";
+
+    ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+    EXPECT_EQ(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_COMPUTE_DONE));
+    EXPECT_EQ(cmp.cmd_seq, 35u);
+    EXPECT_EQ(cmp.status, 0u);
+    EXPECT_EQ(cmp.compute.routed_miss_count, 1);  // expert 1 still in flight
+    EXPECT_EQ(cmp.compute.moe_degraded, 1)
+        << "timeout finalize with an in-flight fetch must be observable "
+           "as degraded (TD-MOE-PROGRESSIVE-DEGRADED-SILENT)";
+
     EXPECT_FALSE(cache_->is_locked({1, 0}, 0));
 }
 
@@ -6868,4 +7756,81 @@ TEST_F(CommandDispatcherTest, DsparkStep_FailsClosedWithoutRuntime) {
     EXPECT_EQ(cmp.cmd_seq, 77u);
     EXPECT_EQ(cmp.error.error_category,
               static_cast<uint32_t>(lipc::CmpErrorCategory::kComputeValidation));
+}
+
+// ── TD-KVXP-CAPACITY-REPUBLISH: REEF caps must track elastic capacity ───────
+// The re-freeze regression test: the REEF service's per-GPU caps are derived
+// from ExpertCache::total_slots(kStable), which 44z elastic zones change at
+// RUNTIME. ensure_reef_service must republish them whenever the cache's
+// elastic topology generation moves — this test FAILS if that refresh is
+// removed (the caps would stay boot-frozen across the grant and the drain).
+
+TEST_F(CommandDispatcherTest, ReefCapsRepublishOnElasticTopologyChange) {
+    // Point the REEF service at the 2-device calibration asset (absolute
+    // path is used verbatim by the engine's resolution rule).
+    cfg_->gpu_loader.calibration_path =
+        std::string(LAYERSTORM_SOURCE_DIR)
+        + "/tests/assets/gpu_loader_calibration_5090x2.json";
+    make_dispatcher();
+
+    // One REEF route command = the lazy service init + a caps read.
+    auto* entries = reinterpret_cast<lipc::ExpertPrefetchEntry*>(
+        sideband_base_ + lipc::IpcLayout::kExpertPrefetchOff);
+    auto reef_route = [&](uint32_t seq) {
+        entries[0] = {1, 0, 0, 0};
+        entries[1] = {1, 1, 0, 0};
+        auto cmd = make_cmd(lipc::E_CMD_REEF_ROUTE, seq, /*gpu_idx=*/0);
+        cmd.reef_route.layer_idx = 1;  // first MoE layer
+        cmd.reef_route.expert_count = 2;
+        dispatcher_->dispatch(cmd);
+        lipc::Completion cmp{};
+        ASSERT_TRUE(read_cmp(*cmp_ring_, cmp));
+        ASSERT_NE(cmp.cmp_type, static_cast<uint32_t>(lipc::CMP_ERROR))
+            << "REEF service failed to build — calibration asset missing?";
+        ASSERT_EQ(cmp.status, 0u);
+    };
+    reef_route(1);
+
+    const auto* svc = dispatcher_->reef_service_for_test();
+    ASSERT_NE(svc, nullptr);
+    const std::vector<int> boot_caps = svc->cap;
+    ASSERT_EQ(boot_caps.size(), 2u);
+    ASSERT_EQ(boot_caps[0],
+              cache_->total_slots(0, lmem::CacheZone::kStable))
+        << "boot caps come from the cache's stable totals";
+
+    // A 44z elastic GRANT on GPU 0: 3 extra stable slots. The zone is
+    // metadata-only (the cache never dereferences), so a fake aligned base
+    // suffices — same convention as expert_cache_elastic_test.
+    const int64_t stride = lmem::align_up_i64(
+        expert_bytes_, lmem::kExpertZoneSlotAlign);
+    void* base = reinterpret_cast<void*>(uintptr_t{1} << 30);
+    const int zid = cache_->add_elastic_zone(
+        0, base, /*bytes=*/3 * stride + lmem::kExpertZoneSlotAlign,
+        stride, /*num_slots=*/3, /*cookie=*/0);
+    ASSERT_GE(zid, 0);
+
+    // The NEXT REEF command must see the granted capacity.
+    reef_route(2);
+    EXPECT_EQ(svc->cap[0], boot_caps[0] + 3)
+        << "granted stable slots must reach the REEF placement model "
+           "(caps re-frozen at boot?)";
+    EXPECT_EQ(svc->cap[1], boot_caps[1]) << "other GPU untouched";
+
+    // A 44z DRAIN (reclaim ratchet step 1) removes the zone from
+    // total_slots immediately — the next command must shrink the model
+    // BEFORE the slabs ever return to KV (which happens at step 5).
+    ASSERT_TRUE(cache_->begin_drain_elastic_zone(0, zid));
+    reef_route(3);
+    EXPECT_EQ(svc->cap[0], boot_caps[0])
+        << "draining capacity must leave the REEF model at once";
+
+    // No generation change → no refresh (the caps stay put across ordinary
+    // commands; one u64 compare is the whole steady-state cost).
+    const std::vector<int> caps_after = svc->cap;
+    reef_route(4);
+    EXPECT_EQ(svc->cap, caps_after);
+
+    // Cleanup: the empty zone removes cleanly.
+    EXPECT_TRUE(cache_->remove_elastic_zone(0, zid));
 }

@@ -9,6 +9,16 @@
       "maximum": 1048576,
       "default": 0,
       "description": "PER-ENTRY registration cap: a prompt prefix longer than this is not registered as a holder (the request itself is unaffected). 0 (default) = no separate cap — an entry is bounded only by the TOTAL budget (serving.prefix_cache.max_cached_tokens; an entry longer than the total budget can never fit and is always refused). Set it below the total budget to stop one huge prompt from evicting the whole working set; set it to serving.max_sequence_length in serving profiles so every admissible prompt is cacheable. Independent of the total budget by design — the pre-2026-08-26 single 8192 number silently killed long-prompt caching (skips are now logged per request)."
+    },
+    "subgrid_mid_edge": {
+      "type": "boolean",
+      "default": false,
+      "description": "SUB-GRID mid-edge prefix reuse (USER DECISION 2026-08-28; TD-PREFIX-MIDEDGE-SUBGRID-CLASS resolved 2026-08-29: the repeat gate proved page-aligned sub-grid also diverges — NO sub-grid subclass is identity-safe): opt-in, default OFF. OFF = grid-clamped mid-edge reuse only (the shipped R4c policy; INV-PREFIX-CACHE-1 token identity holds unconditionally). ON = a mid-edge hit reuses the EXACT longest common prefix with a registered node, off the prefill grid, via a truncating fork — gaining LCP mod grid extra reused tokens per hit (up to grid-1, averaging ~256 ≈ 6 s of TTFT at champion prefill rates) at the cost of the R4b-measured accepted-divergence class: the continuation is a DETERMINISTIC, shape-induced, different-but-valid greedy trajectory (~1e-3 logit deltas, first divergence within ~15 decode tokens; same accepted class as TD-SERVE-SC-TRAJECTORY). Identity gates, goldens and A/B harnesses MUST assert this is OFF (orchestrator.assert_identity_preconditions). Env LS_ORCH_SUBGRID_MIDEDGE overrides either way when set (first char != '0' enables); LS_ORCH_NO_MIDEDGE=1 disables all mid-edge reuse including this. Inert on architectures whose forks are not truncatable (V4 in-place rings, INV-SEQ-FORK-TRUNC): those keep the legacy grid/exact-body filter regardless."
+    },
+    "hibernate_holders": {
+      "type": "boolean",
+      "default": true,
+      "description": "R3 holder hibernation (TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE): after registering a prefix holder, demote its hot kMain pages (all but the append-frontier logical group) to the KV-tiering cold pool via CMD_SEQ_HIBERNATE. A frozen holder never steps, so window-driven demotion never reaches it; without hibernation each deep holder pins ~the retention window of VRAM (measured ~5,100 pages/rank on the GLM champion) and pool pressure evicts the cache as fast as it fills (the churn mechanism). No-op on architectures without a KV-tiering manager (V4 side tiers keep their copy-on-fork cost, INV-PREFIX-CACHE-3). Fail-safe: on any engine error the holder simply stays hot."
     }
   },
   "additionalProperties": false

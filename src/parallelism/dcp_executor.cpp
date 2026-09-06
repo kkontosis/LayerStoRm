@@ -155,6 +155,7 @@ void DcpExecutor::allocate_buffers() {
     kv_compressed_.resize(dcp_size_);
     kv_a_pad_out_.resize(dcp_size_, nullptr);
     hidden_out_.resize(dcp_size_);
+    hidden_f32_.resize(dcp_size_, nullptr);
     fp8_corrected_.resize(dcp_size_);
     fp8_corrected_scales_.resize(dcp_size_);
     normed_hidden_.resize(dcp_size_);
@@ -167,50 +168,31 @@ void DcpExecutor::allocate_buffers() {
     q_gathered_stage_.resize(dcp_size_, nullptr);
     q_gathered_.resize(dcp_size_, nullptr);
 
-    // GLM-25a: DSA indexer producer scratch (per rank). Allocated only when the
-    // model has DSA. The indexer-K cache is a persistent slot × position ARENA
-    // (single-sequence step model), sized to the serving context
-    // (rope_max_pos = serving.max_sequence_length — attention cannot run past
-    // the rope table anyway). Slots are assigned only to layers that ever
-    // COMPUTE the indexer: IndexShare full layers, plus layer 0 if shared
-    // (ascending layer order means layer 0 always computes when no full result
-    // precedes it; later shared layers reuse within the step). GLM-5.2 preset:
-    // 21 slots × 32K × 132 B ≈ 89 MB/rank.
-    //
-    // Paged migration path (do with TD-GLM-INDEXER-BATCH, not before): replace
-    // this arena with Pool::kIndexerK — the pool is pre-provisioned at init
-    // (same upfront VRAM as the arena), so paging buys nothing at B==1; its
-    // value is per-SEQUENCE pages (PageMeta.sequence_id, free_sequence) shared
-    // across a multi-sequence budget + DCP sharding via
-    // allocate_indexer_k_for_dcp. Steps: (1) budget the per-position F32 scale
-    // into indexer_k_bytes_per_page, (2) dispatcher allocates pages per
-    // seq/layer and builds indexer block-tables/slot-mappings alongside
-    // build_kv_metadata (same TD-51cb dirty guard), (3) indexer_k_quant_append
-    // takes a slot mapping and lightning_score_mqa takes a block table.
-    // An arena can also stretch to SMALL fixed B>1 (per-seq slot column,
-    // reservation = B_max × cap × n_slots × 132 B — fine for B ≤ 8 at ≤128K)
-    // before pooled pages become structurally necessary (many seqs / 1M multi-
-    // tenancy, where worst-case × B reservation stops fitting).
+    // GLM-25a: DSA indexer producer scratch (per rank). Allocated only when
+    // the model has DSA. Key STORAGE is exclusively the dispatcher-
+    // provisioned paged Pool::kIndexerK pages (TD-GLM-INDEXER-PAGED/-BATCH;
+    // S4 deleted the legacy B==1 persistent K arena — INV-DSA-RESERVE made
+    // it unreachable on any reserved sequence, and unreserved legacy
+    // producers now fail loudly to dense instead of landing in a silently
+    // 128K-capped side store).
     const int NIH = opts_.index_n_heads;
     const int IHD = opts_.index_head_dim;
     // The sparse-attention consumer reads sparse_indices with stride
     // opts_.index_topk (prefill_attention topk arg), so the top-k output must be
     // laid out and padded to that stride.
     const int ITK = opts_.index_topk;
-    // Arena ceiling (GLM-25k 1M capacity smoke): the arena is the B==1
-    // FALLBACK for the paged Pool::kIndexerK path (the production path,
-    // provisioned to the full serving window by VramAllocator). Sizing the
-    // fallback to the serving context too DOUBLES the indexer-K VRAM at
-    // long caps (21 slots × 1M × 132 B ≈ 2.84 GB/rank at 1M — allocation
-    // failure on a 32 GB card). Cap it at 128K tokens: below the cap the
-    // historical behavior is unchanged (preset 32768 ≪ cap); beyond it a
-    // pool-miss falls back to dense (produce_sparse_indices false via the
-    // seqlen > indexer_cache_tokens_ ceiling) exactly as a pool-miss past
-    // the serving window always did — and under KV tiering dense-with-cold
-    // stays fail-closed (INV-KVT-2).
-    constexpr int kIndexerArenaCapTokens = 131072;
-    indexer_cache_tokens_ = opts_.has_dsa
-        ? std::min(std::max(opts_.rope_max_pos, 4096), kIndexerArenaCapTokens)
+    // GF3.5: ROW capacity/stride — index_topk + kpool - 1 expanded token
+    // rows on IndexPool models (== ITK on legacy, so sizing is unchanged
+    // there). Selection budget stays ITK (pools: ITK/kpool).
+    const int ITKR = opts_.index_topk_rows();
+    // Score-scratch sizing: one query scores at most the FULL serving
+    // context (rope_max_pos = serving.max_sequence_length — attention
+    // cannot run past the rope table anyway). The per-position cost is tiny
+    // (8 B/position: F32 score + int32 endpoint), so this is deliberately
+    // UNCAPPED — the arena's historical 128K clamp silently under-sized
+    // this scratch for paged sequences beyond 128K.
+    indexer_score_tokens_ = opts_.has_dsa
+        ? std::max(opts_.rope_max_pos, 4096)
         : 0;
     // TD-GLM-INDEXER-LOCAL-MERGE: local (position-sharded) indexer mode is
     // meaningful only at dcp>=2 with a valid page ownership unit and a
@@ -223,31 +205,38 @@ void DcpExecutor::allocate_buffers() {
     indexer_page_rows_.assign(std::max(opts_.max_batch_size, 1), nullptr);
     const int total_layers = std::max(opts_.num_layers, 1);
 
-    // Slot map: layer → arena slot (−1 = never computes → no K storage).
-    // Uses the same full/shared rule as produce_sparse_indices.
-    indexer_layer_slot_.assign(total_layers, -1);
-    int indexer_slots = 0;
+    // Computes mask: layer → owns indexer-K storage / computes the indexer
+    // (IndexShare full ∪ layer 0 — the same rule as the dispatcher's
+    // indexer_computes_ and produce_sparse_indices' reuse gate).
+    indexer_layer_computes_.assign(static_cast<size_t>(total_layers), 0);
     if (opts_.has_dsa) {
         for (int l = 0; l < total_layers; ++l) {
+            if (!opts_.indexer_computes_layers.empty()) {
+                // GF3.5: authoritative mask from ModelConfig::computes_indexer
+                // (glm5_next: sparse layers + MTP; no "∪ layer 0" union).
+                indexer_layer_computes_[l] =
+                    (l < static_cast<int>(opts_.indexer_computes_layers.size())
+                     && opts_.indexer_computes_layers[l]) ? 1 : 0;
+                continue;
+            }
             const bool full = opts_.indexer_full_layers.empty()
                 || (l < static_cast<int>(opts_.indexer_full_layers.size())
                     && opts_.indexer_full_layers[l]);
-            if (full || l == 0) indexer_layer_slot_[l] = indexer_slots++;
+            if (full || l == 0) indexer_layer_computes_[l] = 1;
         }
     }
-    indexer_arena_slots_ = indexer_slots;
     indexer_q_.resize(dcp_size_, nullptr);
     indexer_k_.resize(dcp_size_, nullptr);
     indexer_weights_.resize(dcp_size_, nullptr);
     indexer_score_proj_.resize(dcp_size_, nullptr);
-    indexer_k_cache_.resize(dcp_size_, nullptr);
-    indexer_k_scales_.resize(dcp_size_, nullptr);
     indexer_scores_.resize(dcp_size_, nullptr);
     indexer_block_endpoints_.resize(dcp_size_, nullptr);
     indexer_topk_scores_.resize(dcp_size_, nullptr);
     indexer_scores_batched_.resize(dcp_size_, nullptr);
     indexer_row_bounds_dev_.resize(dcp_size_, nullptr);
     indexer_page_table_dev_.resize(dcp_size_, nullptr);
+    indexer_gate_.resize(dcp_size_, nullptr);
+    indexer_pool_ids_.resize(dcp_size_, nullptr);
     sparse_indices_dev_.resize(dcp_size_, nullptr);
     topk_lengths_dev_.resize(dcp_size_, nullptr);
     sparse_local_indices_dev_.resize(dcp_size_, nullptr);
@@ -484,6 +473,28 @@ void DcpExecutor::allocate_buffers() {
     // projection/norm chain over up to v4_prefill_rows_max_ rows in one
     // call — grow the shared per-rank scratch to the chunk bound (V4 only;
     // non-V4 sizing byte-identical).
+    // TD-GLM5-TP-COMBINE-PRECISION: resolve the fp32 TP combine. Arch-keyed
+    // default (opts), LS_TP_COMBINE_FP32=0/1 override (A/B measurement /
+    // ops kill switch), inert at dcp_size == 1.
+    tp_combine_fp32_active_ = opts_.tp_combine_fp32;
+    if (const char* e = std::getenv("LS_TP_COMBINE_FP32"); e && e[0])
+        tp_combine_fp32_active_ = (e[0] != '0');
+    tp_combine_fp32_active_ = tp_combine_fp32_active_ && dcp_size_ >= 2;
+    // FP32 staging row bound: hidden_out_'s bound, additionally covering the
+    // KDA prefill chunk rows (kda leg writes hidden rows [0, chunk) too).
+    hidden_f32_rows_ = opts_.v4.enabled ? v4_prefill_rows_max_ : B;
+    if (opts_.kda_enabled)
+        hidden_f32_rows_ = std::max(
+            hidden_f32_rows_,
+            std::min(std::max(B, std::max(opts_.superchunk_tokens, 1)), 512));
+    if (dcp_size_ >= 2)
+        spdlog::warn("TP combine precision: {} partial combine "
+                     "(arch default {}, LS_TP_COMBINE_FP32 {})",
+                     tp_combine_fp32_active_ ? "FP32" : "BF16",
+                     opts_.tp_combine_fp32 ? "fp32" : "bf16",
+                     std::getenv("LS_TP_COMBINE_FP32")
+                         ? std::getenv("LS_TP_COMBINE_FP32") : "unset");
+
     const size_t v4R = v4on ? static_cast<size_t>(v4_prefill_rows_max_) : 0;
     const size_t normed_alloc = std::max(hidden_out_bytes, v4R * H * 2);
     const size_t q_cmp_alloc = std::max(q_compressed_bytes, v4R * Q * 2);
@@ -528,6 +539,11 @@ void DcpExecutor::allocate_buffers() {
         hidden_out_[r]              = attn->device_alloc(
             v4on ? static_cast<size_t>(v4_prefill_rows_max_) * H * 2
                  : hidden_out_bytes);
+        // TD-GLM5-TP-COMBINE-PRECISION: FP32 partial-hidden staging, same
+        // row bound as hidden_out_ (2x the bytes: fp32 vs bf16).
+        if (tp_combine_fp32_active_)
+            hidden_f32_[r]          = attn->device_alloc(
+                static_cast<size_t>(hidden_f32_rows_) * H * 4);
         fp8_corrected_[r]           = attn->device_alloc(fp8_corrected_bytes);
         fp8_corrected_scales_[r]    = attn->device_alloc(fp8_corrected_scale_bytes);
         gemm_workspace_[r]          = (max_ws > 0)
@@ -614,18 +630,14 @@ void DcpExecutor::allocate_buffers() {
         gguf_q8_1_ws_[r]           = (gguf_q8_1_ws_bytes_ > 0)
             ? attn->device_alloc(gguf_q8_1_ws_bytes_) : nullptr;
 
-        // GLM-25a: DSA indexer producer scratch + persistent slot-mapped K arena
-        // (IndexShare-aware: only computing layers get a slot; see slot map
-        // above and the paged-migration comment).
+        // GLM-25a: DSA indexer producer scratch (key storage is the paged
+        // Pool::kIndexerK pool — S4 deleted the persistent K arena).
         if (opts_.has_dsa) {
-            const size_t CT = static_cast<size_t>(indexer_cache_tokens_);
-            const size_t NS = static_cast<size_t>(std::max(indexer_arena_slots_, 1));
+            const size_t CT = static_cast<size_t>(indexer_score_tokens_);
             indexer_q_[r]        = attn->device_alloc(size_t(B) * NIH * IHD * 2);  // BF16
             indexer_k_[r]        = attn->device_alloc(size_t(B) * IHD * 2);        // BF16
             indexer_weights_[r]  = attn->device_alloc(size_t(B) * NIH * 2);        // BF16
             indexer_score_proj_[r] = attn->device_alloc(size_t(B) * NIH * sizeof(float));
-            indexer_k_cache_[r]  = attn->device_alloc(NS * CT * IHD);  // FP8 e4m3
-            indexer_k_scales_[r] = attn->device_alloc(NS * CT * sizeof(float));
             indexer_scores_[r]   = attn->device_alloc(CT * sizeof(float));
             indexer_block_endpoints_[r] = attn->device_alloc(CT * sizeof(int));
             // TD-SPARSE-PREFILL-SCORE-BATCH: under sparse_prefill the batched
@@ -634,7 +646,7 @@ void DcpExecutor::allocate_buffers() {
             // scratch (per-row loop overwrites it sequentially).
             const size_t tk_rows = opts_.sparse_prefill ? size_t(B) : 1;
             indexer_topk_scores_[r] = attn->device_alloc(
-                tk_rows * size_t(std::max(ITK, 1)) * sizeof(float));
+                tk_rows * size_t(std::max(ITKR, 1)) * sizeof(float));
             // TD-PREFILL-SUPERCHUNK: the per-row top-k selection PERSISTS for
             // the whole superchunk (IndexShare shared layers of every
             // sub-chunk consume it later in the layer-wise sweep) — size the
@@ -642,15 +654,29 @@ void DcpExecutor::allocate_buffers() {
             const size_t sparse_rows = static_cast<size_t>(
                 std::max(B, std::max(opts_.superchunk_tokens, 1)));
             sparse_indices_dev_[r] = attn->device_alloc(
-                sparse_rows * std::max(ITK, 1) * sizeof(int));
+                sparse_rows * std::max(ITKR, 1) * sizeof(int));
             topk_lengths_dev_[r] = attn->device_alloc(
                 sparse_rows * sizeof(int));
+            // GF3.5 IndexPool: raw-gate rows for the compress producer and
+            // the pool-id top-k scratch (budget ITK/kpool per row).
+            if (opts_.index_kpool > 1) {
+                indexer_gate_[r] = attn->device_alloc(
+                    size_t(B) * IHD * 2);  // BF16
+                indexer_pool_ids_[r] = attn->device_alloc(
+                    sparse_rows * size_t(std::max(ITK / opts_.index_kpool, 1))
+                    * sizeof(int));
+                if (!indexer_gate_[r] || !indexer_pool_ids_[r]) {
+                    throw std::runtime_error(
+                        "DcpExecutor: IndexPool scratch allocation failed "
+                        "(rank " + std::to_string(r) + ")");
+                }
+            }
             // KVS-4: rank-local translation targets — only sharded KV
             // consumes them (the global buffers above stay the producer's
             // output in both modes).
             if (opts_.dcp_kv_sharded && dcp_size_ >= 2) {
                 sparse_local_indices_dev_[r] = attn->device_alloc(
-                    size_t(B) * std::max(ITK, 1) * sizeof(int));
+                    size_t(B) * std::max(ITKR, 1) * sizeof(int));
                 topk_local_lengths_dev_[r] =
                     attn->device_alloc(size_t(B) * sizeof(int));
             }
@@ -659,7 +685,7 @@ void DcpExecutor::allocate_buffers() {
             // runtime batch size) + rank-major allgather target.
             if (indexer_local_) {
                 const size_t cand_bytes =
-                    2 * size_t(B) * std::max(ITK, 1) * sizeof(int);
+                    2 * size_t(B) * std::max(ITKR, 1) * sizeof(int);
                 indexer_cand_send_[r] = attn->device_alloc(cand_bytes);
                 indexer_cand_recv_[r] =
                     attn->device_alloc(size_t(dcp_size_) * cand_bytes);
@@ -698,8 +724,7 @@ void DcpExecutor::allocate_buffers() {
             }
 
             if (!indexer_q_[r] || !indexer_k_[r] || !indexer_weights_[r]
-                || !indexer_score_proj_[r] || !indexer_k_cache_[r]
-                || !indexer_k_scales_[r] || !indexer_scores_[r]
+                || !indexer_score_proj_[r] || !indexer_scores_[r]
                 || !indexer_block_endpoints_[r] || !indexer_topk_scores_[r]
                 || !sparse_indices_dev_[r] || !topk_lengths_dev_[r]
                 || (opts_.dcp_kv_sharded && dcp_size_ >= 2
@@ -712,9 +737,16 @@ void DcpExecutor::allocate_buffers() {
                     + std::to_string(r) + ")");
             }
 
-            // block_endpoints are position ids — a static iota, uploaded once.
-            std::vector<int> iota(indexer_cache_tokens_);
-            for (int i = 0; i < indexer_cache_tokens_; ++i) iota[i] = i;
+            // block_endpoints are ENTRY endpoint positions — a static
+            // strided iota, uploaded once. Legacy (kpool 1): entry i is
+            // position i, endpoint i. IndexPool (GF3.5): entry i is pool i,
+            // endpoint i*kpool + kpool - 1 — with query position p this
+            // admits exactly the floor((p+1)/kpool) settled pools
+            // (endpoint <= p), vLLM's floor-causality.
+            const int kp = std::max(opts_.index_kpool, 1);
+            std::vector<int> iota(indexer_score_tokens_);
+            for (int i = 0; i < indexer_score_tokens_; ++i)
+                iota[i] = i * kp + (kp - 1);
             attn->memcpy_h2d(indexer_block_endpoints_[r], iota.data(),
                              CT * sizeof(int));
         }
@@ -774,6 +806,78 @@ void DcpExecutor::allocate_buffers() {
                 "(rank " + std::to_string(r) + ")");
         }
     }
+
+    // ── GF3.9 KDA scratch (glm5_next only; every other model allocates
+    // NOTHING here — byte-identical layouts). Row bound mirrors the V4
+    // chunk shape: prefill chunks arrive as batch rows, capped by the
+    // 512-row IPC descriptor bound. The chunked-scan fp32 workspace is
+    // the PLAN GF3.9 budget item (~13.3 MiB per 64-token chunk at H=64,
+    // ~107 MiB at the 512-row bound) — logged per rank below.
+    if (opts_.kda_enabled) {
+        const int Hk = opts_.kda_heads_per_rank;
+        const size_t Ck = static_cast<size_t>(Hk) * 128;
+        kda_rows_max_ = std::min(
+            std::max(B, std::max(opts_.superchunk_tokens, 1)), 512);
+        const size_t rows = static_cast<size_t>(kda_rows_max_);
+        kda_x_bf16_.resize(dcp_size_);
+        kda_beta_.resize(dcp_size_);
+        kda_lowrank_.resize(dcp_size_);
+        kda_lowrank2_.resize(dcp_size_);
+        kda_rawg_.resize(dcp_size_);
+        kda_g2_.resize(dcp_size_);
+        kda_conv_f32_.resize(dcp_size_);
+        kda_core_f32_.resize(dcp_size_);
+        kda_onorm_bf16_.resize(dcp_size_);
+        kda_workspace_.resize(dcp_size_);
+        kda_slots_dev_.resize(dcp_size_);
+        kda_slots_host_.resize(dcp_size_);
+        for (int r = 0; r < dcp_size_; ++r) {
+            auto* attn = opts_.attention_devices[r];
+            attn->set_device();
+            kda_workspace_bytes_ =
+                attn->kda_prefill_workspace_bytes(kda_rows_max_, Hk);
+            kda_x_bf16_[r]     = attn->device_alloc(3 * rows * Ck * 2);
+            kda_beta_[r]       = attn->device_alloc(rows * Hk * 2);
+            kda_lowrank_[r]    = attn->device_alloc(rows * 128 * 2);
+            kda_lowrank2_[r]   = attn->device_alloc(rows * 128 * 2);
+            kda_rawg_[r]       = attn->device_alloc(rows * Ck * 2);
+            kda_g2_[r]         = attn->device_alloc(rows * Ck * 2);
+            kda_conv_f32_[r]   = attn->device_alloc(3 * rows * Ck * 4);
+            kda_core_f32_[r]   = attn->device_alloc(rows * Ck * 4);
+            kda_onorm_bf16_[r] = attn->device_alloc(rows * Ck * 2);
+            kda_workspace_[r]  = kda_workspace_bytes_ > 0
+                ? attn->device_alloc(kda_workspace_bytes_) : nullptr;
+            kda_slots_dev_[r]  = attn->device_alloc(
+                static_cast<size_t>(B) * sizeof(int));
+            kda_slots_host_[r] =
+                r < static_cast<int>(opts_.device_backends.size())
+                        && opts_.device_backends[r]
+                    ? opts_.device_backends[r]->host_alloc_pinned(
+                          static_cast<size_t>(B) * sizeof(int))
+                    : nullptr;
+            if (!kda_x_bf16_[r] || !kda_beta_[r] || !kda_lowrank_[r]
+                || !kda_lowrank2_[r]
+                || !kda_rawg_[r] || !kda_g2_[r] || !kda_conv_f32_[r]
+                || !kda_core_f32_[r] || !kda_onorm_bf16_[r]
+                || (kda_workspace_bytes_ > 0 && !kda_workspace_[r])
+                || !kda_slots_dev_[r] || !kda_slots_host_[r]) {
+                throw std::runtime_error(
+                    "DcpExecutor: device_alloc failed for KDA scratch "
+                    "(rank " + std::to_string(r) + ")");
+            }
+            const double total_mib =
+                (3 * rows * Ck * 2 + rows * Hk * 2 + rows * 128 * 2
+                 + 2 * rows * Ck * 2 + 3 * rows * Ck * 4 + rows * Ck * 4
+                 + rows * Ck * 2 + kda_workspace_bytes_)
+                / (1024.0 * 1024.0);
+            spdlog::info(
+                "DcpExecutor: KDA scratch rank {} — {:.1f} MiB at {} rows "
+                "x {} heads (incl. {:.1f} MiB chunked-scan fp32 workspace, "
+                "GF3.9 prefill budget)",
+                r, total_mib, kda_rows_max_, Hk,
+                kda_workspace_bytes_ / (1024.0 * 1024.0));
+        }
+    }
 }
 
 void DcpExecutor::free_buffers() {
@@ -795,6 +899,7 @@ void DcpExecutor::free_buffers() {
     free_vec(rope_cos_sin_);
     free_vec(rope_cos_sin_compress_);
     free_vec(kv_compressed_);
+    free_vec(hidden_f32_);
     free_vec(kv_a_pad_out_);
     free_vec(hidden_out_);
     free_vec(fp8_corrected_);
@@ -864,8 +969,6 @@ void DcpExecutor::free_buffers() {
     free_vec(indexer_k_);
     free_vec(indexer_weights_);
     free_vec(indexer_score_proj_);
-    free_vec(indexer_k_cache_);
-    free_vec(indexer_k_scales_);
     free_vec(indexer_scores_);
     free_vec(indexer_block_endpoints_);
     free_vec(indexer_topk_scores_);
@@ -873,12 +976,36 @@ void DcpExecutor::free_buffers() {
     free_vec(indexer_scores_batched_);
     free_vec(indexer_row_bounds_dev_);
     free_vec(indexer_page_table_dev_);
+    // P-29 step 7 kIndexer-span scratch.
+    free_vec(indexer_dec_ptab_dev_);
+    free_vec(indexer_dec_bounds_dev_);
+    free_vec(indexer_gate_);
+    free_vec(indexer_pool_ids_);
     free_vec(sparse_indices_dev_);
     free_vec(topk_lengths_dev_);
     free_vec(sparse_local_indices_dev_);
     free_vec(topk_local_lengths_dev_);
     free_vec(indexer_cand_send_);
     free_vec(indexer_cand_recv_);
+    // GF3.9 KDA scratch (device buffers per rank; pinned host via backend).
+    free_vec(kda_x_bf16_);
+    free_vec(kda_beta_);
+    free_vec(kda_lowrank_);
+    free_vec(kda_lowrank2_);
+    free_vec(kda_rawg_);
+    free_vec(kda_g2_);
+    free_vec(kda_conv_f32_);
+    free_vec(kda_core_f32_);
+    free_vec(kda_onorm_bf16_);
+    free_vec(kda_workspace_);
+    free_vec(kda_slots_dev_);
+    for (int r = 0; r < static_cast<int>(kda_slots_host_.size()); ++r) {
+        if (kda_slots_host_[r]
+            && r < static_cast<int>(opts_.device_backends.size())
+            && opts_.device_backends[r])
+            opts_.device_backends[r]->host_free_pinned(kda_slots_host_[r]);
+    }
+    kda_slots_host_.clear();
     sparse_indices_ptrs_.clear();
     topk_lengths_ptrs_.clear();
     // dequant_pool_ destroyed by unique_ptr in destructor.
@@ -891,15 +1018,66 @@ void DcpExecutor::free_buffers() {
 // prefill (mmq) at M ≤ 8 (mirrors the kernel's GEMV/GEMM split at M=8);
 // dequant strategy always uses the lossless-activation dequant GEMM. The
 // per-projection k-quant type is passed through verbatim.
+void DcpExecutor::tp_hidden_probe(const char* tag, int layer_idx,
+                                  void* const* bufs, int batch) const {
+    static const bool on = [] {
+        const char* e = std::getenv("LS_TP_HIDDEN_PROBE");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (!on || !bufs) return;
+    const int H = opts_.hidden_size;
+    std::vector<uint16_t> row(static_cast<size_t>(H));
+    for (int r = 0; r < dcp_size_; ++r) {
+        if (!bufs[r]) continue;
+        auto* attn = opts_.attention_devices[r];
+        attn->set_device();
+        attn->device_sync();
+        if (r < static_cast<int>(opts_.device_backends.size())
+            && opts_.device_backends[r]) {
+            opts_.device_backends[r]->memcpy_d2h_async(
+                row.data(), bufs[r], static_cast<size_t>(H) * 2, nullptr);
+            opts_.device_backends[r]->device_sync();
+        } else {
+            continue;
+        }
+        double sum = 0.0, asum = 0.0;
+        for (int i = 0; i < H; ++i) {
+            // bf16 -> float by bit shift (host-side, CUDA-free).
+            uint32_t u = static_cast<uint32_t>(row[static_cast<size_t>(i)])
+                         << 16;
+            float f;
+            std::memcpy(&f, &u, 4);
+            sum += f;
+            asum += std::fabs(f);
+        }
+        spdlog::warn("[tp-probe] {} L{} r{} B{} sum={:.10e} asum={:.10e} "
+                     "w0={:04x} w1={:04x} w2={:04x} w3={:04x}",
+                     tag, layer_idx, r, batch, sum, asum,
+                     row[0], row[1], row[2], row[3]);
+    }
+}
+
+int DcpExecutor::gguf_mmvq_max_m() {
+    static const int mmvq_max_m = [] {
+        const char* no = std::getenv("LS_NO_CHUNK_SMALLM");
+        if (no && *no && no[0] != '0') return 8;
+        const char* e = std::getenv("LS_CHUNK_SMALLM");
+        if (e && *e && e[0] == '0') return 8;
+        return 32;
+    }();
+    return mmvq_max_m;
+}
+
 void DcpExecutor::route_gguf_gemm(compute::AttentionDevice* attn,
                                   int rank, int M, int N, int K,
                                   const void* A, const void* B, void* C,
                                   model::GgufKQuantType type,
-                                  void* stream) const {
+                                  void* stream, bool c_fp32) const {
     compute::GgufGemmParams p{};
     p.M = M; p.N = N; p.K = K;
     p.A = A; p.B = B; p.C = C;
     p.type = type;
+    p.c_fp32 = c_fp32;
 
     if (opts_.gguf_strategy == config::GgufStrategy::dequant) {
         attn->gguf_dequant_gemm(p, stream);
@@ -916,13 +1094,7 @@ void DcpExecutor::route_gguf_gemm(compute::AttentionDevice* attn,
     // Shares its gate rule with the small-M GEMV (bf16_gemm.cu
     // small_m_gemv_enabled(); explicit LS_CHUNK_SMALLM=0 also disables) —
     // keep the two in lockstep.
-    static const int mmvq_max_m = [] {
-        const char* no = std::getenv("LS_NO_CHUNK_SMALLM");
-        if (no && *no && no[0] != '0') return 8;
-        const char* e = std::getenv("LS_CHUNK_SMALLM");
-        if (e && *e && e[0] == '0') return 8;
-        return 32;
-    }();
+    const int mmvq_max_m = gguf_mmvq_max_m();
     void* ws = (rank < static_cast<int>(gguf_q8_1_ws_.size()))
                  ? gguf_q8_1_ws_[rank] : nullptr;
     if (M <= mmvq_max_m) {
@@ -988,6 +1160,11 @@ void DcpExecutor::register_buffers(daemon::BufferRegistry& registry) {
                                            v4_prefill_rows_max_) * H * 2
                                      : sz_hidden_out,
                                  gpu, name("hidden_out").c_str());
+        if (hidden_f32_[r])
+            registry.register_buffer(
+                hidden_f32_[r],
+                static_cast<int64_t>(hidden_f32_rows_) * H * 4,
+                gpu, name("hidden_f32").c_str());
         registry.register_buffer(fp8_corrected_[r],           sz_fp8_corrected,      gpu, name("fp8_corrected").c_str());
         registry.register_buffer(fp8_corrected_scales_[r],    sz_fp8_corr_scales,    gpu, name("fp8_corrected_scales").c_str());
         if (gemm_workspace_[r]) {
@@ -1104,9 +1281,29 @@ void DcpExecutor::set_layer_weights(
     for (auto& v : oproj_meta_resident_b_) std::fill(v.begin(), v.end(), -1);
 
     // Construct the dequant pool now that we know the layer count.
+    //
+    // P-29 step 21 (TD-KVBV-DEQUANT-POOL-INERT-GLM5N): size the pool to
+    // ZERO slots when no layer's kv_b_proj needs a dequant slot (not FP8,
+    // not packed GGUF — e.g. glm5_next, whose GGUF kv_b is assembled to
+    // BF16 at load, GLM-1). The 5-slot carve was ~8 MiB/slot/rank of dead
+    // VRAM on such models; acquire() only ever takes the BF16-direct
+    // branch, which needs no slot. kv_b flags are final here: engine
+    // wire_kv_bv_dequant() sets kv_b_proj_is_fp8 before calling
+    // set_layer_weights(), and kv_b_is_gguf is threaded at upload time.
+    bool any_kv_b_dequant = false;
+    for (const auto& per_rank : all_layer_weights_) {
+        for (const auto* w : per_rank) {
+            if (w && KvBvDequantPool::needs_dequant(*w)) {
+                any_kv_b_dequant = true;
+                break;
+            }
+        }
+        if (any_kv_b_dequant) break;
+    }
+
     KvBvDequantPool::Options pool_opts;
     pool_opts.dcp_size = dcp_size_;
-    pool_opts.num_slots = 5;
+    pool_opts.num_slots = any_kv_b_dequant ? 5 : 0;
     pool_opts.num_heads_local = num_heads_local_;
     pool_opts.qk_nope_head_dim = opts_.qk_nope_head_dim;
     pool_opts.v_head_dim = opts_.v_head_dim;

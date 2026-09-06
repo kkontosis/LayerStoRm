@@ -534,8 +534,12 @@ class OrchestratorLoop(
         self._pending_numa_migrations: list = []
         self._next_seq_id: int = 1
 
-        # First MoE layer index (layers before this are dense attention-only)
-        self._first_moe_layer = metadata.num_layers - metadata.num_moe_layers
+        # First MoE layer index (layers before this are dense attention-only).
+        # P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS: config-derived
+        # (EngineMetadata.first_moe_layer = first_k_dense_replace), NOT
+        # `num_layers - num_moe_layers` — the MTP-armed census counts the
+        # NextN block, which would move the derived boundary down one layer.
+        self._first_moe_layer = metadata.first_moe_layer
 
         # Wire scheduler sub-delegates
         self._scheduler.eviction_scorer = eviction_policy

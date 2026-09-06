@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include <spdlog/spdlog.h>
 
@@ -121,7 +122,8 @@ uint32_t CommandDispatcher::poll_compute_completions() {
                                   pc.layer_idx, /*status=*/0,
                                   pc.host_buf_offset, pc.data_bytes,
                                   pc.top1_prob, pc.entropy,
-                                  pc.routed_miss_count);
+                                  pc.routed_miss_count, pc.moe_degraded,
+                                  pc.indexer_dense);
 
         // Union-aware cache partitioning: the kExpertFfn event is ready, so
         // the GPU is done reading this command's transient (streaming-zone)
@@ -226,7 +228,8 @@ void CommandDispatcher::write_compute_completion(
         uint32_t gpu_idx, uint32_t layer_idx, uint32_t status,
         uint32_t host_buf_offset, uint32_t data_bytes,
         float top1_prob, float entropy,
-        uint8_t routed_miss_count) {
+        uint8_t routed_miss_count, uint8_t moe_degraded,
+        uint8_t indexer_dense) {
     ipc::Completion cmp{};
     cmp.cmp_type                    = ipc::CMP_COMPUTE_DONE;
     cmp.cmd_seq                     = cmd_seq;
@@ -239,6 +242,8 @@ void CommandDispatcher::write_compute_completion(
     cmp.compute.top1_prob           = top1_prob;
     cmp.compute.entropy             = entropy;
     cmp.compute.routed_miss_count   = routed_miss_count;
+    cmp.compute.moe_degraded        = moe_degraded;
+    cmp.compute.indexer_dense       = indexer_dense;
     perf_trace::record(perf_trace::kCmpWritten,
                        static_cast<uint16_t>(gpu_idx), cmd_seq,
                        orig_cmd_type, layer_idx);
@@ -282,6 +287,19 @@ void CommandDispatcher::write_event_completion(
 void CommandDispatcher::write_error(
         uint32_t cmd_seq, uint32_t gpu_idx,
         ipc::CmpErrorCategory category, const char* msg) {
+    // 44z (INV-KVXP (b)): the retryable pool-exhaustion CHOKE POINT — every
+    // kKvPoolExhausted completion pokes the rebalancer HERE, so no refusal
+    // site can silently miss the hook again
+    // (TD-KVXP-BOOT-OVERGRANT-FIRST-ADMISSION: the seq_create bulk-KV site
+    // had no per-site call and 189 refusals never armed the eager drain).
+    // The shortfall is set-and-consume: always reset, forwarded only for
+    // the pool category.
+    const int64_t shortfall =
+        std::exchange(pool_refusal_shortfall_slabs_, int64_t{0});
+    if (category == ipc::CmpErrorCategory::kKvPoolExhausted
+        && pool_pressure_cb_)
+        pool_pressure_cb_(static_cast<int>(gpu_idx), shortfall);
+
     ipc::Completion cmp{};
     cmp.cmp_type              = ipc::CMP_ERROR;
     cmp.cmd_seq               = cmd_seq;
@@ -347,7 +365,8 @@ void CommandDispatcher::write_cancel_completion(
 
 void CommandDispatcher::write_seq_completion(
         uint32_t cmd_seq, uint32_t gpu_idx,
-        uint64_t seq_id, uint32_t page_count, uint32_t status) {
+        uint64_t seq_id, uint32_t page_count, uint32_t status,
+        uint32_t reserved_tokens) {
     ipc::Completion cmp{};
     cmp.cmp_type          = ipc::CMP_SEQ_OP_DONE;
     cmp.cmd_seq           = cmd_seq;
@@ -355,6 +374,8 @@ void CommandDispatcher::write_seq_completion(
     cmp.status            = status;
     cmp.seq_op.seq_id     = seq_id;
     cmp.seq_op.page_count = page_count;
+    // TD-INDEXER-NO-DENSE-FALLBACK: granted indexer-K reservation (tokens).
+    cmp.seq_op.reserved_tokens = reserved_tokens;
     if (!deps_.cmp_ring->try_write(&cmp)) {
         spdlog::error("CommandDispatcher: completion ring full (seq op)");
     }

@@ -17,6 +17,7 @@
 #include "core/expert_device.h"
 #include "core/null_device_backend.h"
 #include "core/gpu_ref.h"
+#include "model/quantization/gguf_compute_cast.h"
 #include "model/quantization/gguf_kquant.h"
 #include "config/config_parser.h"
 
@@ -125,7 +126,7 @@ TEST(GgufFusedMoeGate, ProjectionTypeCastMatches) {
                                   lm::GgufKQuantType::Q6_K,
                                   lm::GgufKQuantType::Q8_0);
     auto cast = [](lm::GgufKQuantType t) {
-        return static_cast<lc::GgufQuantType>(static_cast<int>(t));
+        return lm::gguf::to_compute_gguf(t);  // static_assert-guarded bridge
     };
     EXPECT_EQ(cast(qi.projection_type(lm::Projection::gate)), lc::GgufQuantType::Q4_K);
     EXPECT_EQ(cast(qi.projection_type(lm::Projection::up)),   lc::GgufQuantType::Q6_K);

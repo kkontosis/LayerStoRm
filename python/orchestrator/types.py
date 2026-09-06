@@ -97,6 +97,18 @@ class EngineMetadata:
     num_layers: int
     expert_bytes: int
     kv_bytes_per_page: int
+    # P-29 step 13 / TD-MTP-PROBE-DEFERRED-CONSUMERS: index of the FIRST MoE
+    # layer = the model config's `first_k_dense_replace` (layers below it
+    # are dense-FFN).  Pass it from config at every real construction
+    # site: the historical `num_layers - num_moe_layers` subtraction is
+    # only correct while the MoE census stops at num_hidden_layers.  With
+    # the MTP expert census armed (glm5_next + speculation.method mtp +
+    # speculation.mtp.enabled) the census counts the NextN block too —
+    # 43 MoE layers on a 45-layer model — and the subtraction yields 2,
+    # silently making dense layer 2 look like an MoE layer.
+    # -1 (default) = not supplied: __post_init__ falls back to the legacy
+    # subtraction so mock/unit callers keep their exact prior geometry.
+    first_moe_layer: int = -1
     num_expert_devices: int = 0
     gpus: tuple[GpuConfig, ...] = ()
     think_start_token_id: int = -1
@@ -114,16 +126,60 @@ class EngineMetadata:
     # superchunk-prefill token bound.  0 in mock/unit contexts
     # (superchunk prefill stays off; per-token prefill unchanged).
     moe_batch_capacity: int = 0
-    # DeepSeek-V4 (V4-8): per hidden layer attention type from
-    # EngineInfo.v4_attention_types — 0 = SWA-only, 1 = CSA (ratio 4),
-    # 2 = HCA (ratio 128).  Empty for non-V4 models.
-    v4_attention_types: tuple[int, ...] = ()
+    # P-30 step 1: the engine's REALIZED single-shot MoE chunk bound
+    # (EngineInfo.moe_chunk_capacity) after the elastic chunk fail-safe.
+    # Batches above it run the chunked grouped-GEMM path — rejected with
+    # expert-only ranks resident (TD-MOE-EP-XTP-WAVES), so EP-beyond-TP
+    # superchunk strides must clamp to this. 0 in mock/unit contexts.
+    moe_chunk_capacity: int = 0
+    # Per hidden layer attention type from EngineInfo.attention_types
+    # (GF3.2 / TD-ATTN-TYPES-V4-NAMING: renamed from v4_attention_types).
+    # V4 codes: 0 = SWA-only, 1 = CSA (ratio 4), 2 = HCA (ratio 128).
+    # glm5_next codes: 3 = linear (KDA — no KV, per-request recurrent
+    # state), 4 = sparse MLA (NoPE DSA — KV-bearing).
+    # Empty for homogeneous-attention models (GLM-5.2 / V3.2).
+    attention_types: tuple[int, ...] = ()
+    # R4b arch capability (EngineInfo.seq_fork_truncatable,
+    # INV-SEQ-FORK-TRUNC): True iff CMD_SEQ_FORK honours prefix_len
+    # truncation on this boot's architecture — i.e. the arch has NO lossy
+    # position-indexed per-sequence state (V4 in-place rings have it, so
+    # V4 is False).  Gates the orchestrator's mid-edge prefix reuse
+    # (PrefixCache.lookup_mid_edge); False = grid/exact-node hits only.
+    # Default False: mock/unit contexts keep the legacy lookup unless a
+    # test opts in.
+    seq_fork_truncatable: bool = False
+    # ── TD-GLM5-KDA-SLOTS-EXPORT (EngineInfo.kda_state_*): KDA state-pool
+    # geometry — all zero for models without linear-attention per-request
+    # state.  kda_state_mapped: the state units are whole-slab runs claimed
+    # from the SHARED kMain pool (the default; kda_state_pool_pages is that
+    # pool, kda_state_pages_per_seq is ONE admission's state demand beside
+    # its KV+indexer pages — live pressure reads
+    # StateSnapshot.kv_main_free_pages against it).  Not mapped: a
+    # dedicated carve of kda_state_slots whole-request slots is the hard
+    # concurrency cap (in-flight requests + non-hibernated prefix holders;
+    # hibernated holders spill and return their slot, INV-KDA-STATE (g)).
+    kda_state_mapped: bool = False
+    kda_state_slots: int = 0
+    kda_state_slot_bytes: int = 0
+    kda_state_pages_per_seq: int = 0
+    kda_state_pool_pages: int = 0
+
+    def __post_init__(self) -> None:
+        # Legacy fallback for callers that do not (yet) carry the model
+        # config's first_k_dense_replace: the pre-MTP-census identity
+        # `num_layers - num_moe_layers`.  Materialized once so every
+        # consumer can read `metadata.first_moe_layer` unconditionally
+        # (never the sentinel).
+        if self.first_moe_layer < 0:
+            object.__setattr__(self, "first_moe_layer",
+                               max(0, self.num_layers - self.num_moe_layers))
 
     def attention_type_for_layer(self, layer: int) -> int:
-        """V4 per-layer attention type (V4-8); 0/SWA-equivalent default
-        when the model is not V4 or the layer is out of range."""
-        if 0 <= layer < len(self.v4_attention_types):
-            return self.v4_attention_types[layer]
+        """Per-layer attention type (V4-8, extended by GF3.2);
+        0/SWA-equivalent default when the model has no per-layer
+        heterogeneity or the layer is out of range."""
+        if 0 <= layer < len(self.attention_types):
+            return self.attention_types[layer]
         return 0
 
 

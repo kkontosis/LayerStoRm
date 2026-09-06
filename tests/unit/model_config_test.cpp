@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
 #include "model/model_config.h"
 
 namespace lc = layerstorm::config;
@@ -97,6 +102,76 @@ static ModelConfig glm5_config() {
         };
         return lc::parse_config(j);
     }()};
+}
+
+// GLM-5.3-Flash (glm5_next, GF3.2) — real geometry from
+// test-data/GLM-5.3-Flash/config.json (spec/GLM-5.3-FLASH-MODELINFO.md §2/§3):
+// 45 layers = 34 KDA linear + 11 NoPE sparse MLA at depths 3+4k and 43;
+// 3 dense + 42 MoE; 288 routed experts; NoPE (rope dim 0, latent 512).
+static lc::Config glm53_flash_raw_config() {
+    return [] {
+        nlohmann::json layer_types = nlohmann::json::array();
+        for (int l = 0; l < 45; ++l) {
+            const bool sparse = (l % 4 == 3) || l == 43;
+            layer_types.push_back(sparse ? "deepseek_sparse_attention"
+                                         : "linear_attention");
+        }
+        auto j = nlohmann::json{
+            {"model", {
+                {"architecture",           "glm5_next"},
+                {"weights_path",           "/data/models/glm-5.3-flash/"},
+                {"weights_format",         "safetensors"},
+                {"num_hidden_layers",      45},
+                {"hidden_size",            4096},
+                {"num_attention_heads",    64},
+                {"num_key_value_heads",    64},
+                {"intermediate_size",      12288},
+                {"n_routed_experts",       288},
+                {"n_shared_experts",       1},
+                {"num_experts_per_tok",    8},
+                {"n_group",                1},
+                {"topk_group",             1},
+                {"vocab_size",             154880},
+                {"max_position_embeddings", 1048576},
+                {"kv_lora_rank",           512},
+                {"q_lora_rank",            1536},
+                {"qk_rope_head_dim",       0},
+                {"qk_nope_head_dim",       256},
+                {"v_head_dim",             256},
+                {"first_k_dense_replace",  3},
+                {"moe_layer_freq",         1},
+                {"index_topk",             2048},
+                {"index_n_heads",          32},
+                {"index_head_dim",         128},
+                {"index_kpool",            4},
+                {"index_kpool_compress",   true},
+                {"index_kpool_always_select_tail", true},
+                {"mla_use_nope",           true},
+                {"layer_types",            layer_types},
+                {"linear_attn_config", {
+                    {"num_heads", 64}, {"head_dim", 128},
+                    {"short_conv_kernel_size", 4},
+                    {"gate_lower_bound", -5.0}}},
+                {"hc_mult",                4},
+                {"hc_sinkhorn_iters",      20},
+                {"hc_eps",                 1e-6},
+                {"swiglu_limit",           10.0},
+                {"num_nextn_predict_layers", 1},
+                {"rms_norm_eps",           1e-5},
+                {"routed_scaling_factor",  2.5},
+                {"moe_intermediate_size",  2048},
+            }},
+            {"quantization", {{"weights", "fp8_e4m3"}, {"attention_compute", "fp8_e4m3"},
+                              {"kv_cache", "fp8_e4m3"}, {"gating_compute", "fp32"}}},
+            {"hardware", {{"gpus", {{{"id", 0}, {"type", "rtx5090"}, {"vram_gb", 32}}}},
+                          {"system_ram_gb", 256}}},
+        };
+        return lc::parse_config(j);
+    }();
+}
+
+static ModelConfig glm53_flash_config() {
+    return ModelConfig{glm53_flash_raw_config()};
 }
 
 static ModelConfig kimi_k25_config() {
@@ -253,6 +328,16 @@ TEST_F(ModelConfigGLM5Test, RopeInterleave) {
     EXPECT_TRUE(cfg.raw().indexer_rope_interleave);
 }
 
+TEST_F(ModelConfigGLM5Test, ComputesIndexerIsFullUnionLayer0MtpNever) {
+    // GF3.5: legacy DSA computing-layer set = IndexShare full ∪ {layer 0};
+    // the MTP layer is shared by construction and never computes/stores.
+    for (int l = 0; l < 78; ++l)
+        EXPECT_EQ(cfg.computes_indexer(l),
+                  cfg.is_full_index_layer(l) || l == 0) << "layer " << l;
+    EXPECT_FALSE(cfg.computes_indexer(78));  // MTP layer (num_nextn 1)
+    EXPECT_FALSE(cfg.computes_indexer(79));  // out of range
+}
+
 TEST_F(ModelConfigGLM5Test, IndexShareFullLayerSet) {
     // GLM-5.2's real IndexShare pattern (from the HF config's indexer_types,
     // dropped by the GGUF): 21 full layers, reconstructed from freq=4/offset=3.
@@ -287,6 +372,117 @@ TEST_F(ModelConfigGLM5Test, RawValues) {
     EXPECT_EQ(cfg.raw().v_head_dim, 256);
     EXPECT_DOUBLE_EQ(cfg.raw().rms_norm_eps, 1e-5);
     EXPECT_DOUBLE_EQ(cfg.raw().rope_theta, 1000000.0);
+}
+
+// ── Tests: GLM-5.3-Flash (glm5_next, GF3.2) ─────────────────────────────────
+
+static ModelConfig deepseek_v4_config();  // defined in the V4 section below
+
+class ModelConfigGlm5NextTest : public ::testing::Test {
+   protected:
+    ModelConfig cfg = glm53_flash_config();
+};
+
+TEST_F(ModelConfigGlm5NextTest, DispatchHelpers) {
+    EXPECT_TRUE(cfg.is_glm5_next());
+    EXPECT_FALSE(cfg.is_v4());
+    EXPECT_TRUE(cfg.has_dsa());          // 11 sparse layers carry DSA
+    EXPECT_TRUE(cfg.has_mtp());
+    EXPECT_TRUE(cfg.has_mhc());          // hc_mult 4, same machinery as V4
+    EXPECT_TRUE(cfg.has_index_pool());   // index_kpool 4
+    EXPECT_FALSE(cfg.has_grouped_routing());
+    EXPECT_FALSE(cfg.has_vision());      // GF3.14 deferred; text-only config
+}
+
+TEST_F(ModelConfigGlm5NextTest, LinearAttentionLayerPattern) {
+    // (lin x3, sparse) x11 + lin — sparse at 3+4k and 43 (MODELINFO §3).
+    int linear = 0, sparse = 0;
+    for (int l = 0; l < 45; ++l) {
+        const bool expect_sparse = (l % 4 == 3) || l == 43;
+        EXPECT_EQ(cfg.is_linear_attention_layer(l), !expect_sparse)
+            << "layer " << l;
+        (cfg.is_linear_attention_layer(l) ? linear : sparse)++;
+    }
+    EXPECT_EQ(linear, 34);
+    EXPECT_EQ(sparse, 11);
+    EXPECT_EQ(cfg.num_linear_attention_layers(), 34);
+    // KV-bearing layers = the sparse set only (kv_layers 79 -> 11 class
+    // consequence, booklet §10.4): page provisioning / KV metadata /
+    // tiering / DCP cover ONLY these.
+    EXPECT_EQ(cfg.num_kv_layers(), 11);
+    // Out of range / other archs.
+    EXPECT_FALSE(cfg.is_linear_attention_layer(-1));
+    EXPECT_FALSE(cfg.is_linear_attention_layer(45));
+}
+
+TEST_F(ModelConfigGlm5NextTest, IndexerLayersAreExactlyTheSparseSet) {
+    // IndexShare does not exist on glm5_next (indexer_types uniformly
+    // "full") and KDA layers carry NO indexer: the computing-layer set is
+    // exactly the 11 sparse layers (MODELINFO §3c).
+    EXPECT_EQ(cfg.num_full_index_layers(), 11);
+    for (int l = 0; l < 45; ++l)
+        EXPECT_EQ(cfg.is_full_index_layer(l),
+                  !cfg.is_linear_attention_layer(l)) << "layer " << l;
+}
+
+TEST_F(ModelConfigGlm5NextTest, ComputesIndexerIsSparseSetPlusMtp) {
+    // GF3.5: the ONE computing-layer predicate. glm5_next: no "∪ layer 0"
+    // union (layer 0 is KDA linear, no indexer), and the MTP layer (45) IS
+    // a computing layer — sparse MLA with its OWN indexer tensors
+    // (MODELINFO §3c "the 11 sparse layers + the MTP layer").
+    for (int l = 0; l < 45; ++l)
+        EXPECT_EQ(cfg.computes_indexer(l), !cfg.is_linear_attention_layer(l))
+            << "layer " << l;
+    EXPECT_FALSE(cfg.computes_indexer(0));   // linear — the union must NOT apply
+    EXPECT_TRUE(cfg.computes_indexer(45));   // MTP layer computes
+    EXPECT_FALSE(cfg.computes_indexer(46));  // out of range
+    EXPECT_FALSE(cfg.computes_indexer(-1));
+}
+
+TEST_F(ModelConfigGlm5NextTest, MoeAxisIndependentOfAttentionAxis) {
+    // mlp_layer_types (3 dense + 42 sparse) is NOT a config field: it is
+    // exactly reproduced by first_k_dense_replace=3 + moe_layer_freq=1
+    // (recorded GF3.2 decision). Layers 0-2 = KDA + dense; 3 = sparse-MLA
+    // + MoE; 4 = KDA + MoE.
+    EXPECT_EQ(cfg.num_dense_layers(), 3);
+    EXPECT_EQ(cfg.num_moe_layers(), 42);
+    EXPECT_FALSE(cfg.is_moe_layer(2));
+    EXPECT_TRUE(cfg.is_moe_layer(3));
+    EXPECT_TRUE(cfg.is_moe_layer(4));
+    EXPECT_TRUE(cfg.is_linear_attention_layer(4));
+}
+
+TEST_F(ModelConfigGlm5NextTest, NoPeDerivedDimensions) {
+    EXPECT_EQ(cfg.qk_head_dim(), 256);   // 256 nope + 0 rope
+    EXPECT_EQ(cfg.kv_cache_dim(), 512);  // latent = kv_lora_rank exactly
+    EXPECT_TRUE(cfg.raw().mla_use_nope);
+    EXPECT_EQ(cfg.raw().qk_rope_head_dim, 0);
+}
+
+TEST_F(ModelConfigGlm5NextTest, LinearAttnConfigValues) {
+    ASSERT_TRUE(cfg.raw().linear_attn_config.has_value());
+    const auto& la = *cfg.raw().linear_attn_config;
+    EXPECT_EQ(la.num_heads, 64);
+    EXPECT_EQ(la.head_dim, 128);
+    EXPECT_EQ(la.short_conv_kernel_size, 4);
+    EXPECT_DOUBLE_EQ(la.gate_lower_bound, -5.0);
+    EXPECT_EQ(cfg.raw().n_routed_experts, 288);
+    EXPECT_EQ(cfg.raw().index_kpool, 4);
+}
+
+TEST(ModelConfigGlm5NextEdge, HelpersInertOnOtherArchs) {
+    // Byte-identity guard at the helper level: existing archs see no
+    // behavior change from the new helpers.
+    ModelConfig glm52 = glm5_config();
+    EXPECT_FALSE(glm52.is_glm5_next());
+    EXPECT_FALSE(glm52.has_index_pool());
+    EXPECT_EQ(glm52.num_linear_attention_layers(), 0);
+    EXPECT_EQ(glm52.num_kv_layers(), 78);  // every hidden layer bears KV
+    for (int l : {0, 3, 42, 77})
+        EXPECT_FALSE(glm52.is_linear_attention_layer(l));
+    ModelConfig v4 = deepseek_v4_config();
+    EXPECT_FALSE(v4.is_glm5_next());
+    EXPECT_EQ(v4.num_linear_attention_layers(), 0);
 }
 
 // ── Tests: Kimi K2.5 ────────────────────────────────────────────────────────
@@ -656,4 +852,184 @@ TEST(ModelConfigV4, V32Regression) {
     EXPECT_TRUE(cfg.has_dsa());  // index_topk 2048, non-V4
     EXPECT_EQ(cfg.attention_type_for_layer(0), V4AttentionType::kSwa);
     EXPECT_FALSE(cfg.layer_uses_compress_rope(0));
+}
+
+// ── P-29 step 11 / OQ-3 phase A: LS_MTP_PROBE expert census ───────────────────────
+// The env flag is latched on FIRST use (static). Under ctest discovery every
+// TEST runs in its own process, so both arms execute for real; a whole-binary
+// run latches whichever arm executes first and the other arm SKIPS (never
+// flakes). The OFF arm is the champion negative control: layer counts and
+// the 12,096-slot arena census must be byte-identical with the flag absent.
+
+TEST(Glm5NextMtpProbe, OffKeepsChampionCensus) {
+    ::unsetenv("LS_MTP_PROBE");
+    if (ModelConfig::mtp_probe_experts_enabled())
+        GTEST_SKIP() << "probe flag latched ON earlier in this process";
+    ModelConfig cfg = glm53_flash_config();
+    EXPECT_EQ(cfg.num_moe_layers(), 42);
+    EXPECT_EQ(cfg.num_dense_layers(), 3);
+    EXPECT_FALSE(cfg.is_moe_layer(45));
+    EXPECT_EQ(cfg.moe_layer_indices().back(), 44);
+}
+
+TEST(Glm5NextMtpProbe, OnCountsMtpLayerAsMoe) {
+    ::setenv("LS_MTP_PROBE", "1", /*overwrite=*/1);
+    if (!ModelConfig::mtp_probe_experts_enabled())
+        GTEST_SKIP() << "probe flag latched OFF earlier in this process";
+    ModelConfig cfg = glm53_flash_config();
+    // Layer 45 (== num_hidden_layers) is the MTP block: full MoE
+    // (MODELINFO §5), appended contiguously (3..45) so the ELM
+    // ordinal-window arithmetic holds.
+    EXPECT_TRUE(cfg.is_moe_layer(45));
+    EXPECT_EQ(cfg.num_moe_layers(), 43);
+    EXPECT_EQ(cfg.moe_layer_indices().back(), 45);
+    // Bounds: one nextn layer only; nothing past it.
+    EXPECT_FALSE(cfg.is_moe_layer(46));
+    // Dense census and per-hidden-layer masks are untouched.
+    EXPECT_EQ(cfg.num_dense_layers(), 3);
+    EXPECT_EQ(static_cast<int>(cfg.full_index_layer_mask().size()), 45);
+    // Negative control: the probe is glm5_next-only — a V4-shaped config
+    // (also nextn > 0) must NOT grow its MoE census under the flag.
+    ModelConfig v4 = deepseek_v4_config();
+    EXPECT_FALSE(v4.is_moe_layer(v4.raw().num_hidden_layers));
+}
+
+// ── P-29 step 13 phase B: CONFIG-armed MTP expert census ──────────────────────────
+// arm_mtp_experts() is a PROCESS-WIDE, one-way latch and
+// mtp_probe_experts_enabled() latches "census consulted" on its first query,
+// so the arms below are mutually exclusive within one process. Under ctest
+// discovery each TEST is its own process and every arm runs for real; in a
+// whole-binary run whichever arm gets there first wins and the others SKIP
+// (never flake, never silently pass).
+
+// (b) Negative control: none of the near-miss config shapes arm the census —
+// glm5_next stays at the champion 42 MoE layers / 12,096-slot identity.
+TEST(Glm5NextMtpArming, ConfigWithoutMtpKeepsChampionCensus) {
+    ::unsetenv("LS_MTP_PROBE");
+    if (ModelConfig::mtp_probe_experts_enabled())
+        GTEST_SKIP() << "census latched ON earlier in this process";
+
+    // speculation off entirely.
+    {
+        lc::Config c = glm53_flash_raw_config();
+        c.speculation.enabled = false;
+        c.speculation.method  = lc::SpeculationMethodType::mtp;
+        c.speculation.mtp.enabled = true;
+        ModelConfig mc{c};
+        EXPECT_EQ(mc.num_moe_layers(), 42);
+        EXPECT_FALSE(mc.is_moe_layer(45));
+        EXPECT_EQ(mc.moe_layer_indices().back(), 44);
+    }
+    // speculation on, but the method is not MTP.
+    {
+        lc::Config c = glm53_flash_raw_config();
+        c.speculation.enabled = true;
+        c.speculation.method  = lc::SpeculationMethodType::dspark;
+        c.speculation.mtp.enabled = true;
+        ModelConfig mc{c};
+        EXPECT_EQ(mc.num_moe_layers(), 42);
+        EXPECT_FALSE(mc.is_moe_layer(45));
+    }
+    // method == mtp, but the MTP block itself is disabled.
+    {
+        lc::Config c = glm53_flash_raw_config();
+        c.speculation.enabled = true;
+        c.speculation.method  = lc::SpeculationMethodType::mtp;
+        c.speculation.mtp.enabled = false;
+        ModelConfig mc{c};
+        EXPECT_EQ(mc.num_moe_layers(), 42);
+        EXPECT_FALSE(mc.is_moe_layer(45));
+    }
+    // Fully armed signal but no nextn layer to count.
+    {
+        lc::Config c = glm53_flash_raw_config();
+        c.speculation.enabled = true;
+        c.speculation.method  = lc::SpeculationMethodType::mtp;
+        c.speculation.mtp.enabled = true;
+        c.model.num_nextn_predict_layers = 0;
+        ModelConfig mc{c};
+        EXPECT_EQ(mc.num_moe_layers(), 42);
+    }
+    // Fully armed signal on a NON-glm5_next arch (V3.2 also has nextn > 0).
+    {
+        lc::Config c = glm53_flash_raw_config();
+        c.speculation.enabled = true;
+        c.speculation.method  = lc::SpeculationMethodType::mtp;
+        c.speculation.mtp.enabled = true;
+        c.model.architecture = lc::Architecture::deepseek_v3;
+        ModelConfig mc{c};
+        EXPECT_FALSE(mc.is_moe_layer(c.model.num_hidden_layers));
+    }
+    // Nothing above may have armed the process-wide latch.
+    EXPECT_FALSE(ModelConfig::mtp_probe_experts_enabled());
+    // The ModelConfig(config::ModelConfig) constructor never arms either.
+    ModelConfig model_only{glm53_flash_raw_config().model};
+    EXPECT_EQ(model_only.num_moe_layers(), 42);
+}
+
+// (a) The serving shape: speculation.enabled + method==mtp + mtp.enabled on
+// glm5_next with nextn > 0 arms the census from the Config constructor,
+// BEFORE compute_layer_counts runs — so layer 45 is a tenant MoE layer.
+TEST(Glm5NextMtpArming, ConfigArmsMtpCensus) {
+    ::unsetenv("LS_MTP_PROBE");
+    lc::Config c = glm53_flash_raw_config();
+    c.speculation.enabled = true;
+    c.speculation.method  = lc::SpeculationMethodType::mtp;
+    c.speculation.mtp.enabled = true;
+    ASSERT_EQ(c.model.num_nextn_predict_layers, 1);
+
+    std::unique_ptr<ModelConfig> mc;
+    try {
+        mc = std::make_unique<ModelConfig>(c);
+    } catch (const std::logic_error&) {
+        GTEST_SKIP() << "an un-armed census was already consulted in this "
+                        "process — arming is refused by design";
+    }
+    EXPECT_TRUE(ModelConfig::mtp_probe_experts_enabled());
+    EXPECT_TRUE(mc->is_moe_layer(45));
+    EXPECT_EQ(mc->num_moe_layers(), 43);
+    EXPECT_EQ(mc->moe_layer_indices().back(), 45);
+    // Contiguity: the MTP block is appended, never interleaved.
+    EXPECT_EQ(mc->moe_layer_indices().front(), 3);
+    // Bounds: exactly one nextn layer, nothing past it.
+    EXPECT_FALSE(mc->is_moe_layer(46));
+    // Everything else about the census is untouched.
+    EXPECT_EQ(mc->num_dense_layers(), 3);
+    EXPECT_EQ(static_cast<int>(mc->full_index_layer_mask().size()), 45);
+
+    // The latch is process-wide: a SECOND ModelConfig built from a config
+    // with NO arming signal now sees the extended census too (one census
+    // per process — that is the whole point of the one-way latch).
+    lc::Config plain = glm53_flash_raw_config();
+    plain.speculation.enabled = false;
+    ModelConfig mc2{plain};
+    EXPECT_EQ(mc2.num_moe_layers(), 43);
+    // ...but the arch gate still holds: non-glm5_next never grows.
+    ModelConfig v4 = deepseek_v4_config();
+    EXPECT_FALSE(v4.is_moe_layer(v4.raw().num_hidden_layers));
+    // Re-arming an already-armed process is a no-op, never a throw.
+    EXPECT_NO_THROW(ModelConfig::arm_mtp_experts());
+}
+
+// (c) Arming AFTER an un-armed census was consulted would split the process
+// into two censuses (42-layer tables already built, 43-layer tables after) —
+// it must throw, not silently flip.
+TEST(Glm5NextMtpArming, ArmAfterCensusConsultedThrows) {
+    ::unsetenv("LS_MTP_PROBE");
+    // This query BOTH proves the census is un-armed and latches "consulted".
+    if (ModelConfig::mtp_probe_experts_enabled())
+        GTEST_SKIP() << "census already ON in this process (armed or "
+                        "LS_MTP_PROBE) — arming is a legal no-op there";
+    try {
+        ModelConfig::arm_mtp_experts();
+        FAIL() << "arm_mtp_experts() must refuse after a consulted census";
+    } catch (const std::logic_error& e) {
+        const std::string msg(e.what());
+        EXPECT_NE(msg.find("arm_mtp_experts"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("census"), std::string::npos) << msg;
+    }
+    // The failed arming must not have latched anything on.
+    EXPECT_FALSE(ModelConfig::mtp_probe_experts_enabled());
+    ModelConfig mc = glm53_flash_config();
+    EXPECT_EQ(mc.num_moe_layers(), 42);
 }

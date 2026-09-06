@@ -29,9 +29,13 @@ enum class TensorComponent {
     indexer_k_norm_bias,
     indexer_weights_proj,  // V4 reuses: blk.N.indexer.proj
     indexer_compressor_wkv,    // V4: blk.N.indexer_compressor_kv
-    indexer_compressor_wgate,  // V4: blk.N.indexer_compressor_gate
-    indexer_compressor_ape,    // V4: blk.N.indexer_compressor_ape
-    indexer_compressor_norm,   // V4: blk.N.indexer_compressor_norm
+    indexer_compressor_wgate,  // V4: blk.N.indexer_compressor_gate;
+                               //   glm5_next: self_attn.indexer.index_kpool_compress_gate
+                               //   (IndexPool learned 4:1 pooling gate — MODELINFO §3c)
+    indexer_compressor_ape,    // V4: blk.N.indexer_compressor_ape;
+                               //   glm5_next: self_attn.indexer.index_kpool_compress_ape
+                               //   (per-slot additive position bias [kpool, idx_dim])
+    indexer_compressor_norm,   // V4: blk.N.indexer_compressor_norm (glm5_next has none)
 
     // Layer norms
     input_layernorm,
@@ -89,6 +93,34 @@ enum class TensorComponent {
     output_hc_fn,       // output_hc_fn — model-level mHC output collapse
     output_hc_base,     // output_hc_base
     output_hc_scale,    // output_hc_scale
+
+    // ── glm5_next KDA linear attention (PLAN.md GF3.3; spec/GLM-5.3-FLASH-
+    // MODELINFO.md §3a). The checkpoint ships UNFUSED tensors under
+    // `model.language_model.layers.L.self_attn.` — separate q/k/v projections,
+    // per-head beta, low-rank decay (f) and output (g) gates, THREE separate
+    // depthwise width-4 causal convs, per-head decay base A_log (F32),
+    // per-channel dt_bias (F32), gated RMSNorm o_norm, and o_proj (which maps
+    // to the shared TensorComponent::o_proj — same name, same row-parallel
+    // sharding). vLLM's `in_proj_qkvbfg_a` fusion is a LOAD-TIME optimization,
+    // not a checkpoint tensor. Shapes (GLM-5.3-Flash, verified from the shard
+    // headers at HF rev 04c4e9e9): q/k/v [8192, 4096], b [64, 4096],
+    // f_a/g_a [128, 4096], f_b/g_b [8192, 128], conv1d [8192, 1, 4] each,
+    // A_log [64], dt_bias [8192], o_norm [128]. All BF16 except A_log/dt_bias
+    // (F32) — whole KDA layers sit in the FP8 skip list (MODELINFO §7).
+    kda_q_proj,         // self_attn.q_proj — per-head [heads*dim, hidden]
+    kda_k_proj,         // self_attn.k_proj
+    kda_v_proj,         // self_attn.v_proj
+    kda_b_proj,         // self_attn.b_proj — per-head beta [heads, hidden]
+    kda_f_a_proj,       // self_attn.f_a_proj — decay gate down [dim, hidden]
+    kda_f_b_proj,       // self_attn.f_b_proj — decay gate up [heads*dim, dim]
+    kda_g_a_proj,       // self_attn.g_a_proj — output gate down [dim, hidden]
+    kda_g_b_proj,       // self_attn.g_b_proj — output gate up [heads*dim, dim]
+    kda_q_conv1d,       // self_attn.q_conv1d — depthwise causal conv [heads*dim, 1, K]
+    kda_k_conv1d,       // self_attn.k_conv1d
+    kda_v_conv1d,       // self_attn.v_conv1d
+    kda_a_log,          // self_attn.A_log — per-head decay base, F32 [heads] (no suffix)
+    kda_dt_bias,        // self_attn.dt_bias — per-channel dt bias, F32 [heads*dim] (no suffix)
+    kda_o_norm,         // self_attn.o_norm — gated RMSNorm over head_dim [dim]
 };
 
 // ── TensorRole ───────────────────────────────────────────────────────────────
@@ -160,6 +192,12 @@ std::optional<TensorId> parse_hf_name(std::string_view name);
 ///   "token_embd.weight"            -> {embedding, weight, model_level, -1, -1}
 ///   "output.weight"                -> {output_head, weight, model_level, -1, -1}
 ///   "output_norm.weight"           -> {final_norm, weight, model_level, -1, -1}
+///
+/// glm5_next (GF3.9) adds the KDA surface: `blk.N.ssm_*` (beta/f_a/f_b/g_a/
+/// g_b/conv1d_{q,k,v}/norm/dt) plus the BARE MHA names `blk.N.attn_{q,k,v}`
+/// for the KDA q/k/v projections. `blk.N.ssm_a` carries NO role suffix and is
+/// matched by a narrow escape before suffix parsing; `blk.N.ssm_dt.bias` is a
+/// main tensor whose role is normalized to `weight`.
 std::optional<TensorId> parse_gguf_name(std::string_view name);
 
 /// String representation of a TensorComponent for logging/debugging.

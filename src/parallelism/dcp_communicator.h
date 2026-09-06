@@ -137,12 +137,15 @@ public:
     /// latency-bound kernels. BIT-IDENTICAL to two separate allreduce_hidden
     /// calls (same per-element rank sums; aggregation changes launch count
     /// only). When dcp_size==1: no-op.
+    /// a_fp32: buffers_a are FP32 and reduce in fp32 (the
+    /// TD-GLM5-TP-COMBINE-PRECISION shared/dense FFN partial combine).
     void allreduce_hidden_fused(void* const* buffers_a,
                                 void* const* buffers_b,
                                 int batch_size,
                                 void* const* streams,
                                 bool b_fp32 = false,
-                                int b_rows_per_token = 1);
+                                int b_rows_per_token = 1,
+                                bool a_fp32 = false);
 
     /// KD-4g: Allgather partial logits for TP-sharded output head.
     /// Per-rank [batch_size, local_vocab_size] FP32 → per-rank [batch_size, vocab_size] FP32.

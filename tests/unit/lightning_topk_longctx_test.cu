@@ -177,3 +177,57 @@ TEST(LightningTopkLongCtx, CausalityHoldsBeyondTopkBoundary) {
         EXPECT_LE(out.idx[i], QP) << "future position selected @" << i;
     }
 }
+
+// DET-TOPK-TIES (TD-SERVE-PREFILL-NONDET-RUN-TO-RUN): when MORE candidates
+// tie at the threshold key than there are slots left, the selected SET must
+// be a pure function of the scores — the remaining slots go to the
+// LOWEST-INDEX ties.  The upstream ports admit contested ties in atomicAdd
+// arrival order (warp-scheduling-dependent), which made the served GLM
+// greedy trajectory non-reproducible run-to-run once selection binds
+// (query_position >= topk).  Exact-set check vs the deterministic CPU rule
+// plus a repeat-stability check.
+TEST(LightningTopkLongCtx, ContestedThresholdTiesDeterministicLowestIndex) {
+    REQUIRES_GPU();
+    const int NB = 2877, K = 2048;
+    const float kTie = 1.0f;
+
+    // 500 distinct above-threshold scores at scattered positions; every
+    // other position ties EXACTLY at the threshold key.  above = 500,
+    // remaining = K - 500 = 1548, tie population = 2377 > remaining.
+    std::mt19937 rng(31);
+    std::vector<float> scores(NB, kTie);
+    std::vector<int> pos(NB);
+    for (int i = 0; i < NB; ++i) pos[i] = i;
+    std::shuffle(pos.begin(), pos.end(), rng);
+    std::set<int> above;
+    for (int j = 0; j < 500; ++j) {
+        scores[pos[j]] = 5.0f + 0.001f * static_cast<float>(j);
+        above.insert(pos[j]);
+    }
+
+    // Deterministic reference set: all above-threshold + the lowest-index
+    // remaining ties.
+    std::set<int> ref(above);
+    for (int i = 0; i < NB && static_cast<int>(ref.size()) < K; ++i)
+        if (!above.count(i)) ref.insert(i);
+
+    auto first = run_topk(scores, K, /*query_position=*/NB - 1);
+    ASSERT_EQ(first.effective_k, K);
+    std::set<int> sel(first.idx.begin(), first.idx.end());
+    ASSERT_EQ(static_cast<int>(sel.size()), K);
+    EXPECT_TRUE(sel == ref)
+        << "contested-tie membership is not the deterministic lowest-index "
+           "rule (or raced): first mismatch would flip sparse-attention KV "
+           "membership run-to-run";
+    for (int i = 0; i < K; ++i)
+        EXPECT_EQ(first.score[i], scores[first.idx[i]]) << "slot " << i;
+
+    // Repeat stability: the same inputs must produce the same bits, every
+    // launch (the legacy admission raced warp scheduling here).
+    for (int rep = 0; rep < 7; ++rep) {
+        auto again = run_topk(scores, K, NB - 1);
+        ASSERT_EQ(again.effective_k, K) << "rep " << rep;
+        EXPECT_TRUE(again.idx == first.idx) << "selection raced at rep " << rep;
+        EXPECT_TRUE(again.score == first.score) << "scores raced at rep " << rep;
+    }
+}

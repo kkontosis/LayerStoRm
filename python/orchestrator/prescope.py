@@ -103,7 +103,7 @@ class PrescopePredictor:
         self._cfg = config
         self._ne = metadata.num_experts
         self._n_moe = metadata.num_moe_layers
-        self._first_moe = metadata.num_layers - metadata.num_moe_layers
+        self._first_moe = metadata.first_moe_layer
         self._input_dim = config.pca_dim + self._ne
         self._rng = np.random.default_rng(42)
 
@@ -326,7 +326,7 @@ class PreScope:
         self._predictor = predictor
         self._num_experts = metadata.num_experts
         self._num_layers = metadata.num_layers
-        self._first_moe = metadata.num_layers - metadata.num_moe_layers
+        self._first_moe = metadata.first_moe_layer
 
     @property
     def config(self) -> PrescopeConfig:

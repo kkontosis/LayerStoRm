@@ -137,7 +137,7 @@ TEST(AllocatorCrossModule, VramPartitioningIntegrity) {
         const auto& gpu_layout = vram.layout().gpus[g];
 
         // ── KV region bounds (two separate segments after region reorder) ─
-        // Layout: pinned | kv_speculation | indexer_k | kv_main | streaming | stable
+        // Layout (S1): pinned | kv_speculation | kv_hca | kv_swa | indexer_k | kv_main | streaming | stable
         auto kv_main_start = reinterpret_cast<uintptr_t>(region.kv_main);
         int64_t kv_main_len = gpu_layout.kv_main_bytes;
         auto kv_spec_start = reinterpret_cast<uintptr_t>(region.kv_speculation);

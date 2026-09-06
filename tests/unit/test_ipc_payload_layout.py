@@ -65,6 +65,7 @@ _PY_CMD_PAYLOADS = {
     "SeqCreatePayload":       shm_protocol.SeqCreatePayload,
     "SeqFreePayload":         shm_protocol.SeqFreePayload,
     "SeqForkPayload":         shm_protocol.SeqForkPayload,
+    "SeqHibernatePayload":    shm_protocol.SeqHibernatePayload,
     "NvmeReadPayload":        shm_protocol.NvmeReadPayload,
     "NvmeWritePayload":       shm_protocol.NvmeWritePayload,
     "NvmeEvictHostPayload":   shm_protocol.NvmeEvictHostPayload,

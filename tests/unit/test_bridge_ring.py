@@ -33,7 +33,9 @@ from bridge.protocol import (
     CMD_SAMPLE_TOKENS,
     CMD_SEQ_CREATE,
     CMD_SEQ_FORK,
+    CMD_SEQ_FORK_FROZEN,
     CMD_SEQ_FREE,
+    CMD_SEQ_HIBERNATE,
     CMP_COMPUTE_DONE,
     CMP_ERROR,
     CMP_SEQ_OP_DONE,
@@ -42,6 +44,7 @@ from bridge.protocol import (
     D_B_CMD_PREFETCH_BATCH,
     D_B_CMD_RUN_ATTENTION,
     D_B_CMD_RUN_MOE,
+    D_CMD_KDA_CKPT,
     D_CMD_RUN_DSPARK_STEP,
     E_CMD_FETCH_AND_RUN_MOE,
     E_CMD_FETCH_AND_RUN_MOE_BIG,
@@ -155,6 +158,26 @@ class FakeDaemon(threading.Thread):
         self._rows: list[int] = []           # last embedded tokens
         self.known_seqs: set[int] = set()
         self.forks = 0
+        self.frozen_forks = 0
+        self.last_fork_prefix = -1   # R4a: prefix_len of the last fork
+        self.fork_prefixes: list[int] = []   # every fork's prefix_len
+        self.hibernates: list[int] = []
+        # P-29 step 24 (LS_KDA_PREFIX_CKPT): per-seq host checkpoint
+        # positions (mirrors SequenceState::kda_ckpts), the scripted
+        # per-checkpoint byte size, capture log, and the KDA-arch switch:
+        # when kda_arch is True a TRUNCATING fork is admitted ONLY at a
+        # recorded checkpoint position (the engine's reworked gate);
+        # False keeps every pre-existing test byte-identical (truncation
+        # freely admitted, the arch-neutral fake).
+        self.kda_arch = False
+        self.kda_ckpts: dict[int, set[int]] = {}
+        self.kda_ckpt_bytes_each = 1 << 20
+        self.kda_ckpt_captures: list[tuple[int, int]] = []
+        # TD-PREFIX-TIDY-COLD-SPILL: scripted spill behavior — list of
+        # (status, spilled_pages) answers consumed per spill=1 hibernate
+        # (empty = engine no-tiering arm: status 0, 0 pages).
+        self.spills: list[tuple[int, int]] = []
+        self.spill_answers: list[tuple[int, int]] = []
         self.seq_frees = 0
         # Page-pool admission emulation (evict-at-admission tests): when
         # set, SEQ_CREATE / SEQ_FORK are rejected with the engine's
@@ -172,6 +195,20 @@ class FakeDaemon(threading.Thread):
         # sequence to dense. None = never fail.
         self.indexer_exhaust_until_frees: int | None = None
         self.indexer_exhaust_rejects = 0
+        # TD-INDEXER-NO-DENSE-FALLBACK (Route 1) emulation: record the
+        # reservation each SEQ_CREATE/SEQ_FORK carried, grant
+        # min(reserve, max_seq_tokens) back through seq_op.reserved_tokens
+        # (aliases compute.data_bytes on the wire), and optionally script
+        # an ADMISSION-TIME reservation exhaustion (category 29) until
+        # `seq_frees` reaches the mark — the create-side evict-retry shape.
+        self.max_seq_tokens = 25600
+        self.last_create_reserve = -1
+        self.last_fork_reserve = -1
+        self.reserve_exhaust_until_frees: int | None = None
+        self.reserve_exhaust_rejects = 0
+        # Scripted indexer_dense witness bytes: the next N RUN_ATTENTION
+        # completions carry compute.indexer_dense=1 (a dense kDead step).
+        self.dense_flag_remaining = 0
         # Scripted V4 side-tier exhaustion (INV-PREFIX-CACHE-3 seam): same
         # gate as indexer_exhaust_until_frees, but the CMP_ERROR replays
         # the 2026-08-26 incident EXACTLY — the engine's 100-byte message
@@ -180,6 +217,31 @@ class FakeDaemon(threading.Thread):
         # Retryability must be recognized from the CATEGORY.
         self.v4_tier_exhaust_until_frees: int | None = None
         self.v4_tier_exhaust_rejects = 0
+        # Scripted MID-SPEC-ROUND exhaustion (TD-SPEC-ROUND-POOL-EVICT):
+        # replay the 2026-08-26 truncated CMP byte-for-byte, but WHILE a
+        # dspark draft is in flight.  When set to the 0-based
+        # RUN_DSPARK_STEP call index N, that draft's completion is HELD
+        # (draft logically "in flight"); every attention-carrying command
+        # arriving while it is held is declined with the TRUNCATED V4
+        # side-tier CMP_ERROR (category kKvPoolExhausted=29 — retryability
+        # must come from the CATEGORY, the 80-byte field ate "exhausted").
+        # The held completion is released when a CMD_SEQ_FREE arrives —
+        # written BEFORE the free's own CMP_SEQ_OP_DONE, replaying the
+        # engine interleave where the draft completes while the
+        # orchestrator's holder-eviction free is waiting (the bridge
+        # wait() must stash it).  spec_round_exhaust_max_rejects bounds
+        # the declines: after that many, the held completion is released
+        # WITHOUT a SEQ_FREE (models the draft finishing on its own while
+        # nothing is evictable).  spec_round_draft_error makes the held
+        # completion the draft's own CMP_ERROR instead (draft-side
+        # failure surfacing mid-eviction — must stash + surface as
+        # DsparkDraftError at collect).
+        self.spec_round_exhaust_at_call: int | None = None
+        self.spec_round_exhaust_rejects = 0
+        self.spec_round_exhaust_max_rejects: int | None = None
+        self.spec_round_draft_error = False
+        self.held_dspark_releases = 0
+        self._held_dspark: bytes | None = None
         # Scripted draft-context invalidation (TD-DSPARK-CTX-CAP /
         # INV-SERVE-SPEC-FALLBACK): from dspark call index N on, every
         # D_CMD_RUN_DSPARK_STEP is declined with the engine's real
@@ -188,6 +250,11 @@ class FakeDaemon(threading.Thread):
         # None = never fail; 0 = invalid from the first draft.
         self.dspark_fail_from: int | None = None
         self.embed_calls: list[int] = []     # n per EMBEDDING_LOOKUP
+        # TD-MOE-PROGRESSIVE-DEGRADED-SILENT: while > 0, each MoE-carrying
+        # completion (FETCH_AND_RUN_MOE / _BIG / FAR on a MoE layer) is
+        # emitted with compute.moe_degraded=1 and this counts down —
+        # scripting the engine's degraded progressive finalize.
+        self.degrade_moe_remaining = 0
         self.fetch_moes = 0                  # E_CMD_FETCH_AND_RUN_MOE
         self.fetch_moe_bigs = 0              # E_CMD_FETCH_AND_RUN_MOE_BIG
         self.moe_big_rows: list[int] = []    # their num_seqs fields
@@ -215,19 +282,30 @@ class FakeDaemon(threading.Thread):
         ctypes.memmove(dest, bytes(cmp), 128)
         hdr.producer_seq = prod + 1
 
-    def _done(self, cmd: Command, **compute) -> None:
+    def _build_done(self, cmd: Command, **compute) -> Completion:
         c = Completion()
         c.cmp_type = (CMP_SEQ_OP_DONE
                       if cmd.cmd_type in (CMD_SEQ_CREATE, CMD_SEQ_FREE,
-                                          CMD_SEQ_FORK)
+                                          CMD_SEQ_FORK, CMD_SEQ_FORK_FROZEN,
+                                          CMD_SEQ_HIBERNATE)
                       else CMP_COMPUTE_DONE)
         c.cmd_seq = cmd.cmd_seq
         c.gpu_idx = 0
-        c.status = 0
+        c.status = compute.pop("status", 0)  # envelope field, not payload
         c.payload.compute.cmd_type = cmd.cmd_type
         for k, v in compute.items():
             setattr(c.payload.compute, k, v)
-        self._write_cmp(c)
+        return c
+
+    def _done(self, cmd: Command, **compute) -> None:
+        self._write_cmp(self._build_done(cmd, **compute))
+
+    def _degrade_flag(self) -> int:
+        """Consume one scripted degraded-MoE completion, if any."""
+        if self.degrade_moe_remaining > 0:
+            self.degrade_moe_remaining -= 1
+            return 1
+        return 0
 
     def run(self) -> None:
         try:
@@ -271,6 +349,26 @@ class FakeDaemon(threading.Thread):
         return (self.seq_capacity is not None
                 and len(self.known_seqs) >= self.seq_capacity)
 
+    def _release_held_dspark(self) -> None:
+        if self._held_dspark is not None:
+            self._write_cmp(self._held_dspark)   # bytes(bytes) is identity
+            self._held_dspark = None
+            self.held_dspark_releases += 1
+
+    def _spec_round_exhausted(self, cmd: Command) -> bool:
+        """Decline an attention-carrying command while a draft completion
+        is held — the byte-exact truncated V4 CMP (category 29)."""
+        if self._held_dspark is None:
+            return False
+        self.spec_round_exhaust_rejects += 1
+        self._error(cmd, self.V4_TIER_EXHAUST_MSG,
+                    category=self.ERR_CAT_KV_POOL_EXHAUSTED)
+        if (self.spec_round_exhaust_max_rejects is not None
+                and (self.spec_round_exhaust_rejects
+                     >= self.spec_round_exhaust_max_rejects)):
+            self._release_held_dspark()      # draft finishes on its own
+        return True
+
     def _handle(self, cmd: Command) -> None:
         t = cmd.cmd_type
         if t == CMD_SEQ_CREATE:
@@ -279,16 +377,37 @@ class FakeDaemon(threading.Thread):
                 self._error(cmd, "seq_create: kMain page pool exhausted "
                                  f"(scripted cap {self.seq_capacity})")
                 return
+            reserve = int(cmd.payload.seq_create.reserve_tokens)
+            self.last_create_reserve = reserve
+            if (reserve > 0
+                    and self.reserve_exhaust_until_frees is not None
+                    and self.seq_frees < self.reserve_exhaust_until_frees):
+                self.reserve_exhaust_rejects += 1
+                # Engine-faithful shape: category 29 (kKvPoolExhausted) +
+                # "exhausted" early in the 80-byte message.
+                self._error(cmd, "seq_create: exhausted indexer-K pool at "
+                                 "admission reservation — retryable, evict "
+                                 "a prefix holder", category=29)
+                return
             self.known_seqs.add(int(cmd.payload.seq_create.seq_id))
-            self._done(cmd)
+            self._done(cmd, data_bytes=(min(reserve, self.max_seq_tokens)
+                                        if reserve else 0))
         elif t == CMD_SEQ_FREE:
+            # TD-SPEC-ROUND-POOL-EVICT interleave: the in-flight draft
+            # completes while the orchestrator waits on this free — its
+            # completion lands BEFORE the CMP_SEQ_OP_DONE, so the bridge
+            # wait() must stash it for dspark_collect_async.
+            self._release_held_dspark()
             self.known_seqs.discard(int(cmd.payload.seq_free.seq_id))
+            self.kda_ckpts.pop(int(cmd.payload.seq_free.seq_id), None)
             self.seq_frees += 1
             self._done(cmd)
-        elif t == CMD_SEQ_FORK:
+        elif t in (CMD_SEQ_FORK, CMD_SEQ_FORK_FROZEN):
             # Prefix-cache / spec-fork primitive: the fake is stateless per
             # seq (routing derives from the embedded rows), so a fork just
-            # validates lifecycle and registers the child.
+            # validates lifecycle and registers the child.  FROZEN forks
+            # (R3 holder registration — engine-side CoW-free) are counted
+            # separately so tests can assert the registration arm.
             if self._admission_full():
                 self.seq_admission_rejects += 1
                 self._error(cmd, "seq_fork: kMain page pool exhausted "
@@ -300,9 +419,72 @@ class FakeDaemon(threading.Thread):
                 self.errors.append(f"seq_fork: unknown src {src}")
             if dst in self.known_seqs:
                 self.errors.append(f"seq_fork: dst {dst} exists")
+            prefix = int(cmd.payload.seq_fork.prefix_len)
+            # P-29 step 24 gate mirror: on the KDA arch a truncating fork
+            # needs a checkpoint at EXACTLY prefix_len (kSeqFork refusal
+            # otherwise — the engine's reworked blanket gate).
+            if (self.kda_arch and prefix > 0
+                    and prefix not in self.kda_ckpts.get(src, set())):
+                self._error(cmd, "seq_fork: prefix_len unsupported: no "
+                                 "KDA checkpoint at prefix_len (lossy "
+                                 "arch)", category=13)
+                return
             self.known_seqs.add(dst)
             self.forks += 1
-            self._done(cmd)
+            # R4a: record the truncation prefix (0 = full fork) so tests
+            # can assert what the wire carried.
+            self.last_fork_prefix = prefix
+            self.fork_prefixes.append(prefix)
+            if t == CMD_SEQ_FORK_FROZEN and src in self.kda_ckpts:
+                # Registration fork MOVES the parent's checkpoints to the
+                # frozen holder (engine semantics, P-29 step 24).
+                self.kda_ckpts[dst] = self.kda_ckpts.pop(src)
+            reserve = int(cmd.payload.seq_fork.reserve_tokens)
+            self.last_fork_reserve = reserve
+            if t == CMD_SEQ_FORK_FROZEN:
+                self.frozen_forks += 1
+                reserve = 0          # frozen holders never reserve
+            self._done(cmd, data_bytes=(min(reserve, self.max_seq_tokens)
+                                        if reserve else 0))
+        elif t == D_CMD_KDA_CKPT:
+            # P-29 step 24: host-RAM KDA prefix checkpoint capture. The
+            # fake validates lifecycle only (frontier/grid preconditions
+            # are engine-tested in CommandDispatcherKdaState); duplicate
+            # positions are idempotent with data_bytes=0, like the engine.
+            sid = int(cmd.payload.kda_anchor.seq_id)
+            cpos = int(cmd.payload.kda_anchor.pos)
+            if sid not in self.known_seqs:
+                self._error(cmd, "kda_ckpt: unknown sequence or no live "
+                                 "KDA state", category=10)
+                return
+            have = self.kda_ckpts.setdefault(sid, set())
+            fresh = cpos not in have
+            have.add(cpos)
+            self.kda_ckpt_captures.append((sid, cpos))
+            self._done(cmd, data_bytes=(self.kda_ckpt_bytes_each
+                                        if fresh else 0))
+        elif t == CMD_SEQ_HIBERNATE:
+            # R3 holder hibernation: no-op success on the fake (mirrors
+            # the engine's no-tiering arm); lifecycle validated + counted.
+            sid = int(cmd.payload.seq_hibernate.seq_id)
+            klen = int(cmd.payload.seq_hibernate.kv_len)
+            if sid not in self.known_seqs:
+                self._error(cmd, "seq_hibernate: unknown seq_id",
+                            category=12)
+                return
+            if klen == 0:
+                self._error(cmd, "seq_hibernate: kv_len required",
+                            category=12)
+                return
+            spill = int(getattr(cmd.payload.seq_hibernate, "spill", 0))
+            if spill:
+                st, pages = (self.spill_answers.pop(0)
+                             if self.spill_answers else (0, 0))
+                self.spills.append((sid, st, pages))
+                self._done(cmd, status=st, data_bytes=pages)
+            else:
+                self.hibernates.append((sid, klen))
+                self._done(cmd)
         elif t == CMD_EMBEDDING_LOOKUP:
             p = cmd.payload.embedding_lookup
             n = int(p.num_tokens)
@@ -318,6 +500,8 @@ class FakeDaemon(threading.Thread):
             self.embed_calls.append(n)
             self._done(cmd)
         elif t == D_B_CMD_RUN_ATTENTION:
+            if self._spec_round_exhausted(cmd):
+                return
             if (self.indexer_exhaust_until_frees is not None
                     and self.seq_frees < self.indexer_exhaust_until_frees):
                 self.indexer_exhaust_rejects += 1
@@ -340,13 +524,18 @@ class FakeDaemon(threading.Thread):
                     for j in range(TOPK):
                         idx[r * TOPK + j] = \
                             (self._rows[ro + r] + j) % NUM_EXPERTS
-            self._done(cmd, layer_idx=p.layer_idx)
+            idense = 0
+            if self.dense_flag_remaining > 0:
+                self.dense_flag_remaining -= 1
+                idense = 1
+            self._done(cmd, layer_idx=p.layer_idx, indexer_dense=idense)
         elif t == E_CMD_FETCH_AND_RUN_MOE:
             p = cmd.payload.fetch_and_run_moe
             if p.expert_count == 0:
                 self.errors.append("FETCH_AND_RUN_MOE expert_count 0")
             self.fetch_moes += 1
-            self._done(cmd, layer_idx=p.layer_idx)
+            self._done(cmd, layer_idx=p.layer_idx,
+                       moe_degraded=self._degrade_flag())
         elif t == E_CMD_FETCH_AND_RUN_MOE_BIG:
             p = cmd.payload.fetch_and_run_moe_big
             if p.expert_count == 0:
@@ -367,7 +556,8 @@ class FakeDaemon(threading.Thread):
                     f"got {len(got)} want {len(want)}")
             self.fetch_moe_bigs += 1
             self.moe_big_rows.append(n)
-            self._done(cmd, layer_idx=p.layer_idx)
+            self._done(cmd, layer_idx=p.layer_idx,
+                       moe_degraded=self._degrade_flag())
         elif t == E_CMD_REEF_ROUTE:
             # Emulate the daemon ReefOrch service: rewrite gpu targets in
             # place (e%NUM_GPUS stands in for the solver) + sentinel evicts.
@@ -388,6 +578,8 @@ class FakeDaemon(threading.Thread):
             # The fused layer RUNS ATTENTION engine-side, so this is where a
             # kIndexerK exhaustion surfaces on the FAR path (same guard as
             # D_B_CMD_RUN_ATTENTION above).
+            if self._spec_round_exhausted(cmd):
+                return
             if (self.indexer_exhaust_until_frees is not None
                     and self.seq_frees < self.indexer_exhaust_until_frees):
                 self.indexer_exhaust_rejects += 1
@@ -408,7 +600,14 @@ class FakeDaemon(threading.Thread):
                         seen.add((tok + j) % NUM_EXPERTS)
                 count = len(seen)
             self.far_layers += 1
-            self._done(cmd, layer_idx=p.layer_idx, data_bytes=count)
+            idense = 0
+            if self.dense_flag_remaining > 0:
+                self.dense_flag_remaining -= 1
+                idense = 1
+            self._done(cmd, layer_idx=p.layer_idx, data_bytes=count,
+                       moe_degraded=(self._degrade_flag()
+                                     if p.layer_idx >= FIRST_MOE else 0),
+                       indexer_dense=idense)
         elif t == D_B_CMD_RUN_MOE:
             self.dense_moes += 1
             self._done(cmd, layer_idx=cmd.payload.run_moe.layer_idx)
@@ -460,6 +659,23 @@ class FakeDaemon(threading.Thread):
         elif t == D_CMD_RUN_DSPARK_STEP:
             p = cmd.payload.run_dspark_step
             g = p.num_query
+            hold = (self.spec_round_exhaust_at_call is not None
+                    and self.dspark_calls == self.spec_round_exhaust_at_call)
+            if hold and self.spec_round_draft_error:
+                # The held completion is the DRAFT's own failure — it must
+                # be stashed by whatever wait it interrupts and surface as
+                # DsparkDraftError at dspark_collect_async.
+                self.dspark_calls += 1
+                c = Completion()
+                c.cmp_type = CMP_ERROR
+                c.cmd_seq = cmd.cmd_seq
+                c.gpu_idx = 0
+                c.status = 1
+                c.payload.error.error_category = 2
+                c.payload.error.message = (
+                    b"dspark run_step: draft context invalidated (scripted)")
+                self._held_dspark = bytes(c)
+                return
             if (self.dspark_fail_from is not None
                     and self.dspark_calls >= self.dspark_fail_from):
                 self.dspark_calls += 1
@@ -480,9 +696,14 @@ class FakeDaemon(threading.Thread):
                 tok = f(tok)
                 ids[k] = tok if k != wrong_at else (tok + 1) % VOCAB
                 cf[k] = 0.9 if k != wrong_at else 0.15
-            self._done(cmd, host_buf_offset=SPEC_READBACK_OFF,
-                       data_bytes=4 * g * (2 if self.conf_enabled else 1),
-                       top1_prob=0.9, entropy=0.1)
+            c = self._build_done(
+                cmd, host_buf_offset=SPEC_READBACK_OFF,
+                data_bytes=4 * g * (2 if self.conf_enabled else 1),
+                top1_prob=0.9, entropy=0.1)
+            if hold:
+                self._held_dspark = bytes(c)   # in flight until release
+            else:
+                self._write_cmp(c)
         else:
             self.errors.append(f"unknown cmd_type 0x{t:x}")
 
@@ -566,6 +787,26 @@ def test_far_fused_lossless_chain(route_arm, far_burst):
         _finish(daemon)
 
 
+def test_truncated_fork_carries_prefix_len():
+    # R4a: a truncating fork rides the generic ring path and the engine
+    # sees the prefix; full forks (default and fastbridge hot path) carry
+    # prefix_len == 0 — the legacy wire shape.
+    bridge, daemon, _ = _make()
+    try:
+        bridge.create_sequence(1, 64)
+        bridge.fork_sequence(1, 2, prefix_len=48)
+        assert daemon.forks == 1 and daemon.frozen_forks == 0
+        assert daemon.last_fork_prefix == 48
+        bridge.fork_sequence(1, 3)
+        assert daemon.forks == 2
+        assert daemon.last_fork_prefix == 0
+        bridge.fork_sequence(1, 4, frozen=True, prefix_len=32)
+        assert daemon.frozen_forks == 1
+        assert daemon.last_fork_prefix == 32
+    finally:
+        _finish(daemon)
+
+
 def test_conf_truncation_and_fallback():
     bridge, daemon, _ = _make(conf_enabled=True, gamma=5)
     try:
@@ -603,6 +844,46 @@ def test_lru_victim_map_chain_neutral():
                                    gamma=5, vb="batched")
         assert out[:40] == chain(4321, 40)
         assert all(len(l.resident) <= l.capacity for l in lrus)
+    finally:
+        _finish(daemon)
+
+
+# ── TD-MOE-PROGRESSIVE-DEGRADED-SILENT: degraded finalize observability ────
+# A degraded progressive-MoE finalize (Completion.compute.moe_degraded=1)
+# must be COUNTED by the bridge, whatever wait() does with the completion —
+# the orchestrator turns the monotonic counter into a per-request stat.
+
+
+def _drive_degraded_counter(bridge, daemon) -> None:
+    daemon.degrade_moe_remaining = 3
+    st = SpecStats()
+    out = run_speculative_loop(bridge, 1, 20, 4321, None, st,
+                               gamma=5, vb="batched", overlap=False)
+    assert out[:20] == chain(4321, 20)
+    assert bridge.moe_degraded_layers == 3, (
+        f"degraded finalizes not counted: {bridge.moe_degraded_layers}")
+    # Healthy follow-up run: the monotonic counter must NOT advance.
+    out2 = run_speculative_loop(bridge, 2, 20, 999, None, SpecStats(),
+                                gamma=5, vb="batched", overlap=False)
+    assert out2[:20] == chain(999, 20)
+    assert bridge.moe_degraded_layers == 3, "healthy run advanced the counter"
+
+
+def test_moe_degraded_counter():
+    bridge, daemon, _ = _make(gamma=5)
+    try:
+        _drive_degraded_counter(bridge, daemon)
+    finally:
+        _finish(daemon)
+
+
+@pytest.mark.skipif(not ring_bridge.fastbridge_active(),
+                    reason="_fastbridge not built")
+def test_moe_degraded_counter_pure_ctypes(monkeypatch):
+    monkeypatch.setattr(ring_bridge, "_fb", None)
+    bridge, daemon, _ = _make(gamma=5)
+    try:
+        _drive_degraded_counter(bridge, daemon)
     finally:
         _finish(daemon)
 
@@ -734,3 +1015,78 @@ def test_is_pool_exhaustion_matches_category_and_substring():
     # Neither: not retryable.
     assert not is_pool_exhaustion(BridgeError(truncated, category=2))
     assert not is_pool_exhaustion(BridgeError("dispatch exception"))
+
+
+def test_free_sequence_under_pending_async_draft_stashes_completion():
+    """TD-SPEC-ROUND-POOL-EVICT bridge validation: a SEQ_FREE issued while
+    an async dspark draft is IN FLIGHT (the mid-round holder eviction) must
+    neither consume nor drop the draft's completion.  The scripted daemon
+    releases the held draft completion INSIDE the free's wait — before the
+    CMP_SEQ_OP_DONE — so wait() must stash it and dspark_collect_async must
+    return it intact afterwards."""
+    gamma = 4
+    bridge, daemon, _ = _make(gamma=gamma)
+    try:
+        bridge.create_sequence(1, 8)
+        bridge.create_sequence(2, 8)             # the "holder"
+        daemon.spec_round_exhaust_at_call = 0    # hold the first draft
+        bridge.dspark_send_async(1, 4321, 0, gamma)
+        # The eviction shape: free the holder while the draft is pending.
+        bridge.free_sequence(2)
+        assert daemon.held_dspark_releases == 1
+        assert daemon.seq_frees == 1
+        ids, _ = bridge.dspark_collect_async(gamma, False)
+        # FakeDaemon draft for call 0: wrong_at=0, chain elsewhere.
+        t = f(4321)
+        want = [(t + 1) % VOCAB]
+        for _k in range(gamma - 1):
+            t = f(t)
+            want.append(t)
+        assert ids == want, "stashed draft completion corrupted"
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_free_sequence_under_pending_draft_stashes_draft_error():
+    """Same interleave, draft-side FAILURE arm: the draft's CMP_ERROR
+    arriving inside the free's wait is stashed (never raised at the free,
+    never lost) and surfaces as DsparkDraftError at the round's collect —
+    the spec->plain fallback trigger (INV-SERVE-SPEC-FALLBACK)."""
+    from bridge.ring_bridge import DsparkDraftError
+    gamma = 4
+    bridge, daemon, _ = _make(gamma=gamma)
+    try:
+        bridge.create_sequence(1, 8)
+        bridge.create_sequence(2, 8)
+        daemon.spec_round_exhaust_at_call = 0
+        daemon.spec_round_draft_error = True
+        bridge.dspark_send_async(1, 4321, 0, gamma)
+        bridge.free_sequence(2)                  # must NOT raise
+        assert daemon.held_dspark_releases == 1
+        try:
+            bridge.dspark_collect_async(gamma, False)
+            raise AssertionError("stashed draft error was not surfaced")
+        except DsparkDraftError as e:
+            assert "draft context invalidated" in str(e)
+        assert not daemon.errors, daemon.errors
+    finally:
+        _finish(daemon)
+
+
+def test_mtp_project_payload_layout():
+    """P-29 step 11: the Python ctypes mirror of ipc::Command.mtp_project must
+    match the C++ 12-byte layout exactly — prev_src rides the former
+    _pad[0] byte, so a drift here silently feeds prev_src=0 (attn_buf
+    trunk hidden) instead of the head-normed hidden the probe measures
+    against. Negative control: the struct must NOT have grown."""
+    import ctypes
+    from orchestrator.shm_protocol import MtpProjectPayload
+    assert ctypes.sizeof(MtpProjectPayload) == 12
+    offs = {f[0]: getattr(MtpProjectPayload, f[0]).offset
+            for f in MtpProjectPayload._fields_}
+    assert offs["mtp_layer_idx"] == 0
+    assert offs["input_token_id"] == 4
+    assert offs["step_idx"] == 8
+    assert offs["hidden_row"] == 9
+    assert offs["prev_src"] == 10

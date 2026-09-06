@@ -88,6 +88,9 @@ class DsparkRuntime;  // DSP-3
 
 namespace layerstorm::daemon {
 
+// 44z stage 4: KV <-> expert zone rebalancer (daemon/expert_zone_rebalancer.h).
+class ExpertZoneRebalancer;
+
 // ── Backend overrides for testability ───────────────────────────────────────
 
 /// Groups all pluggable backends.  Production code uses default_backends();
@@ -223,6 +226,10 @@ private:
     // Built from the file's per-projection k-quant types (pre-scanned at init);
     // quant_ points at this when weights == gguf (generic). nullopt otherwise.
     std::optional<model::GgufQuantInterface> owned_gguf_quant_;
+    // GF3.15 (TD-AUTOCONFIG-PINNED-BYTES-UPPER-BOUND): the checkpoint's real
+    // per-tensor GGUF widths for the NON-expert tensors, from a header pre-scan
+    // at init. Owned here because LayerRegistry only borrows it.
+    std::optional<model::GgufNonExpertWidths> owned_gguf_widths_;
     std::unique_ptr<model::LayerRegistry> layer_registry_;
 
     // ── Memory (steps 5-10) ──
@@ -268,6 +275,19 @@ private:
         // load_weights) before registering.
         std::atomic<bool> start_register{false};
         std::thread thread;
+        // GF3.15: a ctor unwind (init_modules throw after the early-arena
+        // worker launched) must NOT std::terminate on the joinable worker —
+        // that masks the real boot exception as 'terminate called without
+        // an active exception' (seen live on the first glm5_next
+        // live-prepack boot). Release the register gate the worker may be
+        // spinning on, then join; shutdown() does the same on the normal
+        // path (this dtor is its unwind-safety mirror).
+        ~ArenaEarlyState() {
+            if (thread.joinable()) {
+                start_register.store(true, std::memory_order_release);
+                thread.join();
+            }
+        }
     };
     ArenaEarlyState arena_early_;
     void launch_arena_attach_early_();
@@ -432,6 +452,12 @@ private:
     std::unique_ptr<ExpertLifecycleManager> elm_;
 
     // ── Daemon thread ──
+    // 44z (LS_KV_EXPERT_REBALANCE, default OFF): trades contiguous kMain slab
+    // runs between the KV pool and the expert cache. Declared BEFORE the
+    // dispatcher and the loop so it is destroyed AFTER them — both hold
+    // callbacks into it (the dispatcher's pool-pressure seam, the loop's
+    // background hook).
+    std::unique_ptr<ExpertZoneRebalancer> expert_zone_rebalancer_;
     std::unique_ptr<ipc::CommandRing>    cmd_ring_;
     std::unique_ptr<ipc::CompletionRing> cmp_ring_;
     std::unique_ptr<CommandDispatcher>   command_dispatcher_;

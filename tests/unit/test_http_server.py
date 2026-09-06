@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import pathlib
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1181,6 +1183,329 @@ _LP_STEPS = [
     _step_lp(101, -0.2, [(101, -0.2), (7, -1.5)]),
     _step_lp(102, -0.3, [(102, -0.3), (7, -1.1)]),
 ]
+
+
+# ---------------------------------------------------------------------------
+# glm5_next serving mode (GF3.13): thinking always on (loud 400 on
+# thinking-off requests), reasoning_effort low/high/max normalization,
+# clear_thinking chat default true, generation_config sampling defaults.
+# ---------------------------------------------------------------------------
+
+GLM5_THINK_START = 92
+GLM5_THINK_END = 93
+
+_GLM5_VOCAB = {
+    GLM5_THINK_START: "<think>",
+    GLM5_THINK_END: "</think>",
+    40: "Pondering.",
+    46: "The answer.",
+    47: "<tool_call>get_weather"
+        "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+}
+
+# Template pre-seeds <think>, so output begins mid-reasoning (no start
+# marker) exactly like GLM-5.2.
+_GLM5_REASONING_TOKENS = [40, GLM5_THINK_END, 46, 2]
+_GLM5_TOOL_TOKENS = [40, GLM5_THINK_END, 47, 2]
+
+
+def _glm5_tokenizer():
+    tok = MagicMock()
+    tok.encode.return_value = [10, 20, 30]
+    tok.decode.side_effect = (
+        lambda ids: "".join(_GLM5_VOCAB.get(t, "") for t in ids))
+    return tok
+
+
+def _glm5_metadata(eos: tuple[int, ...] = (2,)) -> EngineMetadata:
+    return EngineMetadata(
+        num_gpus=1, num_moe_layers=4, num_experts=8, num_layers=6,
+        expert_bytes=2_359_296, kv_bytes_per_page=4096,
+        gpus=(GpuConfig(position=0, gpu_type="rtx5090", is_tp=True,
+                        vram_bytes=32 * 1024**3),),
+        eos_token_ids=eos,
+        think_start_token_id=GLM5_THINK_START,
+        think_end_token_id=GLM5_THINK_END,
+    )
+
+
+def _make_glm5_server(
+    *,
+    token_ids: list[int],
+    tokenizer_mode: str = "glm5_next",
+    sampling_defaults: dict | None = None,
+) -> tuple[LayerStoRmServer, TestClient]:
+    server = LayerStoRmServer(
+        orchestrator=_mock_orchestrator(token_ids, "stop"),
+        tokenizer=_glm5_tokenizer(),
+        chat_template=_mock_chat_template(),
+        metadata=_glm5_metadata(),
+        model_name="test-model",
+        tool_call_parser="glm47",
+        enable_auto_tool_choice=True,
+        reasoning_parser="glm45",
+        tokenizer_mode=tokenizer_mode,
+        sampling_defaults=(
+            {"top_p": 0.95} if sampling_defaults is None
+            else sampling_defaults),
+    )
+    return server, TestClient(server.app)
+
+
+class TestGlm5NextServing:
+
+    def _chat(self, client, **overrides):
+        body = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+        }
+        body.update(overrides)
+        return client.post("/v1/chat/completions", json=body)
+
+    def test_thinking_always_on_default_split(self):
+        # The GLM-5.3 template pre-seeds <|assistant|><think> — an
+        # unspecified `thinking` must run the reasoning-first split
+        # (unlike deepseek_v4 mode, where thinking defaults OFF).
+        _, client = _make_glm5_server(token_ids=_GLM5_REASONING_TOKENS)
+        resp = self._chat(client)
+        assert resp.status_code == 200, resp.text
+        msg = resp.json()["choices"][0]["message"]
+        assert msg["reasoning_content"] == "Pondering."
+        assert msg["content"] == "The answer."
+
+    def test_thinking_false_is_rejected_loudly(self):
+        # No thinking-off control exists in the template; honoring the
+        # flag silently would misroute all reasoning into content.
+        _, client = _make_glm5_server(token_ids=_GLM5_REASONING_TOKENS)
+        for override in ({"thinking": False}, {"enable_thinking": False}):
+            resp = self._chat(client, **override)
+            assert resp.status_code == 400, resp.text
+            assert "cannot be disabled" in resp.json()["error"]["message"]
+
+    def test_reasoning_effort_none_is_rejected(self):
+        _, client = _make_glm5_server(token_ids=_GLM5_REASONING_TOKENS)
+        resp = self._chat(client, reasoning_effort="none")
+        assert resp.status_code == 400
+        assert resp.json()["error"]["param"] == "reasoning_effort"
+
+    def test_reasoning_effort_unknown_is_rejected(self):
+        # The template would silently coerce junk to Max — the serving
+        # layer 400s instead (loud, never silent).
+        _, client = _make_glm5_server(token_ids=_GLM5_REASONING_TOKENS)
+        resp = self._chat(client, reasoning_effort="ultra")
+        assert resp.status_code == 400
+        assert resp.json()["error"]["param"] == "reasoning_effort"
+
+    def test_render_kwargs_defaults(self):
+        # Chat default: clear_thinking True (template default is false,
+        # but API clients do not echo reasoning_content back — GF3.13);
+        # reasoning_effort omitted so the template's own max default
+        # applies; no `thinking` kwarg (the template has no such var).
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        self._chat(client)
+        kwargs = server._chat_template.render.call_args[1]
+        assert kwargs["clear_thinking"] is True
+        assert "reasoning_effort" not in kwargs
+        assert "thinking" not in kwargs
+
+    def test_render_kwargs_effort_normalization(self):
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        for sent, rendered in (("minimal", "low"), ("low", "low"),
+                               ("medium", "high"), ("high", "high"),
+                               ("max", "max"), ("xhigh", "max")):
+            self._chat(client, reasoning_effort=sent)
+            kwargs = server._chat_template.render.call_args[1]
+            assert kwargs["reasoning_effort"] == rendered, sent
+
+    def test_render_kwargs_clear_thinking_override(self):
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        self._chat(client, clear_thinking=False)
+        kwargs = server._chat_template.render.call_args[1]
+        assert kwargs["clear_thinking"] is False
+
+    def test_glm47_tool_call_parsed(self):
+        _, client = _make_glm5_server(token_ids=_GLM5_TOOL_TOKENS)
+        resp = self._chat(client, tools=_WEATHER_TOOLS)
+        assert resp.status_code == 200, resp.text
+        choice = resp.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        msg = choice["message"]
+        assert msg["reasoning_content"] == "Pondering."
+        (tc,) = msg["tool_calls"]
+        assert tc["function"]["name"] == "get_weather"
+        assert json.loads(tc["function"]["arguments"]) == {"city": "Paris"}
+
+    # -- sampling defaults (generation_config.json → top_p 0.95) --------
+
+    def _submitted_sampling(self, server):
+        req = server._orchestrator.submit_request.call_args[0][0]
+        return req.sampling
+
+    def test_sampling_default_top_p_on_explicit_sampling(self):
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        self._chat(client, temperature=0.7)
+        sp = self._submitted_sampling(server)
+        assert sp.temperature == pytest.approx(0.7)
+        assert sp.top_p == pytest.approx(0.95)
+
+    def test_sampling_explicit_top_p_wins(self):
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        self._chat(client, temperature=0.7, top_p=0.5)
+        sp = self._submitted_sampling(server)
+        assert sp.top_p == pytest.approx(0.5)
+
+    def test_sampling_unspecified_temperature_stays_greedy(self):
+        # The greedy-champion routing of UNSPECIFIED temperature is
+        # untouched by the defaults — and greedy requests get no top_p
+        # default either.
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS)
+        self._chat(client)
+        sp = self._submitted_sampling(server)
+        assert sp.temperature == 0.0
+        assert sp.top_p == pytest.approx(1.0)
+
+    def test_no_defaults_dict_is_byte_identical(self):
+        # Every other tokenizer mode boots with no sampling_defaults —
+        # explicit sampling there keeps the OpenAI top_p default 1.0.
+        server, client = _make_glm5_server(
+            token_ids=_GLM5_REASONING_TOKENS, sampling_defaults={})
+        self._chat(client, temperature=0.7)
+        sp = self._submitted_sampling(server)
+        assert sp.top_p == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# glm5_next end-to-end serve smoke (GF3.13): REAL chat template + REAL
+# HF tokenizer + real glm45/glm47 parsers over the full HTTP round trip —
+# everything but the engine (scripted orchestrator), so it runs without
+# evicting a warm store.
+# ---------------------------------------------------------------------------
+
+_GLM53_DIR = (pathlib.Path(__file__).resolve().parent.parent.parent
+              / "test-data" / "GLM-5.3-Flash")
+
+
+@pytest.mark.skipif(not _GLM53_DIR.is_dir(),
+                    reason="GLM-5.3-Flash test data absent")
+class TestGlm5NextServeSmoke:
+
+    @pytest.fixture(scope="class")
+    def wrapper(self):
+        pytest.importorskip("transformers")
+        from tokenizer.tokenizer_wrapper import TokenizerWrapper
+        return TokenizerWrapper(str(_GLM53_DIR))
+
+    @pytest.fixture(scope="class")
+    def renderer(self):
+        from tokenizer.chat_template import ChatTemplateRenderer
+        return ChatTemplateRenderer(_GLM53_DIR)
+
+    def _server(self, wrapper, renderer, answer_text):
+        answer_ids = wrapper.encode(answer_text) + [154820]  # <|endoftext|>
+        meta = _glm5_metadata(eos=wrapper.eos_token_ids)
+        meta = dataclasses.replace(
+            meta,
+            think_start_token_id=wrapper.think_start_token_id,
+            think_end_token_id=wrapper.think_end_token_id,
+        )
+        server = LayerStoRmServer(
+            orchestrator=_mock_orchestrator(answer_ids, "stop"),
+            tokenizer=wrapper,
+            chat_template=renderer,
+            metadata=meta,
+            model_name="glm-5.3-flash",
+            tool_call_parser="glm47",
+            enable_auto_tool_choice=True,
+            reasoning_parser="glm45",
+            tokenizer_mode="glm5_next",
+            sampling_defaults={"top_p": 0.95},
+        )
+        return server, TestClient(server.app)
+
+    def test_detected_stops_and_think_ids(self, wrapper):
+        # The <|user|>-class stop set and the think markers, from the
+        # real tokenizer directory (config.json text_config +
+        # tokenizer.json added_tokens).
+        assert wrapper.eos_token_ids == (154820, 154827, 154829)
+        assert wrapper.think_start_token_id == 154841
+        assert wrapper.think_end_token_id == 154842
+        # len(tokenizer) counts real entries (154856); the model's padded
+        # embedding width 154880 comes from config vocab_size, which WINS
+        # in the serving metadata chain (TD-VOCAB-AUTODETECT: engine
+        # metadata > config > tokenizer-as-last-resort).
+        assert wrapper.vocab_size == 154856
+
+    def test_reasoning_round_trip(self, wrapper, renderer):
+        server, client = self._server(
+            wrapper, renderer, "Pondering deeply.</think>The answer.")
+        resp = client.post("/v1/chat/completions", json={
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "why?"}],
+        })
+        assert resp.status_code == 200, resp.text
+        msg = resp.json()["choices"][0]["message"]
+        assert msg["reasoning_content"] == "Pondering deeply."
+        assert msg["content"] == "The answer."
+
+    def test_prompt_rendered_by_real_template(self, wrapper, renderer,
+                                              monkeypatch):
+        server, client = self._server(
+            wrapper, renderer, "R.</think>ok")
+        captured = {}
+        real_encode = wrapper.encode
+
+        def spy_encode(text):
+            captured["prompt"] = text
+            return real_encode(text)
+
+        monkeypatch.setattr(wrapper, "encode", spy_encode)
+        client.post("/v1/chat/completions", json={
+            "model": "glm-5.3-flash",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "x",
+                 "reasoning_content": "old thoughts"},
+                {"role": "user", "content": "b"},
+            ],
+            "reasoning_effort": "minimal",
+        })
+        prompt = captured["prompt"]
+        assert prompt.startswith("[gMASK]<sop>")
+        # minimal → low → the template renders "Reasoning Effort: Low".
+        assert "<|system|>Reasoning Effort: Low" in prompt
+        # clear_thinking chat default TRUE: the PRIOR turn's reasoning is
+        # dropped on re-render (the R3-measured GLM seam, deterministic).
+        assert "old thoughts" not in prompt
+        assert "<think></think>" in prompt
+        # Generation prompt: thinking unconditionally pre-seeded.
+        assert prompt.rstrip().endswith("<|assistant|><think>")
+
+    def test_tool_call_round_trip(self, wrapper, renderer):
+        server, client = self._server(
+            wrapper, renderer,
+            "Need the weather.</think>"
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            "</tool_call>")
+        resp = client.post("/v1/chat/completions", json={
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": _WEATHER_TOOLS,
+        })
+        assert resp.status_code == 200, resp.text
+        choice = resp.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        msg = choice["message"]
+        assert msg["reasoning_content"] == "Need the weather."
+        (tc,) = msg["tool_calls"]
+        assert tc["function"]["name"] == "get_weather"
+        assert json.loads(tc["function"]["arguments"]) == {"city": "Paris"}
 
 
 class TestCompletionLogprobs:

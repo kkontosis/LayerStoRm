@@ -66,6 +66,13 @@ private:
     void publish_transfers(ipc::StateSnapshot& snap, StateTransaction& tx);
 
     Deps deps_;
+    /// P-29 step 21 (TD-STATE-PUBLISH-DEAD-EXPERT-STATS): the expert-stats
+    /// group is published once as zeros while the feed is dead (the only
+    /// ExpertStats::update() site is behind the opt-in LS_FEED_EXPERTSTATS),
+    /// then skipped — the old per-cycle rewrite walked 42x320x4 accessor
+    /// calls on the dispatch thread every 5 ms to overwrite zeros with
+    /// zeros. Shm-byte-identical: readers see the same zero bytes.
+    bool expert_stats_zeroed_  = false;
     uint32_t num_moe_layers_   = 0;
     uint32_t num_experts_      = 0;
     uint32_t first_moe_layer_  = 0;

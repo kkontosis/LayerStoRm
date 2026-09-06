@@ -40,6 +40,7 @@
 #include "daemon/dispatch_detail.h"
 #include "daemon/moe/arch_mla_moe.h"
 #include "daemon/moe/arch_deepseek_v4_moe.h"
+#include "daemon/moe/moe_internal.h"  // 44z: TD-91d zero-fill guard counters
 #include "daemon/moe/quant_routes.h"
 
 #include <algorithm>
@@ -94,15 +95,13 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
     const int expanded_tokens = num_tokens * topk;
 
     // MoE by-model split (moe/arch_base.h): the chunked sibling reuses the
-    // SAME MoeArch hooks as the single-shot driver (INV-MOE-ARCH); selection
-    // and lazy construction mirror dispatch_moe_internal.
-    const bool is_v4 =
-        mc.architecture == config::Architecture::deepseek_v4;
-    if (!moe_arch_mla_) {
-        moe_arch_mla_ = std::make_unique<ArchMlaMoe>(*this);
-        moe_arch_v4_  = std::make_unique<ArchDeepseekV4Moe>(*this);
-    }
-    MoeArch& arch = is_v4 ? *moe_arch_v4_ : *moe_arch_mla_;
+    // SAME MoeArch hooks as the single-shot driver (INV-MOE-ARCH) via the
+    // SHARED capability predicate (select_moe_arch, moe_driver.cpp).
+    // TD-MOE-BIG-GLM5NEXT-MHC-POST: a local re-derivation here once dropped
+    // the `|| hc_streams > 1` clause, so a chunked glm5_next (hc_mult 4)
+    // batch ran launch_mhc_pre inline but routed hc_post through the plain
+    // residual add — the ~8x residual inflation the driver warns about.
+    MoeArch& arch = select_moe_arch();
 
     // Chunk size: per-command override (E_CMD_FETCH_AND_RUN_MOE_BIG
     // chunk_tokens), clamped to the transient scratch bound.
@@ -262,17 +261,25 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                 const int len = std::min(chunk, num_tokens - off);
                 const void* a_in = row_ptr(norm_input, off);
 
-                const int32_t d_offsets[2] = {0, len};
-                gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets,
-                                          d_offsets, 2 * sizeof(int32_t), stream);
-                const int32_t d_gu_ps[3] = {len, 2 * I_dense_local, hidden};
-                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_gu_ps,
-                                          3 * sizeof(int32_t), stream);
-                const int32_t d_gu_sf[2] = {0, ((len + 127) / 128) * 128};
-                gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, d_gu_sf,
-                                          2 * sizeof(int32_t), stream);
+                // MPOKE (see moe_driver dense site): {0,len} offsets cached
+                // behind a fingerprint; GGUF-dead meta skipped outright.
+                const bool meta_cache = moe_meta_cache_enabled();
+                if (!meta_cache || scratch.shared_offsets_last_b != len) {
+                    const int32_t d_offsets[2] = {0, len};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets,
+                                              d_offsets, 2 * sizeof(int32_t), stream);
+                    scratch.shared_offsets_last_b = len;
+                }
+                if (!meta_cache || !use_gguf) {
+                    const int32_t d_gu_ps[3] = {len, 2 * I_dense_local, hidden};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_gu_ps,
+                                              3 * sizeof(int32_t), stream);
+                    const int32_t d_gu_sf[2] = {0, ((len + 127) / 128) * 128};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets, d_gu_sf,
+                                              2 * sizeof(int32_t), stream);
+                }
 
-                if (!use_fp8 && scratch.nvfp4_alpha) {
+                if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                     gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                               &dw->alpha, sizeof(float), stream);
                     gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -302,6 +309,11 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                     gu.strategy = gguf_strategy;
                     gu.gate_up_weight = dw->gate_up;
                     gu.single_b_ptr = scratch.gguf_single_b_ptr;
+                    if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                        gu.bind_cache = GgufBindCache{scratch.gguf_layer_b_ptrs,
+                                         scratch.gguf_layer_b_host.data(),
+                                         static_cast<int>(mp.layer_idx)};
+                    }
                     gu.expert_offsets =
                         static_cast<const int32_t*>(scratch.shared_expert_offsets);
                     gu.dev = dev;
@@ -328,10 +340,12 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                               scratch.gate_up_output, len, I_dense_local, stream,
                               static_cast<float>(mc.swiglu_limit));
 
-                const int32_t d_dn_ps[3] = {len, hidden, I_dense_local};
-                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_dn_ps,
-                                          3 * sizeof(int32_t), stream);
-                if (!use_fp8 && scratch.nvfp4_alpha) {
+                if (!meta_cache || !use_gguf) {
+                    const int32_t d_dn_ps[3] = {len, hidden, I_dense_local};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes, d_dn_ps,
+                                              3 * sizeof(int32_t), stream);
+                }
+                if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                     gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                               &dw->alpha_down, sizeof(float),
                                               stream);
@@ -347,9 +361,20 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                         len, 1, gpu_dev, stream,
                         use_fp8 ? nullptr : scratch.moe_input_scales});
                 }
+                const void** dense_down_bptrs = nullptr;
                 if (use_gguf) {
-                    gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr,
-                                              &dw->down, sizeof(void*), stream);
+                    if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                        dense_down_bptrs = bind_gguf_b_slot(
+                            gpu_dev,
+                            GgufBindCache{scratch.gguf_layer_b_ptrs,
+                             scratch.gguf_layer_b_host.data(), static_cast<int>(mp.layer_idx)},
+                            /*slot=*/2, dw->down, stream);
+                    } else {
+                        gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr,
+                                                  &dw->down, sizeof(void*), stream);
+                        dense_down_bptrs =
+                            static_cast<const void**>(scratch.gguf_single_b_ptr);
+                    }
                 }
                 {
                     GroupedGemmArgs gargs{use_fp8, 1, hidden, I_dense_local,
@@ -367,8 +392,7 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                         gargs.gguf_type = to_gguf_compute(dw->down_gguf_type);
                         gargs.gguf_strategy = gguf_strategy;
                         gargs.gguf_total_tokens = len;
-                        gargs.B_ptrs =
-                            static_cast<const void**>(scratch.gguf_single_b_ptr);
+                        gargs.B_ptrs = dense_down_bptrs;
                     }
                     launch_grouped_gemm(gargs);
                 }
@@ -382,7 +406,8 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
         // INV-MOE-BIG-4: the (allreduced) dense FFN output is in moe_output.
         // V4-5b mHC: the residual update is hc_post (extras skip) —
         // ArchDeepseekV4Moe::residual_update; base arch: plain residual add.
-        arch.residual_update(gpu, hidden_input, scratch.moe_output,
+        arch.residual_update(static_cast<int>(mp.layer_idx), gpu,
+                             hidden_input, scratch.moe_output,
                              num_tokens, hidden, pair_idx, stream);
         if (pair_idx >= 0) {
             deps_.hidden_state_pairs[pair_idx].commit(
@@ -486,7 +511,7 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
     // Gating (batch-level, persistent buffers): precomputed (F-2) or self-gate.
     bool router_valid = false;
     if (mp.use_precomputed_gating) {
-        const int num_layers = mc.num_hidden_layers;
+        const int num_layers = moe_layer_bound(mc);  // P-29 step 11: incl. probe MTP
         router_valid = static_cast<int>(mp.layer_idx) >= first_k_dense
                     && static_cast<int>(mp.layer_idx) < num_layers;
     } else {
@@ -505,7 +530,7 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
             }
         }
         if (!router_valid) {
-            const int num_layers = mc.num_hidden_layers;
+            const int num_layers = moe_layer_bound(mc);  // P-29 step 11
             const bool is_real_moe_layer =
                 static_cast<int>(mp.layer_idx) >= first_k_dense
                 && static_cast<int>(mp.layer_idx) < num_layers;
@@ -562,7 +587,11 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
             }
             deps_.stream_manager->destroy_event(sync_event, static_cast<int>(gpu));
             if (d2h_ok) {
-                uint8_t seen_missing[32] = {};
+                // TD-GLM5N-ROUTED-EXPERT-ID-TRUNCATION audit: was [32]
+                // (256 bits) — expert ids 256+ read/wrote past the array on
+                // the stack. Sized by the boot-enforced IPC cap
+                // (n_experts <= ipc::kMaxExperts); lockstep with moe_driver.
+                uint8_t seen_missing[ipc::kMaxExperts / 8] = {};
                 uint8_t miss_count = 0;
                 for (int i = 0; i < num_tokens * topk; ++i) {
                     const int e = indices_host[i];
@@ -603,6 +632,7 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
         std::vector<const void*> b_down(n_experts), sb_down(n_experts);
         auto fill = [&](std::vector<const void*>& b, std::vector<const void*>& sb,
                         auto off_fn, int64_t weight_bytes) {
+            int guard_fires = 0;  // 44z: TD-91d fires in THIS fill
             for (int e = 0; e < n_experts; ++e) {
                 const bool is_resident = (bitset[e / 8] >> (e % 8)) & 1;
                 const memory::CacheEntry* entry = nullptr;
@@ -614,6 +644,18 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                         : nullptr;
                 }
                 if (!entry || !entry->vram_address) {
+                    // 44z: this one branch used to conflate two very different
+                    // things — the ORDINARY exclusion of a non-resident expert
+                    // (routing asked for it, it never arrived; already counted
+                    // as a miss) and the TD-91d GUARD FIRE (the bitset said
+                    // resident, so the dispatch was built expecting real
+                    // weights, but the entry is gone — evicted/reclaimed
+                    // between the bitset snapshot and this lookup). Only the
+                    // latter is silent loss, so only it is counted here.
+                    if (is_resident)
+                        zone_guard_zero_fill_hit(mp.layer_idx, e,
+                                                 static_cast<int>(gpu),
+                                                 guard_fires);
                     b[e]  = scratch.zero_weight_buf;
                     sb[e] = scratch.zero_weight_buf;
                     continue;
@@ -623,6 +665,8 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                 b[e]  = base + off;
                 sb[e] = base + off + weight_bytes;
             }
+            zone_guard_zero_fill_fill_done(mp.layer_idx, static_cast<int>(gpu),
+                                           guard_fires);
         };
         fill(b_gate, sb_gate, gate_off_fn, deps_.expert_cache->gate_weight_bytes());
         fill(b_up,   sb_up,   up_off_fn,   deps_.expert_cache->up_weight_bytes());
@@ -955,19 +999,27 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                     continue;
                 }
 
-                const int32_t offsets[2] = {0, len};
-                gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets,
-                                          offsets, 2 * sizeof(int32_t), stream);
-                const int32_t shared_gu_ps[3] =
-                    {len, 2 * intermediate_local, hidden};
-                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes,
-                                          shared_gu_ps, 3 * sizeof(int32_t),
-                                          stream);
-                const int32_t shared_gu_sf[2] = {0, ((len + 127) / 128) * 128};
-                gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets,
-                                          shared_gu_sf, 2 * sizeof(int32_t),
-                                          stream);
-                if (!use_fp8 && scratch.nvfp4_alpha) {
+                // MPOKE (see moe_driver shared site): fingerprint-cached
+                // offsets; GGUF-dead meta skipped outright.
+                const bool meta_cache = moe_meta_cache_enabled();
+                if (!meta_cache || scratch.shared_offsets_last_b != len) {
+                    const int32_t offsets[2] = {0, len};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_expert_offsets,
+                                              offsets, 2 * sizeof(int32_t), stream);
+                    scratch.shared_offsets_last_b = len;
+                }
+                if (!meta_cache || !use_gguf) {
+                    const int32_t shared_gu_ps[3] =
+                        {len, 2 * intermediate_local, hidden};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes,
+                                              shared_gu_ps, 3 * sizeof(int32_t),
+                                              stream);
+                    const int32_t shared_gu_sf[2] = {0, ((len + 127) / 128) * 128};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_sf_offsets,
+                                              shared_gu_sf, 2 * sizeof(int32_t),
+                                              stream);
+                }
+                if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                     gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                               &se->alpha, sizeof(float), stream);
                     gpu_dev->memcpy_h2d_async(scratch.moe_input_scales,
@@ -998,6 +1050,11 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                     gu.strategy = gguf_strategy;
                     gu.gate_up_weight = se->gate_up;
                     gu.single_b_ptr = scratch.gguf_single_b_ptr;
+                    if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                        gu.bind_cache = GgufBindCache{scratch.gguf_layer_b_ptrs,
+                                         scratch.gguf_layer_b_host.data(),
+                                         static_cast<int>(mp.layer_idx)};
+                    }
                     gu.expert_offsets =
                         static_cast<const int32_t*>(scratch.shared_expert_offsets);
                     gu.dev = dev;
@@ -1025,12 +1082,14 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                               intermediate_local, stream,
                               static_cast<float>(mc.swiglu_limit));
                 // 7c: down GEMM → shared_expert_output rows.
-                const int32_t shared_dn_ps[3] =
-                    {len, hidden, intermediate_local};
-                gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes,
-                                          shared_dn_ps, 3 * sizeof(int32_t),
-                                          stream);
-                if (!use_fp8 && scratch.nvfp4_alpha) {
+                if (!meta_cache || !use_gguf) {
+                    const int32_t shared_dn_ps[3] =
+                        {len, hidden, intermediate_local};
+                    gpu_dev->memcpy_h2d_async(scratch.shared_problem_sizes,
+                                              shared_dn_ps, 3 * sizeof(int32_t),
+                                              stream);
+                }
+                if (!use_fp8 && scratch.nvfp4_alpha && (!meta_cache || !use_gguf)) {
                     gpu_dev->memcpy_h2d_async(scratch.nvfp4_alpha,
                                               &se->alpha_down, sizeof(float),
                                               stream);
@@ -1046,9 +1105,20 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                         len, 1, gpu_dev, stream,
                         use_fp8 ? nullptr : scratch.moe_input_scales});
                 }
+                const void** shared_down_bptrs = nullptr;
                 if (use_gguf) {
-                    gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr,
-                                              &se->down, sizeof(void*), stream);
+                    if (meta_cache && scratch.gguf_layer_b_ptrs) {
+                        shared_down_bptrs = bind_gguf_b_slot(
+                            gpu_dev,
+                            GgufBindCache{scratch.gguf_layer_b_ptrs,
+                             scratch.gguf_layer_b_host.data(), static_cast<int>(mp.layer_idx)},
+                            /*slot=*/2, se->down, stream);
+                    } else {
+                        gpu_dev->memcpy_h2d_async(scratch.gguf_single_b_ptr,
+                                                  &se->down, sizeof(void*), stream);
+                        shared_down_bptrs =
+                            static_cast<const void**>(scratch.gguf_single_b_ptr);
+                    }
                 }
                 {
                     GroupedGemmArgs gargs{use_fp8, 1, hidden, intermediate_local,
@@ -1066,8 +1136,7 @@ bool CommandDispatcher::dispatch_moe_chunked_internal(const InternalMoeParams& m
                         gargs.gguf_type = to_gguf_compute(se->down_gguf_type);
                         gargs.gguf_strategy = gguf_strategy;
                         gargs.gguf_total_tokens = len;
-                        gargs.B_ptrs =
-                            static_cast<const void**>(scratch.gguf_single_b_ptr);
+                        gargs.B_ptrs = shared_down_bptrs;
                     }
                     launch_grouped_gemm(gargs);
                 }
@@ -1103,7 +1172,8 @@ chunked_post_allreduce:
     // V4-5b mHC: the residual update is hc_post (extras skip) —
     // ArchDeepseekV4Moe::residual_update; base arch: plain residual add.
     if (hidden_input && moe_valid && scratch.moe_output) {
-        arch.residual_update(gpu, hidden_input, scratch.moe_output,
+        arch.residual_update(static_cast<int>(mp.layer_idx), gpu,
+                             hidden_input, scratch.moe_output,
                              num_tokens, hidden, pair_idx, stream);
     }
 

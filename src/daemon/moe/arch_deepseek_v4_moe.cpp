@@ -29,7 +29,11 @@ bool ArchDeepseekV4Moe::collapse_hidden(
     const void*& rms_src) {
     const auto& scratch = d_.moe_scratch_[gpu];
     const int layer = static_cast<int>(mp.layer_idx);
-    if (norm_w && d_.deps_.hc_streams > 1) {
+    // P-29 step 11: glm5_next MTP layers are non-mHC — single-stream input, no
+    // collapse (hc_streams_for_layer returns 1 for them, engine value else).
+    const int hc_layer = hc_streams_for_layer(
+        d_.deps_.hc_streams, d_.deps_.live_config->model, layer);
+    if (norm_w && hc_layer > 1) {
         if (!lw->hc_ffn_fn || !lw->hc_ffn_base || !lw->hc_ffn_scale ||
             !scratch.hc_x || !scratch.hc_post || !scratch.hc_comb) {
             spdlog::error("dispatch_moe: mHC active but hc_ffn weights/"
@@ -42,7 +46,7 @@ bool ArchDeepseekV4Moe::collapse_hidden(
             d_.deps_.live_config->model.rms_norm_eps,
             d_.deps_.live_config->model.hc_eps, 2.0f,
             d_.deps_.live_config->model.hc_sinkhorn_iters,
-            num_tokens, d_.deps_.hc_streams, hidden, stream);
+            num_tokens, hc_layer, hidden, stream);
         rms_src = scratch.hc_x;
     }
     return true;
@@ -154,21 +158,25 @@ bool ArchDeepseekV4Moe::try_shexp_raw_bf16(
 // mix), not an add. EP-xTP extras (pair_idx < 0) skip it — their local
 // result is never committed and they hold no residual streams. Non-mHC
 // configs fall back to the base plain residual add.
-void ArchDeepseekV4Moe::residual_update(uint32_t gpu, void* hidden_input,
-                                        void* add_src, int num_tokens,
-                                        int hidden, int pair_idx,
-                                        void* stream) {
-    if (d_.deps_.hc_streams > 1) {
+void ArchDeepseekV4Moe::residual_update(int layer_idx, uint32_t gpu,
+                                        void* hidden_input, void* add_src,
+                                        int num_tokens, int hidden,
+                                        int pair_idx, void* stream) {
+    // P-29 step 11: per-layer mHC — glm5_next MTP layers fall to the base plain
+    // residual add (they hold a single-stream residual, no hc_post/comb).
+    const int hc_layer = hc_streams_for_layer(
+        d_.deps_.hc_streams, d_.deps_.live_config->model, layer_idx);
+    if (hc_layer > 1) {
         if (pair_idx >= 0) {
             const auto& scratch = d_.moe_scratch_[gpu];
             compute::launch_mhc_post(
                 hidden_input, add_src, hidden_input,
                 scratch.hc_post, scratch.hc_comb,
-                num_tokens, d_.deps_.hc_streams, hidden, stream);
+                num_tokens, hc_layer, hidden, stream);
         }
     } else {
-        MoeArch::residual_update(gpu, hidden_input, add_src, num_tokens,
-                                 hidden, pair_idx, stream);
+        MoeArch::residual_update(layer_idx, gpu, hidden_input, add_src,
+                                 num_tokens, hidden, pair_idx, stream);
     }
 }
 

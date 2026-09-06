@@ -5,7 +5,14 @@
 //
 // Thin dispatch layer in layerstorm::compute that forwards to SnapMLA kernel
 // launch functions from deps/LayerStoRmKernels. Handles model-type dispatch
-// (V32 vs MODEL1) based on runtime parameters.
+// (V32 vs MODEL1 vs GLM5N) based on runtime parameters.
+//
+// GEOMETRIES (d_qk = d_nope + d_rope, d_v = the V width of a staged KV row):
+//   V32    576 = 512 nope + 64 rope, d_v 512  (GLM-5.2 / DeepSeek-V3.2)
+//   MODEL1 512 = 448 nope + 64 rope, d_v 448  (FlashMLA-inherited)
+//   GLM5N  512 = 512 nope +  0 rope, d_v 512  (GLM-5.3-Flash NoPE)
+// d_nope alone does NOT identify the model — V32 and GLM5N share d_nope 512 —
+// so every dispatch below keys on BOTH dims.
 //==============================================================================
 
 #include <cuda_runtime.h>
@@ -30,7 +37,8 @@ namespace layerstorm::compute {
 
 // ── Decode ──────────────────────────────────────────────────────────────────
 
-// Dense FP8 decode (SnapMLA, paged KV). Dispatches by d_nope: 512→V32, 448→MODEL1.
+// Dense FP8 decode (SnapMLA, paged KV). Dispatches by (d_qk, d_nope):
+// (576,512)→V32, (512,512)→GLM5N, (512,448)→MODEL1; anything else throws.
 void launch_decode_dense_fp8(const sm120::decode::dense_fp8::DenseAttnDecodeParams& params);
 
 // Sparse FP8 decode (SnapMLA with topk indices). Dispatches by params.model_type.
@@ -38,10 +46,15 @@ void launch_decode_sparse_fp8(const sm120::decode::sparse_fp8::SparseAttnDecodeP
 
 // ── Prefill ─────────────────────────────────────────────────────────────────
 
-// Dense absorbed BF16 prefill. Dispatches by d_qk: 576→V32, 512→MODEL1.
+// Dense absorbed BF16 prefill. Dispatches by (d_qk, d_v): 576→<576> (V32),
+// (512,512)→<512> (GLM5N NoPE); anything else throws.
+// NOTE: MLA decode routes through the prefill kernels at batch_size == 1 on the
+// SnapMLA backend, so this dispatch is DECODE-correctness-critical.
 void launch_prefill_dense(const sm120::prefill::dense::head64::DenseAttnFwdParams& params);
 
-// Sparse absorbed BF16 prefill. Dispatches by d_qk: 576→V32, 512→MODEL1.
+// Sparse absorbed BF16 prefill. Dispatches by d_qk: 576→<576> (V32),
+// 512→<512> (GLM5N NoPE, requires d_v == 512); anything else throws.
+// NOTE: DECODE-correctness-critical for the same reason as the dense twin.
 void launch_prefill_sparse(const SparseAttnFwdParams& params);
 
 // ── Prep kernels ────────────────────────────────────────────────────────────

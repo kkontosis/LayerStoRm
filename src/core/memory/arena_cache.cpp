@@ -85,7 +85,7 @@ uint64_t ArenaCache::hash_config(
         const std::vector<NodeIdentity>& nodes,
         const config::PinHostExpertPoolSizingConfig& sizing,
         const config::CrossNodeSpillConfig& spill,
-        uint64_t placement_id) {
+        uint64_t placement_id, uint64_t census_id) {
     uint64_t h = kFnvOffset;
     h = fnv1a_u64(slot_size_bytes, h);
     h = fnv1a_u64(scratch_bytes, h);
@@ -121,6 +121,13 @@ uint64_t ArenaCache::hash_config(
         static constexpr char kPlaceTag[] = "placement";
         h = fnv1a(kPlaceTag, sizeof(kPlaceTag) - 1, h);
         h = fnv1a_u64(placement_id, h);
+    }
+    // Extended MoE census (MTP experts armed): folded ONLY when active so
+    // every historical store keeps its exact hash (P-29 step 13 phase B).
+    if (census_id != 0) {
+        static constexpr char kCensusTag[] = "moe-census";
+        h = fnv1a(kCensusTag, sizeof(kCensusTag) - 1, h);
+        h = fnv1a_u64(census_id, h);
     }
     return h;
 }

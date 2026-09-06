@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "x-configFile": "kda_state.json",
+  "description": "KDA recurrent-state pool internal knobs (glm5_next; TD-KDA-STATE-MAPPED-SLABS). Loaded from kda_state.json if not inlined.",
+  "properties": {
+    "mapped": {
+      "type": "boolean",
+      "default": true,
+      "description": "Back the per-request KDA state with per-(request, linear-layer) contiguous whole-slab runs MAPPED over the shared kv_main slab region instead of a dedicated boot-time carve. DEFAULT ON since 2026-08-31 (user-approved promotion, TD-KDA-STATE-MAPPED-SLABS: measured at parity — kernel +<1% in-noise, wall/prefill parity, cross-mode checkpoints byte-identical — while the former ~1.4-5.7 GiB carve becomes demand-sized SHARED capacity). The kernels' base + slot * stride contract is kept (stride becomes slab_bytes; per-launch slot tables carry per-layer run-start slab ids); both paths are bit-identical in state and output. Set false (or LS_KDA_STATE_MAPPED=0, which overrides either way; '1' enables) to fall back to the dedicated carve — the off-path SURVIVES so the A/B stays re-runnable after any kernel change. Unslabbed models (no indexer pool) have no slab region and fall back to the carve automatically with a boot warning. Engine-side, read at VRAM sizing."
+    }
+  },
+  "additionalProperties": false
+}

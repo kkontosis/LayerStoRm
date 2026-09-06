@@ -13,6 +13,13 @@ class ArchMla final : public AttentionArch {
 public:
     explicit ArchMla(CommandDispatcher& d) : AttentionArch(d) {}
 
+    /// MLA/DSA per-sequence state is position-addressed but append-only
+    /// per position (paged kMain KV, paged indexer-K groups, tiering cold
+    /// slots) -- a prefix [0, N) survives the frontier advancing, so a
+    /// truncating fork can reconstruct any interior N.  No in-place
+    /// pos%capacity rings.
+    bool lossy_position_indexed_state() const override { return false; }
+
     /// MLA has no arch shape restriction — batch cap is the plain
     /// max_batch_size bound.
     bool validate_shape(const CommandDispatcher::InternalAttentionParams& p,

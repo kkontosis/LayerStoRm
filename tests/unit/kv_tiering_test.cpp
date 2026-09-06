@@ -43,6 +43,9 @@
 #include <gtest/gtest.h>
 #include <spdlog/spdlog.h>
 
+#include <dirent.h>
+#include <unistd.h>
+
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -314,7 +317,8 @@ struct ManagerFixture {
                             double host_to_device_ratio = 8.0,
                             int spare_pages = 0,
                             int cohort_rows = 0,
-                            int union_rows = 0)
+                            int union_rows = 0,
+                            std::vector<uint8_t> bearing_mask = {})
         : fx(num_logical + spare_pages, /*layer=*/0),
           next_free_page(num_logical) {
         auto* be = fx.be.get();
@@ -366,6 +370,7 @@ struct ManagerFixture {
         o.hot_buffer_slots = hot_slots;
         o.host_to_device_ratio = host_to_device_ratio;
         o.indexer_full_layers = std::move(full_mask);
+        o.kv_bearing_layers = std::move(bearing_mask);  // GF3.9
         o.cohort_rows_max = cohort_rows;  // TD-KVT-ADMISSION-UPFRONT
         o.union_rows_max = union_rows;    // TD-KVT-COHORT-BATCHED-MATERIALIZE
         mgr = std::make_unique<ld::KvTieringManager>(std::move(o));
@@ -521,6 +526,46 @@ TEST(KvTieringManager, MaterializeHotAndColdMatchesGroundTruth) {
     EXPECT_EQ(m.mgr->cache_entries(0, 0), 4);
 }
 
+TEST(KvTieringManager, NonKvBearingLayersAreGatedOut) {
+    REQUIRES_GPU();
+    // GF3.9 (glm5_next hybrid): the attention-type mask gates tiering to
+    // KV-bearing layers only. A KDA linear layer (bearing_mask[l] == 0)
+    // must be refused by begin_layer, ignored by after_attention, and
+    // never counted as a shared successor (its page list is
+    // empty/sentinel on the real model). Layer 1 (bearing) behaves
+    // exactly like the unmasked manager.
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/10,
+                     /*full_mask=*/{}, /*host_to_device_ratio=*/8.0,
+                     /*spare_pages=*/0, /*cohort_rows=*/0,
+                     /*union_rows=*/0,
+                     /*bearing_mask=*/{0, 1});
+    const int* bts[1] = {m.bt()};
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+    m.fx.be->synchronize_device();
+
+    // Layer 0 = "KDA": refused outright; after_attention is a no-op.
+    EXPECT_FALSE(m.mgr->begin_layer(0, 1, /*pos=*/0, bts));
+    m.mgr->after_attention(0, 1, /*pos=*/31, m.handles.data() + 0, NL,
+                           kLayers);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_TRUE(m.freed.empty())
+        << "a non-bearing layer must never produce demotions";
+
+    // Layer 1 = sparse MLA: the normal tier flow engages.
+    for (uint32_t pos = 0; pos <= 31; ++pos) {
+        ASSERT_TRUE(m.mgr->begin_layer(1, 1, pos, bts));
+        m.mgr->after_attention(1, 1, pos, m.handles.data() + 1, NL,
+                               kLayers);
+    }
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_FALSE(m.freed.empty())
+        << "the bearing layer must tier normally under the mask";
+    for (const auto& [layer, logical] : m.freed)
+        EXPECT_EQ(layer, 1) << "only the bearing layer may demote";
+}
+
 TEST(KvTieringManager, PrefillChunkFlowDemotesBehindFrontierByteExact) {
     REQUIRES_GPU();
     // TD-KVT-PREFILL: simulate B==1 SPARSE chunked prefill — one
@@ -595,6 +640,79 @@ TEST(KvTieringManager, PrefillChunkFlowDemotesBehindFrontierByteExact) {
     EXPECT_EQ(s.pool_hits, 3u);
     EXPECT_EQ(s.h2d_bursts, 1u);
     EXPECT_EQ(s.demoted_pages, 7u);
+}
+
+TEST(KvTieringManager, HibernateLayerDemotesAllButFrontierByteExact) {
+    REQUIRES_GPU();
+    // R3 holder hibernation (TD-PREFIX-POOL-PRESSURE-EVICTS-THE-PRIZE): a
+    // FROZEN prefix holder never steps, so window demotion never reaches
+    // it — measured on the GLM champion, each deep holder pinned ~5,100
+    // pages/rank (its hot retention window at fork time) for its whole
+    // life, and pool pressure evicted the cache as fast as it filled.
+    // hibernate_layer must demote EVERY hot page EXCEPT the
+    // append-frontier logical page (INV-KVT-4's frontier rule), regardless
+    // of the retention window, with byte-exact cold copies (INV-KVT-1) —
+    // and a second call must be a no-op (pages already cold).
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+    m.fx.be->synchronize_device();
+
+    // No step ever ran on this sequence (a holder forked from an
+    // undemoted parent has no tiering state) — hibernate creates it.
+    const int n = m.mgr->hibernate_layer(0, /*seq=*/1,
+                                         m.handles.data() + 0, NL, kLayers);
+    EXPECT_EQ(n, NL - 1) << "all but the frontier page must demote";
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.freed.size(), static_cast<size_t>(NL - 1));
+    for (int j = 0; j < NL - 1; ++j) {
+        EXPECT_EQ(m.freed[j].first, 0);
+        EXPECT_EQ(m.freed[j].second, j) << "demotion order is positional";
+    }
+    EXPECT_TRUE(m.mgr->seq_has_demotions(1));
+
+    // Frontier page stays HOT (no cold copy); every demoted page's cold
+    // copy is byte-exact with the initial VRAM contents.
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(1, 0, NL - 1), nullptr);
+    for (int j = 0; j < NL - 1; ++j) {
+        const void* c = m.mgr->cold_page_host_ptr(1, 0, j);
+        ASSERT_NE(c, nullptr) << "page " << j << " must be COLD";
+        EXPECT_EQ(std::memcmp(c,
+                              m.fx.host_pool.data()
+                                  + static_cast<int64_t>(j) * kStrideBlock,
+                              kStrideBlock),
+                  0)
+            << "cold copy of page " << j << " must be byte-exact";
+    }
+
+    // Idempotent: nothing left to demote.
+    EXPECT_EQ(m.mgr->hibernate_layer(0, 1, m.handles.data() + 0, NL,
+                                     kLayers),
+              0);
+
+    // Explicit frontier (the dispatcher passes kv_len/page_size): a
+    // holder whose parent over-allocated must keep pages AT/AFTER its
+    // coverage-end page hot — hibernate at frontier 7 on a fresh seq
+    // demotes exactly pages 0..6.
+    EXPECT_EQ(m.mgr->hibernate_layer(0, /*seq=*/9, m.handles.data() + 0,
+                                     NL, kLayers, /*frontier_logical=*/7),
+              7);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(9, 0, 6) != nullptr, true);
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(9, 0, 7), nullptr);
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(9, 0, 8), nullptr);
+    m.mgr->on_seq_free(9);
+
+    // A fork FROM the hibernated holder shares the cold slots (INV-KVT-15)
+    // and the child may step from the holder frontier: demoted_frontier is
+    // (NL-1)*page_size, so begin_layer at that position is legal (the
+    // fork-child delta prefill's first write lands on the hot frontier).
+    m.mgr->on_seq_fork(1, 2);
+    const int* bts[1] = {m.bt()};
+    EXPECT_TRUE(m.mgr->begin_layer(0, 2, (NL - 1) * kPageSize, bts));
+    m.mgr->on_seq_free(2);
+    m.mgr->on_seq_free(1);
 }
 
 TEST(KvTieringManager, CohortPerRowMaterializeByteExactChunkBoundaryDemote) {
@@ -948,6 +1066,193 @@ TEST(KvTieringManager, ColdPoolFairShareCapAcrossSequences) {
     EXPECT_EQ(m.mgr->stats().pool_hits, 2u);     // positions 20 (page 5), 24
 }
 
+TEST(KvTieringManager, HibernateBypassesColdFairShareCap) {
+    REQUIRES_GPU();
+    // R3: the per-seq cold fair-share cap protects the pool from one LIVE
+    // sequence, but it counts fork-family holders as independent sequences
+    // — a chained holder's inherited slots already exceed capacity/nseq,
+    // so the cap would veto exactly the deep holders hibernation exists
+    // for.  hibernate_layer must therefore ignore the cap (bounded by pool
+    // capacity + holder eviction instead).
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/8, /*full_mask=*/{},
+                     /*host_to_device_ratio=*/4.0);
+    ASSERT_EQ(m.mgr->cold_pool_capacity_pages(), 16);
+    m.demote(0, 23, /*seq=*/1);   // live seq: 4 cold pages
+    m.demote(0, 23, /*seq=*/2);   // live seq: 4 cold pages
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 8);
+
+    // Hibernating holder seq 3: 7 eligible pages, fair-share cap would be
+    // 16/3 = 5 — hibernation must take all 7 anyway (8 slots free).
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+    const int n = m.mgr->hibernate_layer(0, /*seq=*/3,
+                                         m.handles.data() + 0, NL, kLayers);
+    EXPECT_EQ(n, NL - 1);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(3, 0), NL - 1);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 8 + NL - 1);
+    // A hibernated holder is EXCLUDED from the fair-share census.  Free
+    // seq 1 (4 slots back → 5 free); live demoters are then {2, 4}: seq
+    // 4's cap is 16/2-with-itself = 8, so its 6th candidate is stopped by
+    // POOL exhaustion (5 free), never by a holder-inflated budget skip
+    // (a census counting hibernated seq 3 would cap at 16/3 = 5 and skip
+    // the 6th candidate as over-budget).
+    m.mgr->on_seq_free(1);
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 11);
+    const auto skips_before = m.mgr->stats().budget_skips;
+    m.demote(0, 31, /*seq=*/4);              // 6 candidates, 5 slots free
+    EXPECT_EQ(m.mgr->stats().budget_skips, skips_before)
+        << "hibernated holders must not inflate the live census";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 16);   // pool exhausted
+    m.mgr->on_seq_free(4);
+    m.mgr->on_seq_free(3);
+}
+
+// ── TD-KVT-COLD-FULL-HOT-WEDGE: cold-full skip + out-of-step recovery ──────
+
+TEST(KvTieringManager, ColdPoolFullWedgeRecoversViaPressureDemote) {
+    REQUIRES_GPU();
+    // The wedge class end-to-end at manager level: a FULL cold pool skips
+    // demotions in-step (fail-safe for DATA — a cold slot is the sole copy
+    // of demoted KV, the pool never evicts one), the live sequence
+    // accumulates a hot behind-window backlog, holder EVICTION returns the
+    // slots (INV-KVT-17), and the out-of-step pressure sweep then drains
+    // the backlog WITHOUT a step — the freed pages are what un-wedges
+    // kMain.  ratio 1.0 → per-layer 2 pages × 2 layers = 4-slot pool.
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/8, /*full_mask=*/{},
+                     /*host_to_device_ratio=*/1.0);
+    ASSERT_EQ(m.mgr->cold_pool_capacity_pages(), 4);
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+
+    // Holder seq 9 hibernates layer 0: 7 eligible pages, 4 slots — the
+    // pool fills and the tail is skipped in-step.  A sequence that itself
+    // holds EVERY slot skips via the cap check (budget_skips: cold_used ==
+    // capacity), before the acquire path can see the empty free list.
+    m.fx.be->synchronize_device();
+    const int hib = m.mgr->hibernate_layer(0, /*seq=*/9,
+                                           m.handles.data() + 0, NL, kLayers);
+    EXPECT_EQ(hib, 4);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 4);
+    EXPECT_EQ(m.mgr->stats().budget_skips, 3u);
+    EXPECT_EQ(m.mgr->stats().cold_full_skips, 0u);
+    ASSERT_EQ(m.freed.size(), 4u);
+
+    // Live seq 1 steps at pos 23: 4 window-demotion candidates (pages
+    // 0..3), ALL skipped in-step — a DIFFERENT sequence hitting the full
+    // pool takes the acquire-fail path (cold_full_skips) — and no VRAM
+    // page returns: the wedge class.
+    m.demote(0, 23, /*seq=*/1);
+    EXPECT_EQ(m.mgr->stats().cold_full_skips, 1u);
+    EXPECT_EQ(m.freed.size(), 4u);
+    EXPECT_FALSE(m.mgr->layer_has_cold(1, 0));
+
+    // Pressure sweep while the pool is STILL full: reclaims nothing — the
+    // dispatcher then surfaces the retryable kKvPoolExhausted error and the
+    // orchestrator's eviction seam takes over.
+    EXPECT_EQ(m.mgr->pressure_demote(1, m.handles.data(), NL), 0);
+    EXPECT_EQ(m.mgr->stats().pressure_demoted, 0u);
+
+    // Holder eviction (the orchestrator seam): every slot returns at
+    // refcount 0 (INV-KVT-17)...
+    m.mgr->on_seq_free(9);
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+
+    // ...and the sweep now drains the live backlog out-of-step.  S3: the
+    // sweep flushes ALL layers as one batch ordered by physical page, so
+    // the 4 scarce slots go to the LOWEST token positions across BOTH
+    // layers (position-first draining is what completes slabs) — in this
+    // aliased fixture (page_idx == j on both layers) that is logical 0..1
+    // of each layer, not layer 0's 0..3 as the per-layer legacy sweep
+    // gave.  Fail-safe (remaining pages stay hot) is unchanged.
+    m.fx.be->synchronize_device();
+    const int enq = m.mgr->pressure_demote(1, m.handles.data(), NL);
+    EXPECT_EQ(enq, 4);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_EQ(m.freed.size(), 8u);  // 4 holder + 4 backlog pages reclaimed
+    EXPECT_EQ(m.mgr->stats().pressure_demoted, 4u);
+
+    // Data integrity: the pressure-demoted bytes are byte-exact in the cold
+    // pool even with the freed VRAM pages clobbered (INV-KVT-1), and the
+    // retention window + append frontier stayed hot (INV-KVT-4).
+    std::vector<char> junk(4 * kStrideBlock, '\x55');
+    m.fx.be->memcpy_h2d(m.fx.pool, junk.data(), junk.size());
+    std::vector<char> want(kStrideBlock);
+    int cold_pages = 0;
+    for (int j = 0; j < 4; ++j) {
+        for (int l = 0; l < kLayers; ++l) {
+            const void* cold = m.mgr->cold_page_host_ptr(1, l, j);
+            if (!cold) continue;
+            ++cold_pages;
+            // Both layers alias physical page j (fixture) — the ground
+            // truth is the layer-0 fill pattern of position j.
+            for (int r = 0; r < kPageSize; ++r)
+                fill_row(want.data() + r * kStrideRow, 0,
+                         j * kPageSize + r);
+            EXPECT_EQ(std::memcmp(cold, want.data(),
+                                  static_cast<size_t>(kStrideBlock)), 0)
+                << "pressure-demoted page " << j << " (layer " << l
+                << ") bytes differ";
+        }
+    }
+    EXPECT_EQ(cold_pages, 4) << "exactly the 4 freed slots were reused";
+    for (int j = 0; j < 2; ++j)
+        for (int l = 0; l < kLayers; ++l)
+            EXPECT_NE(m.mgr->cold_page_host_ptr(1, l, j), nullptr)
+                << "lowest positions must win the scarce slots (position-"
+                   "first draining completes slabs)";
+    for (int j = 4; j < NL; ++j)
+        EXPECT_EQ(m.mgr->cold_page_host_ptr(1, 0, j), nullptr)
+            << "page " << j << " must stay hot (window/frontier)";
+    m.mgr->on_seq_free(1);
+}
+
+TEST(KvTieringManager, PressureDemoteSkipsHibernatedUnknownAndFresh) {
+    REQUIRES_GPU();
+    // The pressure sweep only drains LIVE stepped sequences' backlogs:
+    // unknown / never-stepped sequences are no-ops, hibernated holders have
+    // nothing demote-eligible left (their frontier page must stay hot,
+    // INV-KVT-4), a sequence whose whole window is hot enqueues nothing,
+    // and the sweep covers EVERY layer exactly once (idempotent after).
+    ManagerFixture m(/*hot_slots=*/8);
+    const int NL = static_cast<int>(m.handles.size()) / kLayers;
+
+    // Unknown sequence: no state — no-op.
+    EXPECT_EQ(m.mgr->pressure_demote(7, m.handles.data(), NL), 0);
+
+    // Hibernated holder: no-op even with hot pages remaining above its
+    // hibernation frontier.
+    m.fx.be->synchronize_device();
+    ASSERT_GT(m.mgr->hibernate_layer(0, /*seq=*/9, m.handles.data(), NL,
+                                     kLayers, /*frontier_logical=*/2), 0);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    EXPECT_EQ(m.mgr->pressure_demote(9, m.handles.data(), NL), 0);
+
+    // Live sequence with its whole retention window hot: nothing behind the
+    // window at pos 7 — enqueues 0, everything stays hot.
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, /*seq=*/1, /*pos=*/7, bts));
+    EXPECT_EQ(m.mgr->pressure_demote(1, m.handles.data(), NL), 0);
+    EXPECT_FALSE(m.mgr->layer_has_cold(1, 0));
+
+    // After an in-step layer-0 sweep at pos 23 (slots free — nothing
+    // skipped), the pressure sweep still finds layer 1's backlog (the
+    // fixture's step only swept layer 0)...
+    m.demote(0, 23, /*seq=*/1);
+    m.fx.be->synchronize_device();
+    EXPECT_EQ(m.mgr->pressure_demote(1, m.handles.data(), NL), 4);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    // ...and a second sweep is a no-op: no residual backlog.
+    EXPECT_EQ(m.mgr->pressure_demote(1, m.handles.data(), NL), 0);
+    m.mgr->on_seq_free(1);
+    m.mgr->on_seq_free(9);
+}
+
 // ── 7. TD-KVT-SPEC: snapshot cold reads + rewind narrowing ─────────────────
 
 TEST(KvTieringManager, ColdPageHostPtrCapturesBothTiersForSnapshot) {
@@ -1198,6 +1503,84 @@ TEST(KvTieringManager, ForkChildRewindSplitsColdCopyOnWriteParentIntact) {
     m.mgr->on_seq_free(2);
     EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
     EXPECT_FALSE(m.mgr->has_demotions());
+}
+
+TEST(KvTieringManager, TruncatedForkSharesOnlyPrefixColdSlots) {
+    REQUIRES_GPU();
+    // R4a truncating fork from a demoted (e.g. HIBERNATED holder) parent:
+    // on_seq_fork(src, dst, prefix_len) truncates the child's inherited
+    // tiering state to logical pages [0, ceil(prefix_len / page_size)) —
+    // only the KEPT cold slots gain a refcount (a full-copy share would
+    // leak the parent's tail slots at the child's release, since
+    // release_seq walks the child's own page vectors) — and the child's
+    // demoted frontier / cold accounting are recomputed from the kept
+    // prefix.  The COLD straddling page then re-promotes copy-on-write
+    // exactly like a rewind (the dispatcher calls
+    // repromote_for_rewind(dst, prefix_len) for a live truncated child).
+    ManagerFixture m(/*hot_slots=*/8, /*num_logical=*/8, /*full_mask=*/{},
+                     /*host_to_device_ratio=*/8.0, /*spare_pages=*/8);
+    m.demote(/*layer=*/0, /*pos=*/31, /*seq=*/1);  // pages 0..5 cold
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 6);
+
+    // prefix_len 10 → keep ceil(10/4) = 3 logical pages (0..2).
+    m.mgr->on_seq_fork(1, 2, /*prefix_len=*/10);
+    EXPECT_TRUE(m.mgr->seq_has_demotions(2));
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 6) << "shared, never doubled";
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(1, 0), 6);  // parent untouched
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(2, 0), 3)
+        << "child holds ONLY the prefix slots";
+
+    // Child frontier = 12 (page 2 straddles the boundary at 10): a step
+    // writing at 10 fail-louds until the straddle re-promotes (INV-KVT-2).
+    const int* bts[1] = {m.bt()};
+    EXPECT_THROW(m.mgr->begin_layer(0, 2, /*pos=*/10, bts),
+                 std::runtime_error);
+    ASSERT_TRUE(m.mgr->repromote_for_rewind(2, /*token_pos=*/10));
+    EXPECT_EQ(m.mgr->stats().repromoted_pages, 1u) << "straddle page only";
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(2, 0), 2);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 6)
+        << "parent refcounts keep every slot alive";
+    EXPECT_TRUE(m.mgr->begin_layer(0, 2, /*pos=*/10, bts));
+
+    // Parent teardown: the never-shared tail (pages 3..5) AND page 2 (the
+    // child released its ref at re-promotion) free; the shared prefix
+    // (pages 0..1) survives on the child's refs, byte-exact.
+    m.mgr->on_seq_free(1);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 2);
+    m.materialize_and_check(0, {0, 5}, /*seq=*/2);
+    m.mgr->on_seq_free(2);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    EXPECT_FALSE(m.mgr->has_demotions());
+}
+
+TEST(KvTieringManager, TruncatedForkHotStraddleNeedsNoRepromotion) {
+    REQUIRES_GPU();
+    // Truncation boundary in HOT territory of a partially demoted parent:
+    // the kept prefix still includes the parent's cold pages (window
+    // demotion colds the OLDEST positions, so cold pages are always a
+    // position-prefix), but the STRADDLING page is hot — the child's
+    // recomputed frontier is already <= prefix_len, so a step at the
+    // boundary engages with NO re-promotion and the cold prefix keeps
+    // serving reads from the shared slots.
+    ManagerFixture m(/*hot_slots=*/24);
+    m.demote(/*layer=*/0, /*pos=*/31, /*seq=*/1);  // demote_end 8 → pages 0..1
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 2);
+
+    // prefix_len 10 → keep pages 0..2; pages 0..1 cold, straddle page 2 HOT.
+    m.mgr->on_seq_fork(1, 2, /*prefix_len=*/10);
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(2, 0), 2);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 2);
+
+    // Child frontier 8 <= 10: the boundary step runs without re-promotion.
+    const int* bts[1] = {m.bt()};
+    EXPECT_TRUE(m.mgr->begin_layer(0, 2, /*pos=*/10, bts));
+    EXPECT_EQ(m.mgr->stats().repromoted_pages, 0u);
+    m.materialize_and_check(0, {0, 5, 9}, /*seq=*/2);  // cold+hot byte-exact
+
+    m.mgr->on_seq_free(1);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 2) << "child refs pin both";
+    m.mgr->on_seq_free(2);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
 }
 
 // ── 6. TD-KVT-SYNC / TD-KVT-PREFETCH ────────────────────────────────────────
@@ -1622,9 +2005,17 @@ TEST(KvTieringManagerSharded, OwnerOnlyDemotionAndLocalMaterializeByteExact) {
     ASSERT_TRUE(m.mgr->has_demotions());
     ASSERT_TRUE(m.mgr->layer_has_cold(1, 0));
     ASSERT_EQ(m.freed.size(), 6u) << "each demoted page freed exactly ONCE";
-    for (int j = 0; j < 6; ++j) {
-        EXPECT_EQ(m.freed[j].first, 0);
-        EXPECT_EQ(m.freed[j].second, j);
+    // S3: the demote flush orders by (storing owner rank, physical page
+    // index) so per-rank D2H runs coalesce — the SET of freed pages is the
+    // invariant, not the order.
+    {
+        std::vector<int> got;
+        for (const auto& [l, j] : m.freed) {
+            EXPECT_EQ(l, 0);
+            got.push_back(j);
+        }
+        std::sort(got.begin(), got.end());
+        EXPECT_EQ(got, (std::vector<int>{0, 1, 2, 3, 4, 5}));
     }
     EXPECT_EQ(m.mgr->stats().demoted_pages, 6u);
 
@@ -1946,4 +2337,536 @@ TEST(KvTieringManagerReplicated, NoDedupKeepsPerRankCopies) {
     const auto& s = m.mgr->stats();
     EXPECT_EQ(s.cold_misses, 7u);
     EXPECT_EQ(s.pool_hits, 3u);
+}
+
+// ── 10. S3 — tiering by slab (RADIX_SLAB_DESIGN §5 S3) ─────────────────────
+//
+// Position-major slabbed fixture: physical page for (logical j, layer l) is
+// j * L + l (L = fixture layer count) — the S2 packing order (INV-SLAB-2: one slab holds ALL
+// layers' pages for a contiguous token range).  pages_per_slab = 3, so a
+// slab is 1.5 position-cohorts (cohorts straddle slab boundaries, as on the
+// GLM champion where 79 layers meet a 103-page slab).  Covers:
+//   * the in-step window sweep DEFERS per-layer candidates and flushes at
+//     the last layer (or the next step's begin_layer) — demotion selection
+//     stays page-precise, the D2H leaves as contiguous slab runs;
+//   * whole-slab accounting (slabs_demoted_whole) and run coalescing;
+//   * byte-exact cold copies for every layer (INV-KVT-1 unchanged);
+//   * pending-batch interaction seams: seq_free discards, fork flushes
+//     (slot sharing preserved), hibernate_seq batches all layers;
+//   * promotion-side run coalescing (repromote_seq) byte-exact.
+
+namespace {
+
+struct SlabFixture {
+    int L = 2;  // kv layers (runtime — flush triggers depend on it)
+    PoolFixture fx;
+    std::unique_ptr<ld::KvTieringManager> mgr;
+    std::vector<lm::PageHandle> handles;  // (logical j, layer l) at [j*L + l]
+    std::vector<int> host_bt;             // layer-0 logical→physical
+    std::vector<std::pair<int, int>> freed;
+    int num_logical = 0;
+    int next_free_page = 0;
+
+    static constexpr int kPps = 3;  // pages per slab
+
+    explicit SlabFixture(int hot_slots, int num_logical_, int spare_pages = 0,
+                         int layers = 2, const std::string& spill_dir = "",
+                         int64_t spill_cap = 0,
+                         double host_to_device_ratio = 8.0)
+        : L(layers),
+          fx(num_logical_ * layers + spare_pages, /*layer=*/0),
+          num_logical(num_logical_),
+          next_free_page(num_logical_ * layers) {
+        (void)spill_dir; (void)spill_cap; (void)host_to_device_ratio;
+        // Position-major ground truth: physical page j*L+l holds layer l's
+        // rows for positions j*kPageSize.. (PoolFixture filled a layer-0
+        // pattern; rewrite with the per-layer pattern).
+        for (int j = 0; j < num_logical; ++j)
+            for (int l = 0; l < L; ++l) {
+                const int phys = j * L + l;
+                for (int r = 0; r < kPageSize; ++r)
+                    fill_row(fx.host_pool.data()
+                                 + static_cast<int64_t>(phys) * kStrideBlock
+                                 + static_cast<int64_t>(r) * kStrideRow,
+                             l, j * kPageSize + r);
+            }
+        fx.be->memcpy_h2d(fx.pool, fx.host_pool.data(),
+                          static_cast<size_t>(num_logical) * L
+                              * kStrideBlock);
+        for (int j = 0; j < num_logical; ++j)
+            for (int l = 0; l < L; ++l) {
+                const int phys = j * L + l;
+                handles.push_back(lm::PageHandle{
+                    .gpu_idx = 0, .page_idx = phys,
+                    .gpu_ptr = static_cast<char*>(fx.pool)
+                             + static_cast<int64_t>(phys) * kStrideBlock,
+                    .pool = lm::Pool::kMain});
+            }
+        for (int j = 0; j < num_logical; ++j)
+            host_bt.push_back(j * L);  // layer 0 view
+
+        ld::KvTieringManager::Options o;
+        o.dcp_size = 1;
+        o.gpus = {ref0()};
+        o.device_backends = {fx.be.get()};
+        o.stream_manager = nullptr;
+        o.numa_manager = nullptr;
+        o.free_page = [this](uint64_t, int layer, int logical,
+                             const lm::PageHandle&) {
+            freed.emplace_back(layer, logical);
+        };
+        o.alloc_page = [this](uint64_t, int layer, int logical)
+                -> std::optional<lm::PageHandle> {
+            if (next_free_page >= fx.pool_pages) return std::nullopt;
+            const int p = next_free_page++;
+            lm::PageHandle h{
+                .gpu_idx = 0, .page_idx = p,
+                .gpu_ptr = static_cast<char*>(fx.pool)
+                         + static_cast<int64_t>(p) * kStrideBlock,
+                .pool = lm::Pool::kMain};
+            handles[static_cast<size_t>(logical) * L + layer] = h;
+            return h;
+        };
+        o.kv_main_bases = {fx.pool};
+        o.stride_block = kStrideBlock;
+        o.stride_row = kStrideRow;
+        o.page_size = kPageSize;
+        o.kv_layers = L;
+        o.index_topk = kTopk;
+        o.hot_buffer_slots = hot_slots;
+        o.host_to_device_ratio = host_to_device_ratio;
+        o.pages_per_slab = kPps;                        // S3 geometry
+        o.slab_span_pages = {num_logical * L};    // spare pages = loose
+        o.spill_dir = spill_dir;                  // TD-PREFIX-TIDY-COLD-SPILL
+        o.spill_max_bytes = spill_cap;
+        mgr = std::make_unique<ld::KvTieringManager>(std::move(o));
+    }
+
+    const int* bt() const { return host_bt.data(); }
+
+    /// One full step at `pos`: begin_layer + after_attention for EVERY
+    /// layer (the dispatcher shape — the last layer triggers the S3 flush).
+    void step(uint32_t pos, uint64_t seq = 1) {
+        const int* bts[1] = {bt()};
+        for (int l = 0; l < L; ++l) {
+            ASSERT_TRUE(mgr->begin_layer(l, seq, pos, bts));
+            mgr->after_attention(l, seq, pos, handles.data() + l,
+                                 num_logical, L);
+        }
+    }
+
+    std::vector<char> read_page(int phys) {
+        std::vector<char> out(kStrideBlock);
+        fx.be->set_device();
+        fx.be->synchronize_device();
+        fx.be->memcpy_d2h_async(out.data(),
+                                static_cast<char*>(fx.pool)
+                                    + static_cast<int64_t>(phys)
+                                          * kStrideBlock,
+                                out.size(), fx.stream);
+        fx.be->synchronize_device();
+        return out;
+    }
+
+    /// Ground-truth bytes of (logical j, layer l).
+    const char* truth(int j, int l) const {
+        return fx.host_pool.data()
+            + static_cast<int64_t>(j * L + l) * kStrideBlock;
+    }
+};
+
+}  // namespace
+
+TEST(KvTieringSlab, WindowSweepDefersToStepEndThenOneRunWholeSlabs) {
+    REQUIRES_GPU();
+    // 10 logical pages × 4 tokens; retention 8 tokens.  A step at pos 39:
+    // demote_end = 32 → logical 0..7 eligible on BOTH layers = physical
+    // pages 0..15 — one position-major contiguous run = 5 whole slabs
+    // (pps 3) plus one page of slab 5.
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+
+    // Layer 0's sweep must DEFER: no slots taken, nothing freed, pages
+    // still hot (page-precise selection, transfer deferred to step end).
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 39, bts));
+    m.mgr->after_attention(0, 1, 39, m.handles.data() + 0, m.num_logical,
+                           m.L);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_TRUE(m.freed.empty()) << "layer sweep must defer, not demote";
+    EXPECT_FALSE(m.mgr->has_demotions());
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+
+    // The last layer's sweep still only COLLECTS (its later superchunk
+    // sub-chunks could be outstanding) — the batch flushes at the NEXT
+    // step's layer-0 begin_layer.
+    ASSERT_TRUE(m.mgr->begin_layer(1, 1, 39, bts));
+    m.mgr->after_attention(1, 1, 39, m.handles.data() + 1, m.num_logical,
+                           m.L);
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_TRUE(m.freed.empty()) << "no in-step flush";
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 40, bts));  // next step boundary
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    ASSERT_EQ(m.freed.size(), 16u) << "both layers' behind-window pages";
+    const auto& s = m.mgr->stats();
+    EXPECT_EQ(s.slab_flushes, 1u);
+    EXPECT_EQ(s.slab_runs, 1u) << "position-major cohort = ONE contiguous "
+                                  "D2H run";
+    EXPECT_EQ(s.slab_pages, 16u);
+    EXPECT_EQ(s.slabs_demoted_whole, 5u) << "physical 0..15 covers slabs "
+                                            "0..4 whole (pps 3)";
+
+    // Byte-exact cold copies for EVERY layer (INV-KVT-1).
+    for (int j = 0; j < 8; ++j)
+        for (int l = 0; l < m.L; ++l) {
+            const void* c = m.mgr->cold_page_host_ptr(1, l, j);
+            ASSERT_NE(c, nullptr) << "layer " << l << " logical " << j;
+            EXPECT_EQ(std::memcmp(c, m.truth(j, l), kStrideBlock), 0)
+                << "cold copy layer " << l << " logical " << j;
+        }
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(1, 0, 8), nullptr) << "in-window";
+    m.mgr->on_seq_free(1);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0) << "INV-KVT-17";
+}
+
+TEST(KvTieringSlab, SuperchunkLayer0StreamKeepsAccumulating) {
+    REQUIRES_GPU();
+    // The superchunk executor walks LAYER-OUTER over sub-chunks, so
+    // consecutive layer-0 dispatches of one sequence are the SAME pass:
+    // begin_layer(0) must NOT flush a batch whose newest candidates are
+    // still layer 0's — the batch keeps accumulating and goes out with
+    // the step's last layer as ONE run set.
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 39, bts));
+    m.mgr->after_attention(0, 1, 39, m.handles.data() + 0, m.num_logical,
+                           m.L);
+    // Next layer-0 sub-chunk: same pass — still no flush.
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 40, bts));
+    EXPECT_TRUE(m.freed.empty()) << "layer-0 stream must keep accumulating";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    m.mgr->after_attention(0, 1, 40, m.handles.data() + 0, m.num_logical,
+                           m.L);
+    // The pass reaches the last layer (collect only), then the NEXT
+    // step's layer-0 begin flushes everything as ONE batch, ONE run.
+    ASSERT_TRUE(m.mgr->begin_layer(1, 1, 40, bts));
+    m.mgr->after_attention(1, 1, 40, m.handles.data() + 1, m.num_logical,
+                           m.L);
+    EXPECT_TRUE(m.freed.empty()) << "no in-step flush at the last layer";
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 41, bts));  // next step boundary
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    ASSERT_EQ(m.freed.size(), 16u) << "both layers' logical 0..7";
+    EXPECT_EQ(m.mgr->stats().slab_flushes, 1u) << "ONE batch, not per "
+                                                  "sub-chunk";
+    EXPECT_EQ(m.mgr->stats().slab_runs, 1u);
+    m.mgr->on_seq_free(1);
+}
+
+TEST(KvTieringSlab, MissedLastLayerFlushesAtNextStepBegin) {
+    REQUIRES_GPU();
+    // A step whose LAST kv layer never reports (skipped MTP shape): the
+    // batch holds candidates from layers past 0, so the NEXT step's
+    // layer-0 begin_layer is a step boundary and must flush it.
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/3);
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+    for (int l = 0; l < 2; ++l) {  // layers 0 and 1; layer 2 (last) skipped
+        ASSERT_TRUE(m.mgr->begin_layer(l, 1, 39, bts));
+        m.mgr->after_attention(l, 1, 39, m.handles.data() + l,
+                               m.num_logical, m.L);
+    }
+    EXPECT_TRUE(m.freed.empty());
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 40, bts));  // next step
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    ASSERT_EQ(m.freed.size(), 16u) << "layers 0+1, logical 0..7 each";
+    EXPECT_TRUE(m.mgr->seq_has_demotions(1));
+    m.mgr->on_seq_free(1);
+}
+
+TEST(KvTieringSlab, SeqFreeDiscardsPendingWithoutDemotion) {
+    REQUIRES_GPU();
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 39, bts));
+    m.mgr->after_attention(0, 1, 39, m.handles.data() + 0, m.num_logical,
+                           m.L);
+    m.mgr->on_seq_free(1);  // dying sequence: pending batch must be dropped
+    m.fx.be->synchronize_device();
+    m.mgr->poll_demotions();
+    EXPECT_TRUE(m.freed.empty()) << "no demotion may start for a dying seq";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    EXPECT_FALSE(m.mgr->has_demotions());
+    // The seq id can come back fresh.
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 3, bts));
+}
+
+TEST(KvTieringSlab, ForkFlushesPendingThenSharesRefcountedSlots) {
+    REQUIRES_GPU();
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    m.fx.be->synchronize_device();
+    const int* bts[1] = {m.bt()};
+    ASSERT_TRUE(m.mgr->begin_layer(0, 1, 39, bts));
+    m.mgr->after_attention(0, 1, 39, m.handles.data() + 0, m.num_logical,
+                           m.L);
+    EXPECT_TRUE(m.freed.empty());
+    // Fork must flush the pending batch first (settled refcounted slots),
+    // then share them with the child exactly as pre-S3.
+    m.mgr->on_seq_fork(1, 2);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.freed.size(), 8u);
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(1, 0), 8);
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(2, 0), 8) << "child shares slots";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 8) << "refcount-shared, not "
+                                                    "duplicated";
+    m.mgr->on_seq_free(2);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 8) << "parent still holds";
+    m.mgr->on_seq_free(1);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0) << "INV-KVT-17";
+}
+
+TEST(KvTieringSlab, HibernateSeqBatchesAllLayersIntoSlabRuns) {
+    REQUIRES_GPU();
+    // R3 holder hibernation through the S3 whole-sequence sweep: all
+    // layers' pages below the frontier collect into ONE flush → one
+    // contiguous run of 18 physical pages = 6 whole slabs; frontier page
+    // stays hot on every layer (INV-KVT-4).
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10);
+    m.fx.be->synchronize_device();
+    const int n = m.mgr->hibernate_seq(/*seq=*/5, m.handles.data(),
+                                       m.num_logical);
+    EXPECT_EQ(n, 18) << "all but the frontier page, BOTH layers";
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.freed.size(), 18u);
+    const auto& s = m.mgr->stats();
+    EXPECT_EQ(s.slab_flushes, 1u);
+    EXPECT_EQ(s.slab_runs, 1u) << "one contiguous run for the whole holder";
+    EXPECT_EQ(s.slabs_demoted_whole, 6u);
+    for (int j = 0; j < m.num_logical - 1; ++j)
+        for (int l = 0; l < m.L; ++l) {
+            const void* c = m.mgr->cold_page_host_ptr(5, l, j);
+            ASSERT_NE(c, nullptr);
+            EXPECT_EQ(std::memcmp(c, m.truth(j, l), kStrideBlock), 0)
+                << "cold copy layer " << l << " logical " << j;
+        }
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(5, 0, m.num_logical - 1), nullptr);
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(5, 1, m.num_logical - 1), nullptr);
+    // Idempotent (everything already cold).
+    EXPECT_EQ(m.mgr->hibernate_seq(5, m.handles.data(), m.num_logical), 0);
+    m.mgr->on_seq_free(5);
+}
+
+TEST(KvTieringSlab, RepromoteCoalescesRunsByteExact) {
+    REQUIRES_GPU();
+    // Promotion side: a hibernated holder's cold range re-promotes through
+    // the alloc seam; the H2D must land byte-exact and coalesce into runs
+    // (ascending dst pages + the slots the demote flush assigned in the
+    // same order).
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare_pages=*/18);
+    m.fx.be->synchronize_device();
+    ASSERT_EQ(m.mgr->hibernate_seq(6, m.handles.data(), m.num_logical), 18);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    // Clobber the demoted VRAM pages — the pinned cold copies are now the
+    // only correct source.
+    std::vector<char> junk(18 * kStrideBlock, '\x5A');
+    m.fx.be->memcpy_h2d(m.fx.pool, junk.data(), junk.size());
+
+    ASSERT_TRUE(m.mgr->repromote_seq(6, /*keep_frontier=*/0));
+    const auto& s = m.mgr->stats();
+    EXPECT_EQ(s.repromoted_pages, 18u);
+    EXPECT_GE(s.promote_runs, 1u);
+    EXPECT_LE(s.promote_runs, 3u) << "H2D must coalesce, not go per page";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0) << "slots released";
+    EXPECT_FALSE(m.mgr->seq_has_demotions(6));
+    // Byte-exact restore at the freshly allocated physical pages.
+    for (int j = 0; j < m.num_logical - 1; ++j)
+        for (int l = 0; l < m.L; ++l) {
+            const auto& h = m.handles[static_cast<size_t>(j) * m.L + l];
+            const auto got = m.read_page(h.page_idx);
+            EXPECT_EQ(std::memcmp(got.data(), m.truth(j, l), kStrideBlock),
+                      0)
+                << "repromoted bytes layer " << l << " logical " << j;
+        }
+    m.mgr->on_seq_free(6);
+}
+
+// ── 11. TD-PREFIX-TIDY-COLD-SPILL — the 2nd tiering hop ───────────────────
+
+namespace {
+std::string make_spill_dir() {
+    char tmpl[] = "/tmp/ls_spill_test_XXXXXX";
+    const char* d = mkdtemp(tmpl);
+    EXPECT_NE(d, nullptr);
+    return d ? d : "/tmp";
+}
+int spill_files_in(const std::string& dir) {
+    int n = 0;
+    if (DIR* dp = opendir(dir.c_str())) {
+        while (dirent* e = readdir(dp)) {
+            const std::string name = e->d_name;
+            if (name.rfind("ls-spill-", 0) == 0) ++n;
+        }
+        closedir(dp);
+    }
+    return n;
+}
+}  // namespace
+
+TEST(KvTieringSpill, SpillReleasesSlotsUnspillRestoresByteExact) {
+    REQUIRES_GPU();
+    const std::string dir = make_spill_dir();
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/2, dir, /*cap=*/int64_t{1} << 30);
+    m.fx.be->synchronize_device();
+    ASSERT_EQ(m.mgr->hibernate_seq(7, m.handles.data(), m.num_logical), 18);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 18);
+
+    // Spill: every pinned slot returns, the bytes live in ONE file, the
+    // pages stay "demoted" (fail-closed gates keep holding).
+    EXPECT_EQ(m.mgr->spill_seq(7), 18);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0) << "slots must return";
+    EXPECT_TRUE(m.mgr->seq_has_demotions(7));
+    EXPECT_TRUE(m.mgr->seq_spilled(7));
+    EXPECT_EQ(m.mgr->spilled_bytes_total(),
+              static_cast<int64_t>(18) * kStrideBlock);
+    EXPECT_EQ(spill_files_in(dir), 1);
+    EXPECT_EQ(m.mgr->cold_page_host_ptr(7, 0, 0), nullptr)
+        << "a spilled page is not COLD (host ptr must refuse)";
+    // Idempotent.
+    EXPECT_EQ(m.mgr->spill_seq(7), 0);
+
+    // Unspill: fresh slots, byte-exact reload (the ONLY source is the
+    // file), file deleted, cap accounting returns to zero.
+    ASSERT_TRUE(m.mgr->unspill_seq(7));
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 18);
+    EXPECT_FALSE(m.mgr->seq_spilled(7));
+    EXPECT_EQ(m.mgr->spilled_bytes_total(), 0);
+    EXPECT_EQ(spill_files_in(dir), 0) << "file must be unlinked";
+    for (int j = 0; j < m.num_logical - 1; ++j)
+        for (int l = 0; l < m.L; ++l) {
+            const void* c = m.mgr->cold_page_host_ptr(7, l, j);
+            ASSERT_NE(c, nullptr);
+            EXPECT_EQ(std::memcmp(c, m.truth(j, l), kStrideBlock), 0)
+                << "unspilled bytes layer " << l << " logical " << j;
+        }
+    m.mgr->on_seq_free(7);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    rmdir(dir.c_str());
+}
+
+TEST(KvTieringSpill, ByteCapRefusesBeforeWriting) {
+    REQUIRES_GPU();
+    const std::string dir = make_spill_dir();
+    // Cap below the holder's 18-page size: the spill REFUSES with -1,
+    // nothing is written, every slot stays.
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/2, dir,
+                  /*cap=*/static_cast<int64_t>(5) * kStrideBlock);
+    m.fx.be->synchronize_device();
+    ASSERT_EQ(m.mgr->hibernate_seq(8, m.handles.data(), m.num_logical), 18);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    EXPECT_EQ(m.mgr->spill_seq(8), -1) << "cap must refuse BEFORE writing";
+    EXPECT_EQ(spill_files_in(dir), 0);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 18) << "slots untouched";
+    EXPECT_FALSE(m.mgr->seq_spilled(8));
+    m.mgr->on_seq_free(8);
+    rmdir(dir.c_str());
+}
+
+TEST(KvTieringSpill, ForkRequiresUnspillThenSharesSlots) {
+    REQUIRES_GPU();
+    const std::string dir = make_spill_dir();
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/2, dir, /*cap=*/int64_t{1} << 30);
+    m.fx.be->synchronize_device();
+    ASSERT_EQ(m.mgr->hibernate_seq(9, m.handles.data(), m.num_logical), 18);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->spill_seq(9), 18);
+    // The dispatcher must unspill before forking — forking a spilled
+    // holder directly is a contract violation and fails LOUD.
+    EXPECT_THROW(m.mgr->on_seq_fork(9, 10), std::runtime_error);
+    ASSERT_TRUE(m.mgr->unspill_seq(9));
+    m.mgr->on_seq_fork(9, 10);
+    EXPECT_EQ(m.mgr->seq_cold_used_pages(10, 0), 18) << "child shares";
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 18) << "refcounted";
+    m.mgr->on_seq_free(10);
+    m.mgr->on_seq_free(9);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    rmdir(dir.c_str());
+}
+
+TEST(KvTieringSpill, HolderEvictionDeletesTheSpillFile) {
+    REQUIRES_GPU();
+    const std::string dir = make_spill_dir();
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/2, dir, /*cap=*/int64_t{1} << 30);
+    m.fx.be->synchronize_device();
+    ASSERT_EQ(m.mgr->hibernate_seq(11, m.handles.data(), m.num_logical),
+              18);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->spill_seq(11), 18);
+    ASSERT_EQ(spill_files_in(dir), 1);
+    // Holder eviction IS the spill-directory eviction (INV-KVT-17
+    // extended to the disk hop).
+    m.mgr->on_seq_free(11);
+    EXPECT_EQ(spill_files_in(dir), 0);
+    EXPECT_EQ(m.mgr->spilled_bytes_total(), 0);
+    rmdir(dir.c_str());
+}
+
+TEST(KvTieringSpill, UnspillSlotExhaustionIsRetryable) {
+    REQUIRES_GPU();
+    const std::string dir = make_spill_dir();
+    // ratio 1.0 → tiny cold pool: 2 pages/layer × 2 layers = 4 slots.
+    // Holder A (4 eligible of 18 fit) spills; holder B then takes the
+    // freed slots; A's unspill must fail RETRYABLE and succeed after B
+    // is evicted.
+    SlabFixture m(/*hot_slots=*/8, /*num_logical=*/10, /*spare=*/0,
+                  /*layers=*/2, dir, /*cap=*/int64_t{1} << 30,
+                  /*ratio=*/1.0);
+    ASSERT_EQ(m.mgr->cold_pool_capacity_pages(), 4);
+    m.fx.be->synchronize_device();
+    const int a = m.mgr->hibernate_seq(20, m.handles.data(), m.num_logical);
+    ASSERT_EQ(a, 4) << "pool-capacity fail-safe bounds the demotions";
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->spill_seq(20), 4);
+    EXPECT_EQ(m.mgr->cold_pool_used_pages(0), 0);
+    // Holder B takes the pool.
+    ASSERT_EQ(m.mgr->hibernate_seq(21, m.handles.data(), m.num_logical), 4);
+    m.fx.be->synchronize_device();
+    m.mgr->drain_demotions();
+    ASSERT_EQ(m.mgr->cold_pool_used_pages(0), 4);
+    // A cannot reload — retryable false, file intact, partial state
+    // consistent.
+    EXPECT_FALSE(m.mgr->unspill_seq(20));
+    EXPECT_TRUE(m.mgr->seq_spilled(20));
+    EXPECT_EQ(spill_files_in(dir), 1);
+    // The eviction seam frees B; the retry completes byte-exact.
+    m.mgr->on_seq_free(21);
+    ASSERT_TRUE(m.mgr->unspill_seq(20));
+    EXPECT_EQ(spill_files_in(dir), 0);
+    for (int l = 0; l < m.L; ++l)
+        for (int j = 0; j < 2; ++j) {
+            const void* c = m.mgr->cold_page_host_ptr(20, l, j);
+            if (!c) continue;  // only 4 of 18 pages ever demoted
+            EXPECT_EQ(std::memcmp(c, m.truth(j, l), kStrideBlock), 0);
+        }
+    m.mgr->on_seq_free(20);
+    rmdir(dir.c_str());
 }
