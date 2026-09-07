@@ -79,6 +79,7 @@ class ServeOptions:
     model_name: str = ""
     max_concurrent: int = 32
     max_queued_requests: int = 16
+    sse_heartbeat_seconds: float = 15.0
     max_sequence_length: int = 32768
     tokenizer_path: str = "auto"
     # vLLM-parity serving parsers ("" = disabled): named tool-call parser
@@ -146,6 +147,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "(bounded FIFO queue; beyond it → 503 + "
                         "Retry-After; overrides "
                         "serving.max_queued_requests)")
+    p.add_argument("--sse-heartbeat-seconds", type=float, default=None,
+                   help="SSE comment-keepalive cadence (seconds) while a "
+                        "stream has no data (long prefills); 0 disables "
+                        "(overrides serving.sse_heartbeat_seconds)")
     p.add_argument("--max-sequence-length", type=int, default=None,
                    help="max prompt tokens "
                         "(overrides serving.max_sequence_length)")
@@ -270,6 +275,10 @@ def resolve_options(config: dict, args: argparse.Namespace) -> ServeOptions:
         max_queued_requests=int(pick(getattr(args, "max_queued_requests",
                                              None),
                                      "max_queued_requests", 16)),
+        sse_heartbeat_seconds=float(pick(getattr(args,
+                                                 "sse_heartbeat_seconds",
+                                                 None),
+                                         "sse_heartbeat_seconds", 15.0)),
         max_sequence_length=int(pick(args.max_sequence_length,
                                      "max_sequence_length", 32768)),
         tokenizer_path=pick(args.tokenizer_path, "tokenizer_path", "auto"),
@@ -613,6 +622,7 @@ def build_stack(
             port=opts.port,
             max_concurrent=max_concurrent,
             max_queued_requests=opts.max_queued_requests,
+            sse_heartbeat_seconds=opts.sse_heartbeat_seconds,
             max_sequence_length=opts.max_sequence_length,
             tool_call_parser=opts.tool_call_parser,
             enable_auto_tool_choice=opts.enable_auto_tool_choice,

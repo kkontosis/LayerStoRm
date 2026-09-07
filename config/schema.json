@@ -2467,6 +2467,13 @@
           "default": 16,
           "description": "Maximum requests WAITING for a generation slot at the HTTP layer (bounded FIFO admission queue over max_concurrent_requests in-flight generations; queued waiters honor client disconnect). Beyond this depth requests fail fast with 503 + Retry-After. Consumed by the Python serving layer; CLI override: --max-queued-requests."
         },
+        "sse_heartbeat_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 15,
+          "description": "SSE comment-keepalive cadence in seconds while a streaming response has no data to send: a long prefill produces NO bytes until the first token, and stock ~300 s client read timeouts abort it (TD-SERVE-PREFILL-HEARTBEAT). Emits ': ping' comment frames, invisible to SSE consumers. 0 disables. Consumed by the Python serving layer; CLI override: --sse-heartbeat-seconds."
+        },
         "max_sequence_length": {
           "type": "integer",
           "minimum": 128,

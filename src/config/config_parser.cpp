@@ -2130,6 +2130,7 @@ static ServingConfig parse_serving(const nlohmann::json& j) {
     r.port = get_or(j, "port", 8000);
     r.max_concurrent_requests = get_or(j, "max_concurrent_requests", 32);
     r.max_queued_requests = get_or(j, "max_queued_requests", 16);
+    r.sse_heartbeat_seconds = get_or(j, "sse_heartbeat_seconds", 15.0);
     r.max_sequence_length = get_or(j, "max_sequence_length", 32768);
     r.tokenizer_path = get_or(j, "tokenizer_path", std::string{"auto"});
     r.tool_call_parser = get_or(j, "tool_call_parser", std::string{""});
@@ -2147,6 +2148,7 @@ static nlohmann::json serving_to_json(const ServingConfig& r) {
     j["port"] = r.port;
     j["max_concurrent_requests"] = r.max_concurrent_requests;
     j["max_queued_requests"] = r.max_queued_requests;
+    j["sse_heartbeat_seconds"] = r.sse_heartbeat_seconds;
     j["max_sequence_length"] = r.max_sequence_length;
     j["tokenizer_path"] = r.tokenizer_path;
     j["tool_call_parser"] = r.tool_call_parser;
@@ -3180,6 +3182,7 @@ const char* field_name(FieldId id) {
         case FieldId::kServingPort: return "serving.port";
         case FieldId::kServingMaxConcurrentRequests: return "serving.max_concurrent_requests";
         case FieldId::kServingMaxQueuedRequests: return "serving.max_queued_requests";
+        case FieldId::kServingSseHeartbeatSeconds: return "serving.sse_heartbeat_seconds";
         case FieldId::kServingMaxSequenceLength: return "serving.max_sequence_length";
         case FieldId::kServingTokenizerPath: return "serving.tokenizer_path";
         case FieldId::kServingToolCallParser: return "serving.tool_call_parser";

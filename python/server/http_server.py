@@ -477,6 +477,7 @@ class LayerStoRmServer:
         max_concurrent: int = 32,
         max_queued_requests: int = 16,
         max_sequence_length: int = 32768,
+        sse_heartbeat_seconds: float = 15.0,
         tool_call_parser: str = "",
         enable_auto_tool_choice: bool = False,
         reasoning_parser: str = "",
@@ -494,6 +495,7 @@ class LayerStoRmServer:
         self._port = port
         self._max_concurrent = max_concurrent
         self._max_sequence_length = max_sequence_length
+        self._sse_heartbeat_seconds = float(sse_heartbeat_seconds)
 
         self._next_request_id = itertools.count(1)
         self._tracker = _RequestTracker()
@@ -1122,6 +1124,7 @@ class LayerStoRmServer:
             stop=request.stop,
             prompt_tokens=len(prompt_ids),
             release_fn=self._admission.release,
+            heartbeat_seconds=self._sse_heartbeat_seconds,
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 
@@ -1186,6 +1189,7 @@ class LayerStoRmServer:
             reasoning_stream=reasoning_stream,
             tool_stream=tool_stream,
             release_fn=self._admission.release,
+            heartbeat_seconds=self._sse_heartbeat_seconds,
         )
         return StreamingResponse(gen, media_type="text/event-stream")
 

@@ -193,6 +193,7 @@ async def stream_completion_response(
     stop: str | list[str] | None = None,
     prompt_tokens: int = 0,
     release_fn: Any = None,
+    heartbeat_seconds: float = 15.0,
 ) -> AsyncGenerator[str, None]:
     """Async generator yielding SSE strings for ``/v1/completions``.
 
@@ -219,6 +220,7 @@ async def stream_completion_response(
         raw_request=raw_request,
         stop=stop,
         prompt_tokens=prompt_tokens,
+        heartbeat_seconds=heartbeat_seconds,
     )
     # NOTE: the try/finally must live HERE, in the outermost generator —
     # a further wrapper level would break the contract (an abandoned
@@ -261,10 +263,12 @@ async def _stream_completion_inner(
     raw_request: Request,
     stop: str | list[str] | None = None,
     prompt_tokens: int = 0,
+    heartbeat_seconds: float = 15.0,
 ) -> AsyncGenerator[str, None]:
     """/v1/completions SSE event body (teardown handled by the wrapper)."""
     created = int(time.time())
     loop = asyncio.get_event_loop()
+    last_beat = time.monotonic()
     all_tokens: list[int] = []
     prev_text = ""
     stopped = False
@@ -274,6 +278,7 @@ async def _stream_completion_inner(
         new_items = await loop.run_in_executor(None, token_queue.drain)
 
         if new_items:
+            last_beat = time.monotonic()
             pairs: list[tuple[int, Any]] = []
             for tok, lp in new_items:
                 if tok in eos_token_ids:
@@ -386,6 +391,15 @@ async def _stream_completion_inner(
         if await raw_request.is_disconnected():
             return                   # wrapper's finally cancels + releases
 
+        if (heartbeat_seconds > 0
+                and time.monotonic() - last_beat >= heartbeat_seconds):
+            # SSE comment keepalive (TD-SERVE-PREFILL-HEARTBEAT): a long
+            # prefill sends NO bytes until the first token; stock ~300 s
+            # client read timeouts abort it. Comments are invisible to
+            # SSE consumers.
+            last_beat = time.monotonic()
+            yield ": ping\n\n"
+
         await asyncio.sleep(0.01)
 
 
@@ -409,6 +423,7 @@ async def stream_chat_completion_response(
     reasoning_stream: Any = None,
     tool_stream: Any = None,
     release_fn: Any = None,
+    heartbeat_seconds: float = 15.0,
 ) -> AsyncGenerator[str, None]:
     """Async generator yielding SSE strings for ``/v1/chat/completions``.
 
@@ -437,6 +452,7 @@ async def stream_chat_completion_response(
         prompt_tokens=prompt_tokens,
         reasoning_stream=reasoning_stream,
         tool_stream=tool_stream,
+        heartbeat_seconds=heartbeat_seconds,
     )
     # Outermost-generator teardown — see stream_completion_response.
     try:
@@ -461,10 +477,12 @@ async def _stream_chat_completion_inner(
     prompt_tokens: int = 0,
     reasoning_stream: Any = None,
     tool_stream: Any = None,
+    heartbeat_seconds: float = 15.0,
 ) -> AsyncGenerator[str, None]:
     """/v1/chat/completions SSE event body (teardown in the wrapper)."""
     created = int(time.time())
     loop = asyncio.get_event_loop()
+    last_beat = time.monotonic()
     all_tokens: list[int] = []
     prev_text = ""
     first_chunk = True
@@ -545,6 +563,7 @@ async def _stream_chat_completion_inner(
         new_items = await loop.run_in_executor(None, token_queue.drain)
 
         if new_items:
+            last_beat = time.monotonic()
             delta_ids: list[int] = []
             lp_pairs: list[tuple[int, Any]] = []
             for tok, lp in new_items:
@@ -670,5 +689,14 @@ async def _stream_chat_completion_inner(
 
         if await raw_request.is_disconnected():
             return                   # wrapper's finally cancels + releases
+
+        if (heartbeat_seconds > 0
+                and time.monotonic() - last_beat >= heartbeat_seconds):
+            # SSE comment keepalive (TD-SERVE-PREFILL-HEARTBEAT): a long
+            # prefill sends NO bytes until the first token; stock ~300 s
+            # client read timeouts abort it. Comments are invisible to
+            # SSE consumers.
+            last_beat = time.monotonic()
+            yield ": ping\n\n"
 
         await asyncio.sleep(0.01)
