@@ -1,8 +1,14 @@
 """Hardware detection for autoconfig (AUTOCONFIG §3).
 
-CPU-only by construction: everything is read from /proc and /sys. No CUDA,
-no nvidia-smi, no NVML — this module must be safe to run while another
-process owns the GPUs (INV-GPU-1 stays untouched; we never open a device).
+CPU-only by construction: the hardware sweep is read from /proc and /sys. No
+CUDA — this module must be safe to run while another process owns the GPUs
+(INV-GPU-1 stays untouched; we never open a device or create a context).
+
+The ONE exception is the VRAM fallback chain below: when the PCI BAR1 aperture
+does not map the framebuffer we shell out to a read-only
+`nvidia-smi --query-gpu` (NVML) query. That opens no CUDA context, takes no
+device ownership, and does not disturb a live holder, so it is safe in exactly
+the situations the /proc + /sys sweep is. It is never on the primary path.
 
 Traps encoded here (each has bitten this project — AUTOCONFIG §3 table):
 - /proc/driver/nvidia/gpus/* order is lexicographic by PCI bus id, NOT the
@@ -12,9 +18,18 @@ Traps encoded here (each has bitten this project — AUTOCONFIG §3 table):
 - current_link_speed shows the idle downclock (2.5 GT/s on an idle Gen5
   link); only max_link_speed is trustworthy without kickstarting the link
   (config_resolver.cpp kickstarts; we cannot, GPU-free).
-- Physical VRAM is read from the PCI BAR1 span (resizable BAR maps the whole
-  framebuffer: 32.0/16.0 GiB exact on this box); a name-keyed fallback table
-  covers boxes without resizable BAR.
+- Physical VRAM is read from the PCI BAR1 span, which maps the whole
+  framebuffer only while resizable BAR is ON. With ReBAR OFF the span is a
+  256 MiB window that says nothing about framebuffer size, so VRAM resolves
+  through three tiers, in order:
+      1. "bar1"  — the BAR1 span (primary; every carve constant downstream is
+                   calibrated against this number, so it must stay first).
+      2. "nvml"  — a read-only nvidia-smi query, keyed by PCI bus id.
+      3. "table" — GPU_VRAM_FALLBACK_MIB, keyed by the detected model.
+  A model that matches no table row and has neither BAR1 nor NVML REFUSES
+  rather than guessing: detect_gpu_type() collapses every unrecognised name
+  onto its smallest-card fallback, so a silent table hit plans a small carve
+  for a large board with no diagnostic at all.
 - CPU-less HBM NUMA banks (memory > 0, empty cpulist) must be enumerated:
   a node-local OOM fires with 30 GB free system-wide if they are treated
   like DDR nodes.
@@ -28,10 +43,17 @@ from __future__ import annotations
 import glob
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 
-# Physical VRAM fallback when BAR1 is not resizable (MiB, driver-reported
-# physical sizes; the *usable* carve is derived by the solver, AUTOCONFIG §3).
+from .explain import Infeasible
+
+# Physical VRAM fallback of LAST resort, when neither BAR1 nor NVML answers
+# (MiB, driver-reported physical sizes; the *usable* carve is derived by the
+# solver, AUTOCONFIG §3). These rows are transcribed verbatim from
+# `nvidia-smi --query-gpu=memory.total`, so tier 2 and tier 3 speak the same
+# units. Note they are NOT the BAR1 numbers: a 32 GiB board apertures 32768
+# MiB but reports 32607 MiB of framebuffer (the driver/ECC carve-out).
 GPU_VRAM_FALLBACK_MIB = {
     "rtx5090": 32607,
     "rtx5080": 16303,
@@ -64,6 +86,67 @@ def detect_gpu_type(name: str) -> str:
     return "rtx5080"
 
 
+def gpu_name_is_known(name: str) -> bool:
+    """True when detect_gpu_type() RECOGNISED the model, rather than taking
+    its unrecognised-name fallback.
+
+    The two are indistinguishable from the return value alone — both yield
+    "rtx5080" — which is exactly why an unknown card used to silently inherit
+    the 5080 VRAM row. Any caller that treats the detected type as a fact
+    about the hardware (rather than a config enum to fill) must gate on this.
+    """
+    return "5090" in name or "5080" in name
+
+
+def normalize_pci_bus_id(bus_id: str) -> str:
+    """Normalise a PCI bus id to the lowercase sysfs form ("0000:16:00.0").
+
+    nvidia-smi prints an 8-hex-digit domain ("00000000:16:00.0") while sysfs
+    and /proc/driver/nvidia use 4, so the two sources do not join without
+    this. Anything that does not look like domain:bus:dev.fn is returned
+    lowercased and otherwise untouched.
+    """
+    b = bus_id.strip().lower()
+    parts = b.split(":")
+    if len(parts) != 3:
+        return b
+    parts[0] = parts[0][-4:].rjust(4, "0")
+    return ":".join(parts)
+
+
+def query_nvml_vram_mib(timeout_s: float = 10.0) -> dict[str, int]:
+    """Physical VRAM in MiB per PCI bus id, via a read-only NVML query.
+
+    `nvidia-smi --query-gpu` reads driver state; it opens no CUDA context and
+    takes no device ownership, so it is safe to run against GPUs another
+    process is serving on. EVERY failure mode — nvidia-smi absent, driver
+    error, timeout, garbled row — degrades to an empty map so the caller
+    falls through to the name table rather than raising. The values are the
+    same quantity as GPU_VRAM_FALLBACK_MIB, not the BAR1 aperture.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=pci.bus_id,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=timeout_s, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[str, int] = {}
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            mib = int(parts[1])
+        except ValueError:
+            continue
+        if mib > 0:
+            out[normalize_pci_bus_id(parts[0])] = mib
+    return out
+
+
 @dataclass(frozen=True)
 class GpuInfo:
     ordinal: int              # PCI-bus-id order == CUDA ordinal under PCI_BUS_ID
@@ -71,8 +154,8 @@ class GpuInfo:
     name: str                 # driver model string
     gpu_type: str             # rtx5090 / rtx5080 (config enum)
     uuid: str
-    vram_mib: int             # physical (BAR1 span or fallback table)
-    vram_source: str          # "bar1" | "table"
+    vram_mib: int             # physical (BAR1 span, NVML, or fallback table)
+    vram_source: str          # "bar1" | "nvml" | "table"
     pcie_gen_max: int
     pcie_width_max: int
     numa_node: int
@@ -195,8 +278,18 @@ def _bar1_span_bytes(resource_text: str | None) -> int:
     return end - start + 1
 
 
-def detect_gpus(proc_root: str = "/proc", sys_root: str = "/sys") -> tuple[GpuInfo, ...]:
-    """Enumerate NVIDIA GPUs from /proc/driver/nvidia + PCI sysfs. CPU-only."""
+def detect_gpus(proc_root: str = "/proc", sys_root: str = "/sys",
+                nvml_vram: dict[str, int] | None = None) -> tuple[GpuInfo, ...]:
+    """Enumerate NVIDIA GPUs from /proc/driver/nvidia + PCI sysfs.
+
+    `nvml_vram` is the tier-2 VRAM map (bus id -> MiB). None means "query it
+    live, and only if some GPU actually needs it" — pass a dict to keep a
+    caller hermetic ({} to assert the no-NVML path).
+
+    Raises Infeasible when a GPU's physical VRAM cannot be established from
+    any tier; see the module docstring for why that is a refusal rather than
+    a guess.
+    """
     gpu_dirs = sorted(glob.glob(os.path.join(proc_root, "driver/nvidia/gpus/*")))
     gpus: list[GpuInfo] = []
     for ordinal, d in enumerate(gpu_dirs):
@@ -219,8 +312,27 @@ def detect_gpus(proc_root: str = "/proc", sys_root: str = "/sys") -> tuple[GpuIn
             vram_mib = bar1 // (1 << 20)
             vram_source = "bar1"
         else:
-            vram_mib = GPU_VRAM_FALLBACK_MIB.get(gpu_type, 0)
-            vram_source = "table"
+            # ReBAR off: the span is a 256 MiB window, not the framebuffer.
+            if nvml_vram is None:
+                nvml_vram = query_nvml_vram_mib()  # once, memoised per sweep
+            vram_mib = nvml_vram.get(bus_id, 0)
+            vram_source = "nvml"
+            if vram_mib <= 0:
+                if not gpu_name_is_known(name):
+                    raise Infeasible(
+                        "gpu-vram-unknown",
+                        f"gpu {ordinal} ({name or 'unnamed model'}) at {bus_id}",
+                        "the physical VRAM size",
+                        "BAR1 does not map the framebuffer (resizable BAR is "
+                        "off), NVML did not answer, and the model matches no "
+                        "GPU_VRAM_FALLBACK_MIB row",
+                        "enable Resizable BAR in the system firmware, or make "
+                        "nvidia-smi runnable, or add this model to "
+                        "GPU_VRAM_FALLBACK_MIB in hwdetect.py — falling back "
+                        "to the table here would size the whole recipe for a "
+                        "different board.")
+                vram_mib = GPU_VRAM_FALLBACK_MIB[gpu_type]
+                vram_source = "table"
         gpus.append(GpuInfo(
             ordinal=ordinal, pci_bus_id=bus_id, name=name, gpu_type=gpu_type,
             uuid=uuid, vram_mib=vram_mib, vram_source=vram_source,
@@ -269,10 +381,12 @@ def detect_nvmes(sys_root: str = "/sys") -> tuple[NvmeInfo, ...]:
     return tuple(nvmes)
 
 
-def detect_hardware(proc_root: str = "/proc", sys_root: str = "/sys") -> HardwareDescriptor:
-    """Full CPU-only hardware sweep. Roots are injectable for tests."""
+def detect_hardware(proc_root: str = "/proc", sys_root: str = "/sys",
+                    nvml_vram: dict[str, int] | None = None) -> HardwareDescriptor:
+    """Full hardware sweep. Roots and the tier-2 VRAM map are injectable for
+    tests; see detect_gpus() for the VRAM fallback contract."""
     return HardwareDescriptor(
-        gpus=detect_gpus(proc_root, sys_root),
+        gpus=detect_gpus(proc_root, sys_root, nvml_vram),
         numa_nodes=detect_numa(sys_root),
         mem_total_kib=detect_host_ram_kib(proc_root),
         nvmes=detect_nvmes(sys_root),

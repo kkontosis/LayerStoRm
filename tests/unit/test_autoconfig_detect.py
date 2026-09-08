@@ -11,17 +11,21 @@ import json
 import os
 import struct
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python"))
 
-from autoconfig import gguf_meta, sizing
+from autoconfig import gguf_meta, hwdetect, sizing
 from autoconfig.calibration import (CalibrationView, accept_calibration,
                                     load_calibration, resolve_calibration_path)
 from autoconfig.engine_constraints import ENGINE_CONSTRAINTS, active_for, get
+from autoconfig.explain import Infeasible
 from autoconfig.fingerprint import fingerprint
-from autoconfig.hwdetect import HardwareDescriptor, detect_hardware
+from autoconfig.hwdetect import (HardwareDescriptor, detect_gpu_type,
+                                 detect_hardware, gpu_name_is_known,
+                                 normalize_pci_bus_id)
 from autoconfig.modelshape import LinearAttnGeometry, ModelShape
 
 REPO = os.path.join(os.path.dirname(__file__), "..", "..")
@@ -55,7 +59,9 @@ def build_fake_tree(root, gpus=BOX_GPUS, ddr_nodes=4, hbm_nodes=4,
             f.write("16\n")
         with open(os.path.join(p, "current_link_speed"), "w") as f:
             f.write("2.5 GT/s PCIe\n")  # the idle-downclock trap
-        bar1 = bar1_gib << 30
+        # bar1_gib=0 models resizable BAR OFF: the aperture is a 256 MiB
+        # window that reveals nothing about framebuffer size.
+        bar1 = (bar1_gib << 30) if bar1_gib else (256 << 20)
         with open(os.path.join(p, "resource"), "w") as f:
             f.write("0x00000000a0000000 0x00000000a0ffffff 0x0000000000040200\n")
             f.write(f"0x0000004000000000 0x{0x4000000000 + bar1 - 1:016x} 0x000000000014220c\n")
@@ -129,6 +135,127 @@ class TestHwDetect:
 
     def test_descriptor_json_roundtrip(self, box_hw):
         assert HardwareDescriptor.from_json(box_hw.to_json()) == box_hw
+
+
+# ------------------------------------------- VRAM fallback chain (3 tiers)
+
+# The same box with resizable BAR turned off: BAR1 stops reporting size.
+REBAR_OFF_GPUS = [(bus, model, uuid, 0, numa)
+                  for bus, model, uuid, _, numa in BOX_GPUS]
+
+# A board the name table has never heard of, with ReBAR off. detect_gpu_type()
+# has no row for it and silently answers "rtx5080" — the exact case where a
+# table hit would size a 96 GiB card as a 16 GiB one.
+UNKNOWN_BOARD = [("0000:c1:00.0", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                  "GPU-3f1c0d9e-11a2-4b7c-9e60-5c2d8a4f0b13", 0, 1)]
+
+
+class TestVramFallbackChain:
+    """BAR1 -> NVML -> name table, and a refusal in place of a silent guess."""
+
+    def test_bar1_stays_the_primary_source(self, tmp_path):
+        # Every downstream carve constant is calibrated against the BAR1
+        # number, so NVML must not win when BAR1 has an answer.
+        proc, sysd = build_fake_tree(str(tmp_path))
+        hw = detect_hardware(proc_root=proc, sys_root=sysd,
+                             nvml_vram={b: 99999 for b, *_ in BOX_GPUS})
+        assert [g.vram_mib for g in hw.gpus] == [16384, 16384, 32768, 32768]
+        assert all(g.vram_source == "bar1" for g in hw.gpus)
+
+    def test_nvml_answers_when_rebar_is_off(self, tmp_path):
+        proc, sysd = build_fake_tree(str(tmp_path), gpus=REBAR_OFF_GPUS)
+        nvml = {"0000:16:00.0": 16303, "0000:40:00.0": 16303,
+                "0000:6a:00.0": 32607, "0000:94:00.0": 32607}
+        hw = detect_hardware(proc_root=proc, sys_root=sysd, nvml_vram=nvml)
+        assert [g.vram_mib for g in hw.gpus] == [16303, 16303, 32607, 32607]
+        assert all(g.vram_source == "nvml" for g in hw.gpus)
+
+    def test_nvml_sizes_a_board_the_table_cannot(self, tmp_path):
+        proc, sysd = build_fake_tree(str(tmp_path), gpus=UNKNOWN_BOARD)
+        hw = detect_hardware(proc_root=proc, sys_root=sysd,
+                             nvml_vram={"0000:c1:00.0": 97887})
+        g, = hw.gpus
+        assert (g.vram_mib, g.vram_source) == (97887, "nvml")
+        # the config enum still falls back; that is a label, not a VRAM fact
+        assert g.gpu_type == "rtx5080"
+
+    def test_table_is_the_last_resort_for_a_known_name(self, tmp_path):
+        proc, sysd = build_fake_tree(str(tmp_path), gpus=REBAR_OFF_GPUS)
+        hw = detect_hardware(proc_root=proc, sys_root=sysd, nvml_vram={})
+        assert [g.vram_mib for g in hw.gpus] == [16303, 16303, 32607, 32607]
+        assert all(g.vram_source == "table" for g in hw.gpus)
+
+    def test_refuses_an_unknown_board_instead_of_guessing(self, tmp_path):
+        proc, sysd = build_fake_tree(str(tmp_path), gpus=UNKNOWN_BOARD)
+        with pytest.raises(Infeasible) as ei:
+            detect_hardware(proc_root=proc, sys_root=sysd, nvml_vram={})
+        assert ei.value.constraint_id == "gpu-vram-unknown"
+        msg = str(ei.value)
+        assert "0000:c1:00.0" in msg
+        assert "16303" not in msg          # never the silent 5080 row
+        assert "Resizable BAR" in msg      # the refusal names its remedies
+        assert "nvidia-smi" in msg
+
+    def test_refusal_is_per_board_not_per_box(self, tmp_path):
+        # a known board resolves from the table; the unknown one still
+        # refuses, so one odd card cannot be laundered by its neighbours
+        proc, sysd = build_fake_tree(str(tmp_path),
+                                     gpus=REBAR_OFF_GPUS + UNKNOWN_BOARD)
+        with pytest.raises(Infeasible):
+            detect_hardware(proc_root=proc, sys_root=sysd, nvml_vram={})
+
+    def test_nvml_source_survives_json_roundtrip(self, tmp_path):
+        proc, sysd = build_fake_tree(str(tmp_path), gpus=UNKNOWN_BOARD)
+        hw = detect_hardware(proc_root=proc, sys_root=sysd,
+                             nvml_vram={"0000:c1:00.0": 97887})
+        assert HardwareDescriptor.from_json(hw.to_json()) == hw
+
+
+class TestNvmlVramQuery:
+    """Tier 2 is a shell-out; every failure mode must degrade, not raise."""
+
+    def test_bus_id_normalisation_joins_nvidia_smi_to_sysfs(self):
+        # nvidia-smi prints an 8-hex domain, sysfs prints 4
+        assert normalize_pci_bus_id("00000000:6A:00.0") == "0000:6a:00.0"
+        assert normalize_pci_bus_id("0000:6a:00.0") == "0000:6a:00.0"
+        assert normalize_pci_bus_id("garbage") == "garbage"
+
+    def test_known_name_separates_a_match_from_the_fallback(self):
+        assert gpu_name_is_known("NVIDIA GeForce RTX 5090")
+        assert gpu_name_is_known("NVIDIA GeForce RTX 5080")
+        assert not gpu_name_is_known("NVIDIA RTX PRO 6000 Blackwell")
+        # both answer rtx5080 — indistinguishable without the predicate
+        assert detect_gpu_type("NVIDIA RTX PRO 6000 Blackwell") == "rtx5080"
+
+    def test_degrades_when_nvidia_smi_is_absent(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise FileNotFoundError("nvidia-smi")
+        monkeypatch.setattr(hwdetect.subprocess, "run", boom)
+        assert hwdetect.query_nvml_vram_mib() == {}
+
+    def test_degrades_on_driver_error_exit(self, monkeypatch):
+        monkeypatch.setattr(hwdetect.subprocess, "run",
+                            lambda *a, **k: SimpleNamespace(
+                                returncode=9, stdout="", stderr="driver error"))
+        assert hwdetect.query_nvml_vram_mib() == {}
+
+    def test_degrades_on_timeout(self, monkeypatch):
+        def slow(*args, **kwargs):
+            raise hwdetect.subprocess.TimeoutExpired("nvidia-smi", 10.0)
+        monkeypatch.setattr(hwdetect.subprocess, "run", slow)
+        assert hwdetect.query_nvml_vram_mib() == {}
+
+    def test_parses_rows_and_skips_garbled_ones(self, monkeypatch):
+        out = ("00000000:16:00.0, 16303\n"
+               "not-a-row\n"
+               "00000000:6A:00.0, [N/A]\n"      # unparseable size
+               "00000000:40:00.0, 0\n"          # a zero is not an answer
+               "00000000:94:00.0, 32607\n")
+        monkeypatch.setattr(hwdetect.subprocess, "run",
+                            lambda *a, **k: SimpleNamespace(
+                                returncode=0, stdout=out, stderr=""))
+        assert hwdetect.query_nvml_vram_mib() == {"0000:16:00.0": 16303,
+                                                  "0000:94:00.0": 32607}
 
 
 # ------------------------------------------------------------- model shape
