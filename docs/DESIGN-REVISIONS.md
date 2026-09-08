@@ -66,3 +66,22 @@ with chain-aware eviction, the persistent arena holder with its reasoned-wipe
 contract, guided decoding, DeepSeek-V4 support via the arch-split
 attention/MoE drivers, and mini-superchunk served prefill. See the README and
 the changelog for these.
+
+## 8. The two-zone cache (§3.1, §3.3) — clarified: VRAM extends RAM in the stable zone, clones RAM in the streaming zone
+
+The effective in-memory budget is `RAM (arena) + stable zones + pinned
+weights`, so a model larger than RAM can be hosted.
+
+- **Streaming zone** — a pure cache: every resident duplicates an arena (RAM)
+  copy; eviction stays a free metadata drop. H2D-only.
+- **Stable zone** — lends its VRAM: stable residents need no arena copy, so
+  their RAM slots are freed. This makes the stable zone the one tier with
+  both directions — H2D in, D2H back on swap — and swapping needs a small
+  RAM staging reserve (brief temporary duplication; implementation detail).
+- **Pinned weights** — same effect: once uploaded, their RAM copies are
+  freed.
+
+NVMe keeps the prepacked files as cold backing throughout. Extending
+capacity further onto NVMe for cold experts is feasible (the tier exists)
+but slow. A future-oriented capability is a sharded NVMe array capability
+where aggregate throughput makes the transfers quick.
